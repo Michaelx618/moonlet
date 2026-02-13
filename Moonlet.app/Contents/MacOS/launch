@@ -1,0 +1,10 @@
+#!/bin/bash
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+LOG="/Users/michael/moonlet/launch.log"
+
+echo "=== launch $(date) ===" > "$LOG"
+echo "arch: $(arch)" >> "$LOG"
+echo "python3: $(/Users/michael/moonlet/.venv/bin/python3 -c 'import sys; print(sys.executable, sys.platform)')" >> "$LOG"
+
+cd /Users/michael/moonlet/local-app
+exec /usr/bin/arch -arm64 npm start >> "$LOG" 2>&1

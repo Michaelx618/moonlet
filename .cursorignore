@@ -1,0 +1,37 @@
+# Ignore everything except Moonlet project files
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+
+# External tool dirs
+binary/
+core/
+docs/
+eval/
+extensions/
+gui/
+media/
+packages/
+scripts/
+skills/
+sync/
+actions/
+manual-testing-sandbox/
+
+# Root-level non-project files
+CLA.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+LICENSE
+README.md
+package-lock.json
+tsconfig.json
+tsconfig 2.json
+worktree-config.yaml
+package.json
+
+# Generated
+runtime-debug.log
+local-app/package-lock.json
+local-app/node_modules/

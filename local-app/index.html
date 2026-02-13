@@ -1,0 +1,1136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Moonlet</title>
+    <link rel="stylesheet" href="./node_modules/xterm/css/xterm.css" />
+    <style>
+      /* ─── Reset & Base ─── */
+      :root {
+        --bg-base: #1e1e2e;
+        --bg-surface: #181825;
+        --bg-overlay: #11111b;
+        --bg-mantle: #1e1e2e;
+        --bg-crust: #11111b;
+        --border: #313244;
+        --border-active: #45475a;
+        --text: #cdd6f4;
+        --text-dim: #6c7086;
+        --text-muted: #585b70;
+        --accent: #89b4fa;
+        --accent-dim: #74c7ec;
+        --green: #a6e3a1;
+        --red: #f38ba8;
+        --yellow: #f9e2af;
+        --peach: #fab387;
+        --mauve: #cba6f7;
+        --surface0: #313244;
+        --surface1: #45475a;
+        --surface2: #585b70;
+        --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+        --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        --radius: 6px;
+        --radius-lg: 8px;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: var(--font-ui);
+        font-size: 13px;
+        color: var(--text);
+        background: var(--bg-crust);
+        overflow: hidden;
+        height: 100vh;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* ─── Layout ─── */
+      .app {
+        display: grid;
+        grid-template-rows: 38px 1fr 32px;
+        grid-template-columns: 240px 1fr;
+        height: 100vh;
+      }
+
+      /* ─── Title Bar ─── */
+      .titlebar {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 16px;
+        background: var(--bg-overlay);
+        border-bottom: 1px solid var(--border);
+        -webkit-app-region: drag;
+        user-select: none;
+      }
+      .titlebar-logo {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        -webkit-app-region: no-drag;
+      }
+      body.darwin .titlebar-logo {
+        margin-left: 72px;
+      }
+      .titlebar-logo .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 6px var(--accent);
+      }
+      .titlebar-logo span {
+        font-weight: 700;
+        font-size: 13px;
+        letter-spacing: 0.5px;
+        color: var(--text);
+      }
+      .titlebar .spacer { flex: 1; }
+      .titlebar-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        -webkit-app-region: no-drag;
+      }
+      .titlebar-controls .btn {
+        -webkit-app-region: no-drag;
+      }
+      /* mode-switch removed — agent-only */
+      .titlebar-filepath {
+        font-size: 11px;
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 300px;
+        -webkit-app-region: no-drag;
+      }
+      .status-pill {
+        font-size: 11px;
+        color: var(--text-dim);
+        padding: 2px 10px;
+        background: var(--surface0);
+        border-radius: 99px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+        max-width: 180px;
+      }
+      .status-pill span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .status-pill .status-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+      }
+      .status-pill .status-dot.busy {
+        background: var(--yellow);
+        animation: pulse 1s ease infinite;
+      }
+      .status-pill .status-dot.error {
+        background: var(--red);
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
+      }
+
+      /* ─── Sidebar ─── */
+      .sidebar {
+        background: var(--bg-surface);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .sidebar-header {
+        padding: 12px 12px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        border-bottom: 1px solid var(--border);
+      }
+      .sidebar-title {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        color: var(--text-dim);
+        padding: 0 4px;
+      }
+      .sidebar-actions {
+        display: flex;
+        gap: 6px;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 5px 10px;
+        font-size: 12px;
+        font-weight: 500;
+        font-family: var(--font-ui);
+        color: var(--text);
+        background: var(--surface0);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        cursor: pointer;
+        transition: all 120ms;
+        white-space: nowrap;
+      }
+      .btn:hover {
+        background: var(--surface1);
+        border-color: var(--border-active);
+      }
+      .btn-primary {
+        background: var(--accent);
+        color: var(--bg-overlay);
+        border-color: var(--accent);
+      }
+      .btn-primary:hover {
+        filter: brightness(1.1);
+      }
+      .btn-sm {
+        padding: 3px 8px;
+        font-size: 11px;
+      }
+      .btn-icon {
+        padding: 4px 6px;
+        min-width: 28px;
+      }
+      .root-display {
+        font-size: 11px;
+        color: var(--text-muted);
+        padding: 2px 4px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .root-display input {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        font-size: 11px;
+        width: 100%;
+        outline: none;
+        font-family: var(--font-mono);
+      }
+      .file-list {
+        list-style: none;
+        overflow-y: auto;
+        flex: 1;
+        padding: 4px 6px;
+      }
+      .file-list::-webkit-scrollbar { width: 6px; }
+      .file-list::-webkit-scrollbar-track { background: transparent; }
+      .file-list::-webkit-scrollbar-thumb {
+        background: var(--surface1);
+        border-radius: 3px;
+      }
+      .file-list li {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        border-radius: var(--radius);
+        cursor: pointer;
+        font-size: 13px;
+        color: var(--text-dim);
+        transition: all 120ms ease;
+      }
+      .file-list li:hover {
+        background: var(--surface0);
+        color: var(--text);
+      }
+      .file-list li.active {
+        background: rgba(137, 180, 250, 0.12);
+        color: var(--accent);
+        box-shadow: inset 3px 0 0 var(--accent);
+      }
+      .file-icon {
+        font-family: var(--font-mono);
+        font-size: 9px;
+        font-weight: 600;
+        width: 20px;
+        height: 16px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        color: var(--accent-dim);
+        background: rgba(137, 180, 250, 0.08);
+        border-radius: 3px;
+        letter-spacing: -0.5px;
+      }
+      .file-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .folder-expander {
+        width: 14px;
+        height: 14px;
+        border: none;
+        background: transparent;
+        color: var(--text-muted);
+        padding: 0;
+        cursor: pointer;
+        font-size: 11px;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+      .folder-expander.hidden {
+        visibility: hidden;
+      }
+      .explorer-menu {
+        position: fixed;
+        z-index: 2000;
+        min-width: 150px;
+        background: var(--bg-overlay);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        padding: 6px;
+      }
+      .explorer-menu.hidden { display: none; }
+      .explorer-menu-item {
+        width: 100%;
+        text-align: left;
+        padding: 6px 8px;
+        border: none;
+        background: transparent;
+        color: var(--text);
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+        font-family: var(--font-ui);
+      }
+      .explorer-menu-item:hover { background: var(--surface0); }
+      .explorer-menu-item.danger:hover {
+        background: rgba(243, 139, 168, 0.16);
+        color: var(--red);
+      }
+
+      /* ─── Main Area ─── */
+      .main {
+        display: grid;
+        grid-template-rows: 32px 1fr auto;
+        overflow: hidden;
+        background: var(--bg-base);
+      }
+
+      /* Tab bar */
+      .tab-bar {
+        display: flex;
+        align-items: stretch;
+        background: var(--bg-surface);
+        border-bottom: 1px solid var(--border);
+        padding-left: 8px;
+        gap: 0;
+      }
+      .tab {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 14px;
+        font-size: 12px;
+        color: var(--text-dim);
+        border-right: 1px solid var(--border);
+        cursor: pointer;
+        position: relative;
+        transition: color 80ms;
+      }
+      .tab:hover { color: var(--text); }
+      .tab.active {
+        color: var(--text);
+        background: var(--bg-base);
+        border-bottom: 2px solid var(--accent);
+      }
+      .tab .tab-icon { font-size: 13px; opacity: 0.6; }
+
+      /* Editor area */
+      .editor-wrap {
+        display: flex;
+        overflow: hidden;
+        position: relative;
+      }
+      .line-numbers {
+        width: 44px;
+        padding: 12px 8px 12px 0;
+        text-align: right;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.6;
+        color: var(--text-muted);
+        background: var(--bg-base);
+        border-right: 1px solid var(--border);
+        overflow: hidden;
+        user-select: none;
+        flex-shrink: 0;
+        white-space: pre;
+        margin: 0;
+      }
+      .editor-container {
+        flex: 1;
+        position: relative;
+        overflow: hidden;
+      }
+      .cm-host {
+        position: absolute;
+        inset: 0;
+      }
+      .cm-host .cm-editor {
+        height: 100%;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.6;
+        background: var(--bg-base);
+      }
+      .cm-host .cm-scroller {
+        font-family: var(--font-mono);
+        line-height: 1.6;
+      }
+      .cm-host .cm-content {
+        caret-color: var(--text);
+      }
+      .cm-host .cm-cursor,
+      .cm-host .cm-dropCursor {
+        border-left-color: var(--text);
+      }
+      .cm-host .cm-selectionBackground,
+      .cm-host .cm-content ::selection {
+        background: rgba(137, 180, 250, 0.25) !important;
+      }
+      .cm-host .cm-gutters {
+        background: var(--bg-base);
+        border-right: 1px solid var(--border);
+        color: var(--text-muted);
+      }
+      .cm-host .cm-activeLineGutter {
+        background: rgba(137, 180, 250, 0.08);
+      }
+      .cm-host .cm-activeLine {
+        background: rgba(137, 180, 250, 0.06);
+      }
+      .cm-host .cm-diff-add {
+        background: rgba(166, 227, 161, 0.1);
+      }
+      .cm-host .cm-diff-del-anchor {
+        background: rgba(243, 139, 168, 0.1);
+        border-left: 2px solid rgba(243, 139, 168, 0.55);
+      }
+      .editor-highlight {
+        position: absolute;
+        top: 0; left: 0; right: 0; bottom: 0;
+        padding: 12px 16px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre;
+        word-wrap: normal;
+        overflow: auto;
+        pointer-events: none;
+        color: var(--text);
+        margin: 0;
+        border: none;
+        tab-size: 4;
+      }
+      .editor {
+        position: absolute;
+        top: 0; left: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        color: transparent;
+        caret-color: var(--text);
+        border: none;
+        outline: none;
+        resize: none;
+        padding: 12px 16px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.6;
+        overflow: auto;
+        tab-size: 4;
+        white-space: pre;
+        word-wrap: normal;
+        z-index: 1;
+      }
+      .image-preview {
+        position: absolute;
+        top: 0; left: 0; right: 0; bottom: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg-base);
+        z-index: 2;
+      }
+      .image-preview img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+        user-select: none;
+        pointer-events: none;
+      }
+      .editor::selection {
+        background: rgba(137, 180, 250, 0.25);
+        color: transparent;
+      }
+      .editor::-webkit-scrollbar { width: 8px; height: 8px; }
+      .editor::-webkit-scrollbar-track { background: transparent; }
+      .editor::-webkit-scrollbar-thumb {
+        background: var(--surface1);
+        border-radius: 4px;
+      }
+      .editor::placeholder { color: var(--text-muted); }
+      /* Syntax highlight tokens */
+      .hl-kw { color: var(--mauve); }          /* keywords */
+      .hl-bi { color: var(--yellow); }         /* builtins */
+      .hl-fn { color: var(--accent); }         /* function/class names */
+      .hl-str { color: var(--green); }         /* strings */
+      .hl-num { color: var(--peach); }         /* numbers */
+      .hl-cmt { color: var(--surface2); font-style: italic; }  /* comments */
+      .hl-dec { color: var(--peach); }         /* decorators */
+      .hl-op { color: var(--accent-dim); }     /* operators */
+      .hl-self { color: var(--red); font-style: italic; }  /* self/this */
+
+      /* ─── Bottom Panel (Chat / Response) ─── */
+      .bottom-panel {
+        border-top: 1px solid var(--border);
+        background: var(--bg-surface);
+        display: flex;
+        flex-direction: column;
+        max-height: 280px;
+        min-height: 120px;
+        resize: vertical;
+        overflow: hidden;
+      }
+      .panel-tabs {
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        height: 30px;
+        border-bottom: 1px solid var(--border);
+        gap: 16px;
+        flex-shrink: 0;
+      }
+      .panel-tab {
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-dim);
+        cursor: pointer;
+        padding: 6px 0;
+        border-bottom: 2px solid transparent;
+        transition: all 100ms;
+      }
+      .panel-tab.active {
+        color: var(--text);
+        border-color: var(--accent);
+      }
+      .panel-tab:hover { color: var(--text); }
+      .panel-view {
+        flex: 1;
+        display: none;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .panel-view.active {
+        display: flex;
+      }
+      .terminal-output {
+        flex: 1;
+        overflow: auto;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.5;
+        background: var(--bg-overlay);
+        color: var(--text);
+        outline: none;
+        cursor: text;
+      }
+      .terminal-output::-webkit-scrollbar { width: 6px; height: 6px; }
+      .terminal-output::-webkit-scrollbar-thumb {
+        background: var(--surface1);
+        border-radius: 3px;
+      }
+      .btn-danger {
+        color: var(--red);
+        border-color: rgba(243, 139, 168, 0.35);
+        background: rgba(243, 139, 168, 0.08);
+      }
+      .btn-danger:hover {
+        background: rgba(243, 139, 168, 0.16);
+      }
+      .run-timer {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text-muted);
+        padding: 2px 8px;
+        border-radius: var(--radius);
+        transition: all 200ms;
+      }
+      .run-timer.running {
+        color: var(--yellow);
+        background: rgba(249, 226, 175, 0.08);
+      }
+      .run-timer.done {
+        color: var(--green);
+        background: rgba(166, 227, 161, 0.08);
+      }
+      .run-timer.error {
+        color: var(--red);
+        background: rgba(243, 139, 168, 0.08);
+      }
+      .panel-body {
+        flex: 1;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+      .user-prompt-echo {
+        display: none;
+        padding: 6px 12px;
+        margin: 8px 14px 0 14px;
+        font-size: 12px;
+        line-height: 1.4;
+        color: var(--accent);
+        background: rgba(137, 180, 250, 0.08);
+        border-left: 2px solid var(--accent);
+        border-radius: 0 var(--radius) var(--radius) 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 80px;
+        overflow-y: auto;
+        flex-shrink: 0;
+      }
+      .user-prompt-echo.visible { display: block; }
+      .user-prompt-echo::before {
+        content: "You: ";
+        font-weight: 600;
+        color: var(--accent);
+      }
+      .response-area {
+        flex: 1;
+        overflow-y: auto;
+        padding: 10px 14px;
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--text-dim);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .response-area::-webkit-scrollbar { width: 6px; }
+      .response-area::-webkit-scrollbar-thumb {
+        background: var(--surface1);
+        border-radius: 3px;
+      }
+      .response-area.has-content { color: var(--text); }
+      .panel-turn {
+        margin: 8px 0 10px 0;
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+      }
+      .panel-turn-user {
+        border-color: rgba(249, 226, 175, 0.45);
+        background: rgba(249, 226, 175, 0.08);
+        box-shadow: inset 0 0 0 1px rgba(249, 226, 175, 0.15);
+      }
+      .panel-turn-assistant {
+        border-color: rgba(137, 180, 250, 0.45);
+        background: rgba(137, 180, 250, 0.10);
+        box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.12);
+      }
+      .panel-turn-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 4px;
+      }
+      .panel-role {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+      }
+      .panel-role-user { color: var(--yellow); }
+      .panel-role-assistant { color: var(--accent); }
+      .panel-turn-body {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .panel-expand-btn {
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(249, 226, 175, 0.45);
+        background: rgba(249, 226, 175, 0.15);
+        color: var(--yellow);
+        font-size: 11px;
+        line-height: 1.2;
+        cursor: pointer;
+      }
+      .panel-expand-btn:hover {
+        background: rgba(249, 226, 175, 0.22);
+      }
+      /* Diff viewer */
+      /* Diff action buttons (Accept/Reject) */
+      .diff-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: 12px;
+      }
+      .btn-apply, .btn-reject {
+        font-family: var(--font-ui);
+        font-size: 11px;
+        padding: 2px 10px;
+        border-radius: var(--radius);
+        border: 1px solid transparent;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .btn-apply {
+        background: rgba(166, 227, 161, 0.15);
+        color: var(--green);
+        border-color: rgba(166, 227, 161, 0.3);
+      }
+      .btn-apply:hover { background: rgba(166, 227, 161, 0.25); }
+      .btn-reject {
+        background: rgba(243, 139, 168, 0.12);
+        color: var(--red);
+        border-color: rgba(243, 139, 168, 0.25);
+      }
+      .btn-reject:hover { background: rgba(243, 139, 168, 0.22); }
+
+      /* Editor diff highlights (inline gutter + line bg) */
+      .line-numbers .ln-add { color: var(--green); }
+      .line-numbers .ln-del { color: var(--red); }
+      .diff-line-add {
+        background: rgba(166, 227, 161, 0.10);
+        display: inline-block;
+        width: 100%;
+      }
+      .diff-line-del {
+        background: rgba(243, 139, 168, 0.10);
+        display: inline-block;
+        width: 100%;
+      }
+      .diff-line-del-anchor {
+        background: rgba(243, 139, 168, 0.10);
+        border-left: 2px solid rgba(243, 139, 168, 0.55);
+        display: inline-block;
+        width: 100%;
+      }
+      /* Diff viewer (response panel) */
+      .diff-viewer {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.6;
+        overflow-x: auto;
+      }
+      .diff-viewer .diff-header {
+        color: var(--text-muted);
+        padding: 2px 0;
+      }
+      .diff-viewer .diff-hunk-header {
+        color: var(--mauve);
+        padding: 2px 0;
+      }
+      .diff-viewer .diff-add {
+        background: rgba(166, 227, 161, 0.12);
+        color: var(--green);
+      }
+      .diff-viewer .diff-del {
+        background: rgba(243, 139, 168, 0.12);
+        color: var(--red);
+      }
+      .diff-viewer .diff-ctx {
+        color: var(--text-dim);
+      }
+      .diff-viewer .diff-line {
+        padding: 0 8px;
+        white-space: pre;
+        display: block;
+      }
+      .prompt-bar {
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
+        padding: 8px 12px;
+        border-top: 1px solid var(--border);
+        background: var(--bg-overlay);
+        flex-shrink: 0;
+      }
+      .prompt-input {
+        flex: 1;
+        background: var(--surface0);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        padding: 8px 12px;
+        font-size: 13px;
+        font-family: var(--font-ui);
+        resize: none;
+        outline: none;
+        max-height: 80px;
+        line-height: 1.4;
+        transition: border-color 120ms;
+      }
+      .prompt-input::placeholder {
+        color: var(--text-muted);
+      }
+      .prompt-actions {
+        display: flex;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .mode-toggle {
+        background: var(--surface0);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        padding: 8px 10px;
+        font-size: 12px;
+        font-family: var(--font-ui);
+        outline: none;
+        cursor: pointer;
+      }
+      .mode-toggle:focus {
+        border-color: var(--accent);
+      }
+      .btn-send {
+        background: var(--accent);
+        color: var(--bg-overlay);
+        border: none;
+        border-radius: var(--radius-lg);
+        padding: 8px 16px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 120ms;
+        font-family: var(--font-ui);
+      }
+      .btn-send:hover { filter: brightness(1.1); }
+      .btn-send:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .btn-cancel {
+        background: none;
+        color: var(--text-dim);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        padding: 8px 12px;
+        font-size: 12px;
+        cursor: pointer;
+        font-family: var(--font-ui);
+        transition: all 120ms;
+      }
+      .btn-cancel:hover {
+        color: var(--red);
+        border-color: var(--red);
+      }
+
+      /* ─── Status Bar ─── */
+      .statusbar {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        padding: 0 16px;
+        background: var(--bg-overlay);
+        border-top: 1px solid var(--border);
+        font-size: 11px;
+        color: var(--text-muted);
+        gap: 16px;
+        height: 32px;
+      }
+      .statusbar .spacer { flex: 1; }
+      .statusbar-item {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+      }
+      .statusbar-sep {
+        width: 1px;
+        height: 14px;
+        background: var(--border);
+      }
+
+      /* ─── Unsaved indicator ─── */
+      .tab .unsaved-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--text-muted);
+        display: none;
+        margin-left: 4px;
+      }
+      .tab .unsaved-dot.visible {
+        display: inline-block;
+        animation: fadeIn 200ms;
+      }
+
+      /* ─── Welcome Screen ─── */
+      .welcome {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        gap: 16px;
+        color: var(--text-muted);
+        user-select: none;
+      }
+      .welcome-icon {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        background: var(--surface0);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        color: var(--accent);
+        box-shadow: 0 0 24px rgba(137, 180, 250, 0.08);
+      }
+      .welcome h2 {
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--text-dim);
+        letter-spacing: -0.2px;
+      }
+      .welcome p {
+        font-size: 12px;
+        color: var(--text-muted);
+        text-align: center;
+        line-height: 1.6;
+      }
+      .welcome-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 4px;
+      }
+      .welcome kbd {
+        display: inline-block;
+        padding: 1px 6px;
+        font-size: 11px;
+        font-family: var(--font-mono);
+        background: var(--surface0);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        color: var(--text-dim);
+      }
+
+      /* ─── Resize handle ─── */
+      .resize-handle {
+        height: 4px;
+        cursor: ns-resize;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+      .resize-handle::after {
+        content: '';
+        width: 32px;
+        height: 2px;
+        border-radius: 1px;
+        background: var(--surface1);
+        transition: background 120ms;
+      }
+      .resize-handle:hover::after {
+        background: var(--accent);
+      }
+
+      /* ─── Focus & interaction polish ─── */
+      .prompt-input:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.12);
+      }
+      .btn:active {
+        transform: scale(0.97);
+      }
+      .btn-send:active {
+        transform: scale(0.96);
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+
+      /* ─── Utility ─── */
+      .hidden { display: none !important; }
+
+      /* Thinking animation */
+      .thinking-indicator {
+        display: inline-flex;
+        gap: 3px;
+        align-items: center;
+        padding: 4px 0;
+      }
+      .thinking-indicator span {
+        width: 4px;
+        height: 4px;
+        border-radius: 50%;
+        background: var(--accent);
+        animation: bounce 1.2s ease infinite;
+      }
+      .thinking-indicator span:nth-child(2) { animation-delay: 0.15s; }
+      .thinking-indicator span:nth-child(3) { animation-delay: 0.3s; }
+      @keyframes bounce {
+        0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+        40% { transform: scale(1); opacity: 1; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <!-- Title Bar -->
+      <div class="titlebar">
+        <div class="titlebar-logo">
+          <div class="dot"></div>
+          <span>Moonlet</span>
+        </div>
+        <div class="spacer"></div>
+        <span class="titlebar-filepath" id="titleFilepath"></span>
+        <div class="titlebar-controls">
+          <button class="btn btn-sm" id="runFileBtn" title="Run current file">Run</button>
+          <button class="btn btn-sm" id="openTerminalBtn" title="Open terminal">Terminal</button>
+          <div class="status-pill">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="status">Starting...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <div class="sidebar-header">
+          <div style="display:flex; align-items:center; justify-content:space-between;">
+            <span class="sidebar-title">Explorer</span>
+            <div class="sidebar-actions">
+              <button class="btn btn-sm btn-icon" id="refresh" title="Refresh">&#8635;</button>
+            </div>
+          </div>
+          <div style="display:flex; gap:6px;">
+            <button class="btn btn-primary btn-sm" id="pickRoot" style="flex:1;">Import Files</button>
+            <button class="btn btn-sm" id="clearRoot" title="Unselect current directory">Unselect</button>
+          </div>
+          <div class="root-display">
+            <input id="root" placeholder="No folder selected" readonly />
+          </div>
+        </div>
+        <ul class="file-list" id="files"></ul>
+      </div>
+
+      <div class="explorer-menu hidden" id="explorerMenu">
+        <button class="explorer-menu-item" id="menuNewFile">New File</button>
+        <button class="explorer-menu-item" id="menuNewFolder">New Folder</button>
+        <button class="explorer-menu-item" id="menuRenameFile">Rename</button>
+        <button class="explorer-menu-item danger" id="menuDeleteFile">Delete</button>
+      </div>
+
+      <!-- Main Editor Area -->
+      <div class="main">
+        <div class="tab-bar">
+          <div class="tab active" id="editorTab">
+            <span class="tab-icon">&#9998;</span>
+            <span id="tabName">Welcome</span>
+            <span class="unsaved-dot" id="unsavedDot"></span>
+          </div>
+          <div style="flex:1;"></div>
+        </div>
+
+        <div class="editor-wrap">
+          <div class="editor-container">
+            <div class="welcome" id="welcomeScreen">
+              <div class="welcome-icon">&#9790;</div>
+              <h2>Moonlet</h2>
+              <p>No file selected.<br/>
+              Select a folder or create a directory to get started.</p>
+              <div class="welcome-actions">
+                <button class="btn btn-primary btn-sm" id="welcomeSelectFolderBtn">Select Folder</button>
+                <button class="btn btn-sm" id="welcomeCreateDirBtn">Create Directory</button>
+              </div>
+              <p><kbd>Enter</kbd> to send &nbsp; <kbd>Shift+Enter</kbd> for newline</p>
+            </div>
+            <div class="cm-host" id="cmHost"></div>
+            <div class="image-preview" id="imagePreviewWrap">
+              <img id="imagePreview" alt="Image preview" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Bottom Panel -->
+        <div class="bottom-panel">
+          <div class="resize-handle" id="resizeHandle"></div>
+          <div class="panel-tabs">
+            <div class="panel-tab active" id="assistantTabBtn">Assistant</div>
+            <button class="btn btn-sm" id="newChatBtn" title="Start a new chat">New Chat</button>
+            <div class="panel-tab hidden" id="terminalTabBtn">Terminal</div>
+            <button class="btn btn-sm hidden" id="terminalCloseBtn" title="Close terminal">Close</button>
+            <div class="diff-actions" id="diffActions" style="display:none;">
+              <button class="btn-apply" id="btnApply" title="Accept changes">&#10003; Accept</button>
+              <button class="btn-reject" id="btnReject" title="Reject changes">&#10007; Reject</button>
+            </div>
+            <div style="flex:1;"></div>
+            <div class="run-timer" id="runTimer"></div>
+          </div>
+          <div class="panel-body">
+            <div class="panel-view active" id="assistantView">
+              <div class="user-prompt-echo" id="userPromptEcho"></div>
+              <div class="response-area" id="response">Ready. Select a file and ask the agent to edit it.</div>
+              <div class="prompt-bar">
+                <textarea class="prompt-input" id="prompt" rows="1" placeholder="Ask the agent... or /run <command>"></textarea>
+                <div class="prompt-actions">
+                  <select id="mode" class="mode-toggle" title="Assistant mode">
+                    <option value="chat">chat</option>
+                    <option value="agent">agent</option>
+                  </select>
+                  <button class="btn-send" id="send" disabled>Send</button>
+                  <button class="btn-cancel" id="cancel">Stop</button>
+                </div>
+              </div>
+            </div>
+            <div class="panel-view hidden" id="terminalView">
+              <div class="terminal-output" id="terminalOutput"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status Bar -->
+      <div class="statusbar">
+        <span class="statusbar-item" id="statusBarFile">No file</span>
+        <div class="spacer"></div>
+        <span class="statusbar-item" id="statusBarCursor">Ln 1, Col 1</span>
+        <div class="statusbar-sep"></div>
+        <span class="statusbar-item" id="statusBarLang">Plain Text</span>
+        <div class="statusbar-sep"></div>
+        <span class="statusbar-item">UTF-8</span>
+        <div class="statusbar-sep"></div>
+        <span class="statusbar-item" id="statusBarInfo">Moonlet</span>
+      </div>
+    </div>
+
+    <script src="./node_modules/xterm/lib/xterm.js"></script>
+    <script src="./node_modules/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+    <script src="./dist/renderer.js"></script>
+  </body>
+</html>
