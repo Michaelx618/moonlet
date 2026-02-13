@@ -1,8 +1,10 @@
 import json
 import re
+import hashlib
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -70,6 +72,7 @@ from .structural import (
     select_target_symbol,
     select_target_symbols,
     build_symbol_index,
+    build_packed_context,
     extract_target_snippet,
     normalize_structural_output,
     apply_symbol_replacement,
@@ -78,6 +81,7 @@ from .structural import (
     structural_format_retry_rules,
     structural_general_retry_rules,
 )
+from .normalizer import normalize_symbol
 from .fileblock import (
     FileblockRuntime,
     run_fileblock_write,
@@ -132,6 +136,13 @@ MAX_AGENT_CHARS = 300  # truncate stored output to avoid prompt bloat
 # Route-level temperature targets
 TEMP_PLAN = 0.2
 TEMP_EXECUTE = 0.2
+
+# Structural KV cache session state:
+# one session per (file, packed_context_version, rules_version), reset on tuple change
+# and explicitly on new-chat.
+_STRUCTURAL_KV_LOCK = threading.Lock()
+_STRUCTURAL_KV_EPOCH = 0
+_STRUCTURAL_KV_ACTIVE_KEY = ""
 
 
 def _append_history(user_text: str, output: str) -> None:
@@ -673,6 +684,90 @@ def _build_structural_fail_report(reason: str, target_symbol: str = "") -> str:
     for line in repair_lines[:4]:
         out.append(f"  - {line}")
     return "\n".join(out).strip()
+
+
+def _explicit_signature_change_requested(user_text: str, target_name: str = "") -> bool:
+    low = (user_text or "").lower()
+    if not low:
+        return False
+    target_low = (target_name or "").strip().lower()
+    scoped = low
+    if target_low:
+        pat = rf"\\b{re.escape(target_low)}\\b"
+        if re.search(pat, low):
+            scoped = low
+    phrases = (
+        "change signature",
+        "update signature",
+        "modify signature",
+        "change parameter",
+        "update parameter",
+        "add parameter",
+        "remove parameter",
+        "rename parameter",
+        "change return type",
+        "update return type",
+        "make it async",
+        "remove async",
+        "change function definition",
+    )
+    return any(p in scoped for p in phrases)
+
+
+def _build_symbol_subtask_line(user_text: str, symbol_name: str) -> str:
+    lines = [ln.strip() for ln in (user_text or "").splitlines() if ln.strip()]
+    if not lines:
+        return f"Update `{symbol_name}` per request."
+    low_name = (symbol_name or "").strip().lower()
+    for ln in lines:
+        low = ln.lower()
+        if low_name and low_name in low:
+            return ln[:220]
+    for ln in lines:
+        low = ln.lower()
+        if any(tok in low for tok in ("fix", "update", "change", "add", "remove", "refactor", "implement")):
+            return ln[:220]
+    return lines[0][:220]
+
+
+def _structural_kv_tuple_key(focus_file: str) -> str:
+    file_key = _norm_rel_path(focus_file or "")
+    packed_v = str(getattr(config, "STRUCTURAL_PACKED_CONTEXT_VERSION", "1") or "1")
+    rules_v = str(getattr(config, "STRUCTURAL_RULES_VERSION", "1") or "1")
+    return f"file={file_key}|packed_v={packed_v}|rules_v={rules_v}"
+
+
+def reset_structural_kv_cache(reason: str = "manual") -> None:
+    global _STRUCTURAL_KV_EPOCH, _STRUCTURAL_KV_ACTIVE_KEY
+    with _STRUCTURAL_KV_LOCK:
+        _STRUCTURAL_KV_EPOCH += 1
+        _STRUCTURAL_KV_ACTIVE_KEY = ""
+        epoch = _STRUCTURAL_KV_EPOCH
+    dbg(f"structural.kv_reset reason={reason} epoch={epoch}")
+
+
+def _build_structural_cache_key_base(focus_file: str, request_text: str) -> str:
+    del request_text
+    tuple_key = _structural_kv_tuple_key(focus_file)
+    global _STRUCTURAL_KV_EPOCH, _STRUCTURAL_KV_ACTIVE_KEY
+    with _STRUCTURAL_KV_LOCK:
+        if tuple_key != _STRUCTURAL_KV_ACTIVE_KEY:
+            _STRUCTURAL_KV_EPOCH += 1
+            _STRUCTURAL_KV_ACTIVE_KEY = tuple_key
+            dbg(
+                "structural.kv_reset reason=tuple_changed "
+                f"epoch={_STRUCTURAL_KV_EPOCH} tuple={tuple_key}"
+            )
+        epoch = _STRUCTURAL_KV_EPOCH
+    stable = (
+        "structural_edit_kv_v2|"
+        f"{tuple_key}|"
+        f"epoch={epoch}|"
+        "contract=minimal|"
+        "one_symbol_per_run"
+    )
+    digest = hashlib.sha1(stable.encode("utf-8")).hexdigest()
+    return digest[:24]
 
 
 def _set_smoke_meta(
@@ -1800,6 +1895,8 @@ def _run_structural_write(
     forced_symbol_name: str = "",
     forbidden_symbol_names: Optional[List[str]] = None,
     defer_persist: bool = False,
+    execute_temp: Optional[float] = None,
+    cache_key_base: str = "",
 ) -> Dict[str, object]:
     start = time.time()
     trace: List[Dict[str, object]] = []
@@ -1808,6 +1905,28 @@ def _run_structural_write(
     allow_invalid_symbol_apply = bool(
         getattr(config, "STRUCTURAL_APPLY_ON_INVALID_SYMBOL", True)
     )
+    normalizer_enabled = bool(getattr(config, "NORMALIZER_ENABLED", False))
+    optional_verify_enabled = bool(
+        getattr(config, "STRUCTURAL_OPTIONAL_VERIFY_ENABLED", False)
+    )
+    optional_semantic_enabled = bool(
+        getattr(config, "STRUCTURAL_OPTIONAL_SEMANTIC_ENABLED", False)
+    )
+    dbg(f"normalizer.enabled={1 if normalizer_enabled else 0}")
+    structural_temp = TEMP_EXECUTE if execute_temp is None else float(execute_temp)
+    normalizer_meta: Dict[str, object] = {}
+    if normalizer_enabled:
+        normalizer_meta = {
+            "normalizer_version": "normalizer",
+            "normalizer_confidence": "red",
+            "normalizer_repairs": [],
+            "normalizer_stage": "",
+            "normalizer_error_code": "",
+        }
+
+    def _attach_normalizer_meta(meta_obj: Dict[str, object]) -> None:
+        if normalizer_meta:
+            meta_obj.update(normalizer_meta)
     original_content = focus_content_override
     if original_content is None:
         original_content = read_single_file_for_context(focus_file).get(focus_file, "")
@@ -1853,6 +1972,7 @@ def _run_structural_write(
         meta["file_edit_failure_kind"] = "structural"
         meta["failure_reason"] = decision_reason or "structural target not identified"
         meta["structural_fallback_reason"] = decision_reason or "structural target not identified"
+        _attach_normalizer_meta(meta)
         return {
             "output": f"[File edit failed: STRUCTURAL_INELIGIBLE: {decision_reason or 'target not identified'}]",
             "meta": meta,
@@ -1878,6 +1998,7 @@ def _run_structural_write(
         meta["failure_reason"] = "target snippet empty"
         meta["structural_target_symbol"] = target_symbol
         meta["structural_fallback_reason"] = "target snippet empty"
+        _attach_normalizer_meta(meta)
         return {
             "output": "[File edit failed: STRUCTURAL_SNIPPET_EMPTY]",
             "meta": meta,
@@ -1904,6 +2025,36 @@ def _run_structural_write(
         if _ln.strip():
             original_signature_line = _ln.strip()
             break
+
+    symbol_index = build_symbol_index(focus_file, original_content or "")
+    packed_context = build_packed_context(
+        target=target,
+        content=original_content or "",
+        index=symbol_index,
+        user_text=request_text,
+        focus_file=focus_file,
+        max_lines=max(20, int(getattr(config, "STRUCTURAL_PACKED_MAX_LINES", 200))),
+        max_bytes=max(512, int(getattr(config, "STRUCTURAL_PACKED_MAX_BYTES", 8192))),
+    )
+    if packed_context:
+        packed_lines = len(packed_context.splitlines())
+        packed_bytes = len(packed_context.encode("utf-8"))
+        dbg(
+            "structural.packed_context "
+            f"lines={packed_lines} bytes={packed_bytes} "
+            f"target={target.kind}:{target.name}"
+        )
+
+    effective_cache_base = str(cache_key_base or "").strip()
+    if not effective_cache_base:
+        effective_cache_base = _build_structural_cache_key_base(
+            focus_file=focus_file,
+            request_text=request_text,
+        )
+    structural_cache_key = ""
+    if bool(getattr(config, "STRUCTURAL_KV_CACHE_ENABLED", True)):
+        structural_cache_key = f"struct:{effective_cache_base}"
+        dbg(f"structural.cache_key={structural_cache_key}")
 
     compact_single_line_target = _looks_single_line_compact_symbol(original_symbol_text)
     if compact_single_line_target:
@@ -1953,9 +2104,10 @@ def _run_structural_write(
             reply = stream_reply(
                 forced_prompt,
                 silent=silent,
-                temperature=TEMP_EXECUTE,
+                temperature=structural_temp,
                 max_new=structural_max_new,
                 stop_sequences=structural_stop_sequences,
+                cache_key=structural_cache_key,
             )
             return _coerce_structural_reply(reply)
 
@@ -1976,11 +2128,18 @@ def _run_structural_write(
         error_message=diagnostics_hint,
         pre_sliced_request=request_text,
         focus_content_override=focus_content_override,
+        context_override=packed_context,
         analysis_packet=analysis_packet,
     )
     ctx_meta["structural_prefix_forced"] = True
     ctx_meta["structural_stop_count"] = len(structural_stop_sequences)
     ctx_meta["structural_max_new"] = structural_max_new
+    if packed_context:
+        ctx_meta["structural_packed_context"] = True
+        ctx_meta["structural_packed_context_lines"] = len(packed_context.splitlines())
+        ctx_meta["structural_packed_context_bytes"] = len(packed_context.encode("utf-8"))
+    if structural_cache_key:
+        ctx_meta["structural_cache_key"] = structural_cache_key
     if compact_single_line_target:
         ctx_meta["structural_target_was_single_line_compact"] = True
     output = _call(prompt, "structural_attempt_1")
@@ -1998,6 +2157,7 @@ def _run_structural_write(
         meta["failure_kind"] = "timeout"
         meta["failure_reason"] = f"model timed out after {config.GEN_TIMEOUT}s"
         meta["structural_target_symbol"] = target_symbol
+        _attach_normalizer_meta(meta)
         return {
             "output": "[File edit failed: MODEL_TIMEOUT]",
             "meta": meta,
@@ -2009,13 +2169,76 @@ def _run_structural_write(
             "candidate_diff": "",
         }
 
-    replacement_text, norm_err = normalize_structural_output(
-        output,
-        target_symbol=target.name,
-        original_symbol_text=original_symbol_text,
-        target_kind=target.kind,
-        focus_file=focus_file,
-    )
+    if normalizer_enabled:
+        norm = normalize_symbol(
+            raw_output=output,
+            focus_file=focus_file,
+            target_name=target.name,
+            target_kind=target.kind,
+            original_symbol_text=original_symbol_text,
+            request_text=request_text,
+        )
+        normalizer_meta["normalizer_confidence"] = norm.confidence
+        normalizer_meta["normalizer_repairs"] = list(norm.repairs or [])
+        normalizer_meta["normalizer_stage"] = norm.stage
+        normalizer_meta["normalizer_error_code"] = norm.error_code
+        replacement_text = norm.text
+        norm_err = norm.error_code
+        soft_format_codes = {
+            "norm_c_parse_failed",
+            "norm_d_risky_repair_required",
+            "norm_e_reparse_failed",
+        }
+        if norm_err in soft_format_codes:
+            legacy_text, legacy_err = normalize_structural_output(
+                output,
+                target_symbol=target.name,
+                original_symbol_text=original_symbol_text,
+                target_kind=target.kind,
+                focus_file=focus_file,
+            )
+            if not legacy_err and legacy_text:
+                replacement_text = legacy_text
+                norm_err = ""
+                normalizer_meta["normalizer_confidence"] = "yellow"
+                normalizer_meta["normalizer_error_code"] = ""
+                normalizer_meta["normalizer_repairs"] = list(norm.repairs or []) + [
+                    "legacy_normalization_fallback"
+                ]
+                normalizer_meta["normalizer_stage"] = "E"
+                dbg("normalizer.fallback=legacy")
+        if norm_err or norm.confidence == "red":
+            dbg(f"structural.reject_reason={norm_err or 'normalizer_red'}")
+            meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
+            meta.update(ctx_meta)
+            meta["mode_used"] = Route.FILE_EDIT.value
+            meta["route"] = Route.FILE_EDIT.value
+            meta["edit_mode"] = "structural"
+            meta["reject_rule"] = "STRUCTURAL_OUTPUT_INVALID"
+            meta["file_edit_failure_kind"] = "format"
+            meta["failure_kind"] = "format"
+            meta["failure_reason"] = norm_err or "normalizer_red"
+            meta["structural_target_symbol"] = target_symbol
+            meta["structural_fallback_reason"] = norm_err or "normalizer_red"
+            _attach_normalizer_meta(meta)
+            return {
+                "output": f"[File edit failed: STRUCTURAL_OUTPUT_INVALID: {norm_err or 'normalizer_red'}]",
+                "meta": meta,
+                "status_prefix": "",
+                "blocks_count": 0,
+                "retried": False,
+                "timeout": False,
+                "candidate_content": "",
+                "candidate_diff": "",
+            }
+    else:
+        replacement_text, norm_err = normalize_structural_output(
+            output,
+            target_symbol=target.name,
+            original_symbol_text=original_symbol_text,
+            target_kind=target.kind,
+            focus_file=focus_file,
+        )
     if norm_err:
         dbg(f"structural.reject_reason={norm_err}")
         meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
@@ -2029,6 +2252,7 @@ def _run_structural_write(
         meta["failure_reason"] = norm_err
         meta["structural_target_symbol"] = target_symbol
         meta["structural_fallback_reason"] = norm_err
+        _attach_normalizer_meta(meta)
         return {
             "output": f"[File edit failed: STRUCTURAL_OUTPUT_INVALID: {norm_err}]",
             "meta": meta,
@@ -2040,6 +2264,11 @@ def _run_structural_write(
             "candidate_diff": "",
         }
 
+    allow_signature_change = _explicit_signature_change_requested(
+        request_text,
+        target_name=target.name,
+    )
+
     unit_ok, unit_err = validate_replacement_symbol_unit(
         focus_file=focus_file,
         replacement_text=replacement_text,
@@ -2047,12 +2276,15 @@ def _run_structural_write(
         target_kind=target.kind,
         original_symbol_text=original_symbol_text,
         forbidden_symbol_names=list(forbidden_symbol_names or []),
+        allow_signature_change=allow_signature_change,
+        enforce_shape_guard=not normalizer_enabled,
+        normalized_mode=normalizer_enabled,
     )
     warning_kind = ""
     warning_reason = ""
     unit_invalid_symbol = False
     if not unit_ok:
-        if not allow_invalid_symbol_apply:
+        if not allow_invalid_symbol_apply and not normalizer_enabled:
             dbg(f"structural.reject_reason={unit_err}")
             meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
             meta.update(ctx_meta)
@@ -2065,6 +2297,7 @@ def _run_structural_write(
             meta["failure_reason"] = unit_err
             meta["structural_target_symbol"] = target_symbol
             meta["structural_fallback_reason"] = unit_err
+            _attach_normalizer_meta(meta)
             return {
                 "output": f"[File edit failed: STRUCTURAL_OUTPUT_INVALID: {unit_err}]",
                 "meta": meta,
@@ -2076,6 +2309,8 @@ def _run_structural_write(
                 "candidate_diff": "",
             }
         unit_invalid_symbol = True
+        if normalizer_enabled:
+            dbg(f"structural.lenient_continue.normalizer reason={unit_err}")
         dbg(f"structural.lenient_continue reason={unit_err}")
         warning_kind = "format"
         warning_reason = _normalize_failure_reason(unit_err, max_chars=400)
@@ -2099,13 +2334,28 @@ def _run_structural_write(
         meta["mode_used"] = Route.FILE_EDIT.value
         meta["route"] = Route.FILE_EDIT.value
         meta["edit_mode"] = "structural"
+        meta["structural_target_symbol"] = target_symbol
+        meta["noop"] = True
+        if normalizer_enabled:
+            meta["already_up_to_date"] = True
+            meta["applied_without_diff"] = True
+            _attach_normalizer_meta(meta)
+            return {
+                "output": "[No-op file_edit: target already up to date]",
+                "meta": meta,
+                "status_prefix": "",
+                "blocks_count": 0,
+                "retried": False,
+                "timeout": False,
+                "candidate_content": candidate_content,
+                "candidate_diff": candidate_diff,
+            }
         meta["reject_rule"] = "NO_EFFECTIVE_CHANGE"
         meta["failure_kind"] = "noop"
         meta["file_edit_failure_kind"] = "noop"
         meta["failure_reason"] = "model returned no effective file changes"
-        meta["noop"] = True
-        meta["structural_target_symbol"] = target_symbol
         meta["structural_fallback_reason"] = "no_effective_change"
+        _attach_normalizer_meta(meta)
         return {
             "output": "[No-op file_edit: model returned no effective file changes]",
             "meta": meta,
@@ -2125,9 +2375,18 @@ def _run_structural_write(
             original_content=original_content or "",
             candidate_content=candidate_content,
             target=target,
+            allow_signature_change=allow_signature_change,
         )
         if not ok_struct:
-            if allow_invalid_symbol_apply and struct_err in {
+            if normalizer_enabled:
+                dbg(f"structural.lenient_continue.normalizer reason={struct_err}")
+                if not warning_kind:
+                    warning_kind = "structural"
+                struct_reason = _normalize_failure_reason(struct_err, max_chars=400)
+                warning_reason = (
+                    f"{warning_reason}; {struct_reason}" if warning_reason else struct_reason
+                )
+            elif allow_invalid_symbol_apply and struct_err in {
                 "candidate_parse_failed",
                 "target_symbol_missing_after_replacement",
                 "symbol_region_corrupted",
@@ -2153,6 +2412,7 @@ def _run_structural_write(
                 meta["diff"] = candidate_diff
                 meta["structural_target_symbol"] = target_symbol
                 meta["structural_fallback_reason"] = struct_err
+                _attach_normalizer_meta(meta)
                 return {
                     "output": f"[File edit failed: STRUCTURAL_VALIDATE_FAIL: {struct_err}]",
                     "meta": meta,
@@ -2163,13 +2423,19 @@ def _run_structural_write(
                     "candidate_content": candidate_content,
                     "candidate_diff": candidate_diff,
                 }
-    ok, err = _sandbox_validate_candidate_content(
-        focus_file=focus_file,
-        candidate_content=candidate_content,
-        preferred_validate_cmd=preferred_validate_cmd,
-    )
+    ok = True
+    err = ""
+    run_optional_verify = (not normalizer_enabled) or optional_verify_enabled
+    if run_optional_verify:
+        ok, err = _sandbox_validate_candidate_content(
+            focus_file=focus_file,
+            candidate_content=candidate_content,
+            preferred_validate_cmd=preferred_validate_cmd,
+        )
+    else:
+        dbg("verify.skipped reason=normalizer_optional_disabled")
     if not ok:
-        if hard_fail_on_verify_fail:
+        if hard_fail_on_verify_fail and not normalizer_enabled:
             meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
             meta.update(ctx_meta)
             meta["mode_used"] = Route.FILE_EDIT.value
@@ -2183,6 +2449,7 @@ def _run_structural_write(
             meta["diff"] = candidate_diff
             meta["structural_target_symbol"] = target_symbol
             meta["structural_fallback_reason"] = _normalize_failure_reason(err or "compile failed", max_chars=400)
+            _attach_normalizer_meta(meta)
             return {
                 "output": f"[File edit failed: SYNTAX_FAIL: {(err or 'compile failed')[:500]}]",
                 "meta": meta,
@@ -2203,34 +2470,47 @@ def _run_structural_write(
         target_ext,
     )
     if collapse_reason:
-        meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
-        meta.update(ctx_meta)
-        meta["mode_used"] = Route.FILE_EDIT.value
-        meta["route"] = Route.FILE_EDIT.value
-        meta["edit_mode"] = "structural"
-        meta["reject_rule"] = "wipe_risk"
-        meta["file_edit_failure_kind"] = "rewrite_risk"
-        meta["failure_kind"] = "rewrite_risk"
-        meta["failure_reason"] = _normalize_failure_reason(collapse_reason, max_chars=400)
-        meta["structural_target_symbol"] = target_symbol
-        meta["structural_fallback_reason"] = collapse_reason
-        if candidate_diff:
-            meta["diff"] = candidate_diff
-        return {
-            "output": f"[File edit failed: WIPE_RISK: {collapse_reason}]",
-            "meta": meta,
-            "status_prefix": "",
-            "blocks_count": 0,
-            "retried": False,
-            "timeout": False,
-            "candidate_content": candidate_content,
-            "candidate_diff": candidate_diff,
-        }
+        if normalizer_enabled:
+            dbg(f"structural.lenient_continue.normalizer reason={collapse_reason}")
+            if not warning_kind:
+                warning_kind = "rewrite_risk"
+            collapse_norm = _normalize_failure_reason(collapse_reason, max_chars=400)
+            warning_reason = f"{warning_reason}; {collapse_norm}" if warning_reason else collapse_norm
+        else:
+            meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
+            meta.update(ctx_meta)
+            meta["mode_used"] = Route.FILE_EDIT.value
+            meta["route"] = Route.FILE_EDIT.value
+            meta["edit_mode"] = "structural"
+            meta["reject_rule"] = "wipe_risk"
+            meta["file_edit_failure_kind"] = "rewrite_risk"
+            meta["failure_kind"] = "rewrite_risk"
+            meta["failure_reason"] = _normalize_failure_reason(collapse_reason, max_chars=400)
+            meta["structural_target_symbol"] = target_symbol
+            meta["structural_fallback_reason"] = collapse_reason
+            if candidate_diff:
+                meta["diff"] = candidate_diff
+            _attach_normalizer_meta(meta)
+            return {
+                "output": f"[File edit failed: WIPE_RISK: {collapse_reason}]",
+                "meta": meta,
+                "status_prefix": "",
+                "blocks_count": 0,
+                "retried": False,
+                "timeout": False,
+                "candidate_content": candidate_content,
+                "candidate_diff": candidate_diff,
+            }
 
-    semantic_err = _validate_prompt_semantics(request_text, candidate_content)
+    semantic_err = ""
+    run_optional_semantic = (not normalizer_enabled) or optional_semantic_enabled
+    if run_optional_semantic:
+        semantic_err = _validate_prompt_semantics(request_text, candidate_content)
+    else:
+        dbg("verify.semantic_skipped reason=normalizer_optional_disabled")
     if semantic_err:
         dbg("verify.semantic_non_blocking_fail")
-        if hard_fail_on_verify_fail:
+        if hard_fail_on_verify_fail and not normalizer_enabled:
             meta = _build_meta(len(prompt), output, 0, False, start, trace, model_calls_used)
             meta.update(ctx_meta)
             meta["mode_used"] = Route.FILE_EDIT.value
@@ -2243,6 +2523,7 @@ def _run_structural_write(
             meta["diff"] = candidate_diff
             meta["structural_target_symbol"] = target_symbol
             meta["structural_fallback_reason"] = _normalize_failure_reason(semantic_err, max_chars=400)
+            _attach_normalizer_meta(meta)
             return {
                 "output": f"[File edit failed: SEMANTIC_FAIL: {semantic_err[:500]}]",
                 "meta": meta,
@@ -2266,12 +2547,26 @@ def _run_structural_write(
     meta["structural_target_symbol"] = target_symbol
     meta["diff"] = candidate_diff
     meta["syntax_error_count"] = 0
+    _attach_normalizer_meta(meta)
     if warning_kind:
         meta["verify_warning"] = True
         meta["non_blocking_failure"] = True
         meta["failure_kind"] = warning_kind
         meta["file_edit_failure_kind"] = warning_kind
         meta["failure_reason"] = warning_reason
+
+    if defer_persist:
+        meta["defer_persist"] = True
+        return {
+            "output": "[Candidate file_edit]",
+            "meta": meta,
+            "status_prefix": "",
+            "blocks_count": 0,
+            "retried": False,
+            "timeout": False,
+            "candidate_content": candidate_content,
+            "candidate_diff": candidate_diff,
+        }
 
     force_stage = bool(force_stage_on_verify_fail and warning_kind)
     if force_stage:
@@ -2317,6 +2612,7 @@ def _run_structural_edit(
     forbidden_symbol_names: Optional[List[str]] = None,
     baseline_content_override: Optional[str] = None,
     defer_persist: bool = False,
+    cache_key_base: str = "",
 ) -> Dict[str, object]:
     attempt_total = 2
     allow_invalid_symbol_apply = bool(
@@ -2325,6 +2621,12 @@ def _run_structural_edit(
     baseline_content = baseline_content_override
     if baseline_content is None:
         baseline_content = read_single_file_for_context(focus_file).get(focus_file, "")
+    effective_cache_base = str(cache_key_base or "").strip()
+    if not effective_cache_base:
+        effective_cache_base = _build_structural_cache_key_base(
+            focus_file=focus_file,
+            request_text=(sliced_request or user_text or ""),
+        )
     first = _run_structural_write(
         user_text=user_text,
         focus_file=focus_file,
@@ -2339,6 +2641,7 @@ def _run_structural_edit(
         forced_symbol_name=forced_symbol_name,
         forbidden_symbol_names=forbidden_symbol_names,
         defer_persist=defer_persist,
+        cache_key_base=effective_cache_base,
     )
     _annotate_failure_meta(first, attempt_index=1, attempt_total=attempt_total, focus_file=focus_file)
     first_meta = first.get("meta", {}) or {}
@@ -2346,7 +2649,6 @@ def _run_structural_edit(
     retry_trigger = "none"
     retry_hint = ""
     retry_failure_reason = ""
-    format_only_retry = False
     prefer_task_card_retry = False
     first_output = str(first.get("output", ""))
     first_success = (
@@ -2374,25 +2676,19 @@ def _run_structural_edit(
         _set_smoke_meta(first_meta, attempted=False, passed=None, failures=[])
         fail_reason = str(first_meta.get("failure_reason") or "").strip()
         fail_kind = str(first_meta.get("failure_kind") or "").strip()
+        norm_conf = str(first_meta.get("normalizer_confidence") or "").strip().lower()
+        norm_err = str(first_meta.get("normalizer_error_code") or "").strip()
         if not fail_reason:
             fail_kind, fail_reason = _extract_failure_from_output(str(first.get("output") or ""))
         retry_failure_reason = fail_reason
         target_symbol = str(first_meta.get("structural_target_symbol") or "").strip()
-        low_reason = fail_reason.lower()
-        formatting_tokens = (
-            "python_one_liner_def_not_allowed",
-            "replacement_shape_indentation_invalid",
-            "replacement_shape_missing_trailing_newline",
-            "replacement_symbol_shape_invalid",
-            "replacement_symbol_syntax_invalid",
-            "replacement_symbol_mismatch",
-            "missing_symbol_markers",
-            "markerless_output_symbol_mismatch",
-            "markerless_output_parse_failed",
-            "degenerate_low_entropy_output",
-            "unexpected_text_outside_markers",
-            "multiple_top_level_symbols_detected",
-        )
+        explicit_structural_retry = {
+            "candidate_parse_failed",
+            "symbol_region_corrupted",
+            "target_symbol_missing_after_replacement",
+            "replacement_outside_target_span",
+            "unexpected_top_level_symbol",
+        }
         if fail_kind in {"syntax", "semantic"}:
             retry_hint = _build_compile_report(fail_reason)
             retry_trigger = "compile"
@@ -2400,38 +2696,40 @@ def _run_structural_edit(
             first_meta["retry_trigger"] = "none"
             dbg("retry.skipped reason=noop_first_attempt")
             return first
-        elif fail_kind == "format" and any(tok in low_reason for tok in formatting_tokens):
+        elif norm_conf == "red" and norm_err:
             retry_hint = ""
             retry_trigger = "format"
-            format_only_retry = True
+            if norm_err:
+                retry_failure_reason = norm_err
             dbg("structural.retry.format.count=1")
-        else:
+        elif fail_kind == "structural" and fail_reason in explicit_structural_retry:
             retry_hint = _build_structural_fail_report(fail_reason or "structural edit failed", target_symbol=target_symbol)
             retry_trigger = "structural"
+        else:
+            first_meta["retry_trigger"] = "none"
+            dbg("retry.skipped reason=non_retryable_failure")
+            return first
         dbg("retry.invoked attempt=2")
 
     first_meta["retry_trigger"] = retry_trigger
     if retry_trigger == "format":
-        retry_request = (sliced_request or user_text or "").strip()
-        if not retry_request:
-            retry_request = _build_retry_base_request(
-                sliced_request=sliced_request,
-                user_text=user_text,
-                focus_file=focus_file,
-                file_content=baseline_content,
-                prefer_task_card=prefer_task_card_retry,
-            )
         target_symbol = str(first_meta.get("structural_target_symbol") or forced_symbol_name or "").strip()
         fmt_lines = structural_format_retry_rules(
             focus_file=focus_file,
             target_name=target_symbol,
             target_kind="",
         )
+        retry_request = (
+            "FORMAT ONLY RETRY:\n"
+            "- Do not change logic.\n"
+            "- Output ONLY the target symbol using the required wrapper.\n"
+            f"Target: `{target_symbol or 'target_symbol'}`.\n"
+            + "\n".join(fmt_lines)
+        ).strip()
         retry_hint = (
             "format_retry_required: "
             + (retry_failure_reason or "follow structural output format exactly")
         )
-        retry_request += "\n\n" + "\n".join(fmt_lines) + "\n"
     else:
         retry_request = _build_retry_base_request(
             sliced_request=sliced_request,
@@ -2455,6 +2753,8 @@ def _run_structural_edit(
         forced_symbol_name=forced_symbol_name,
         forbidden_symbol_names=forbidden_symbol_names,
         defer_persist=defer_persist,
+        execute_temp=(0.4 if retry_trigger == "format" else TEMP_EXECUTE),
+        cache_key_base=effective_cache_base,
     )
     _annotate_failure_meta(second, attempt_index=2, attempt_total=attempt_total, focus_file=focus_file)
     second_meta = second.get("meta", {}) or {}
@@ -2486,7 +2786,70 @@ def _run_structural_multi_symbol_edit(
     analysis_packet: str,
     sliced_request: str,
     target_names: List[str],
+    cache_key_base: str = "",
 ) -> Dict[str, object]:
+    def _finalize_sequence_result(
+        result: Dict[str, object],
+        baseline: str,
+        final_content: str,
+        total_steps: int,
+        completed_steps: int,
+        partial_failure_reason: str = "",
+    ) -> Dict[str, object]:
+        meta = result.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+            result["meta"] = meta
+
+        aggregate_diff = _compute_unified_diff(baseline or "", final_content or "", focus_file)
+        net_changed = bool(final_content != baseline and (aggregate_diff or "").strip())
+        meta["focus_file"] = focus_file
+        meta["structural_sequence_total"] = total_steps
+        meta["structural_sequence_completed"] = completed_steps
+        meta["structural_sequence_net_changed"] = net_changed
+        if aggregate_diff.strip():
+            meta["diff"] = aggregate_diff
+        result["candidate_content"] = final_content
+        result["candidate_diff"] = aggregate_diff
+
+        if not net_changed:
+            return result
+
+        # Sequence-level net changes should not be reported as no-op.
+        meta.pop("noop", None)
+        meta.pop("already_up_to_date", None)
+        meta.pop("applied_without_diff", None)
+
+        if partial_failure_reason:
+            meta["structural_sequence_partial_failure"] = True
+            meta["verify_warning"] = True
+            meta["non_blocking_failure"] = True
+            meta["failure_kind"] = "structural"
+            meta["file_edit_failure_kind"] = "structural"
+            meta["failure_reason"] = _normalize_failure_reason(
+                partial_failure_reason,
+                max_chars=400,
+            )
+
+        out = str(result.get("output") or "")
+        if out.startswith("[Applied file_edit]") or out.startswith("[Staged file_edit]"):
+            return result
+
+        if config.STAGE_EDITS:
+            meta["staged"] = True
+            meta["staged_file"] = focus_file
+            meta["staged_content"] = final_content
+            if partial_failure_reason:
+                meta["requires_user_decision"] = True
+            result["output"] = "[Staged file_edit]"
+            return result
+
+        target_path = get_root() / focus_file
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(final_content, encoding="utf-8")
+        result["output"] = "[Applied file_edit]"
+        return result
+
     names: List[str] = []
     seen = set()
     for raw in target_names or []:
@@ -2506,6 +2869,7 @@ def _run_structural_multi_symbol_edit(
             full_context=full_context,
             analysis_packet=analysis_packet,
             sliced_request=sliced_request,
+            cache_key_base=cache_key_base,
         )
 
     baseline_content = read_single_file_for_context(focus_file).get(focus_file, "")
@@ -2519,10 +2883,32 @@ def _run_structural_multi_symbol_edit(
             "structural.sequence "
             f"step={idx}/{total} target={name} defer_persist={1 if defer else 0}"
         )
-        step_request = (
-            (sliced_request or user_text or "").strip()
-            + f"\n\nSEQUENCE RULE:\n- In this pass, edit only `{name}`."
-        ).strip()
+        step_target = None
+        for sym in build_symbol_index(focus_file, current_content or ""):
+            if sym.name.lower() == name.lower():
+                step_target = sym
+                break
+        subtask_line = _build_symbol_subtask_line((sliced_request or user_text or ""), name)
+        kind_hint = str(getattr(step_target, "kind", "") or "symbol").strip() or "symbol"
+        step_lines: List[str] = [
+            f"TASK: {subtask_line}",
+            f"Target: {kind_hint} `{name}`",
+            f"Return updated {kind_hint} `{name}` only. No explanation. Keep signature unless explicitly requested.",
+        ]
+        if step_target is not None:
+            target_snippet = extract_target_snippet(
+                current_content or "",
+                step_target,
+                padding_lines=1,
+            )
+            if target_snippet:
+                step_lines.extend(
+                    [
+                        "TARGET_SNIPPET:",
+                        target_snippet,
+                    ]
+                )
+        step_request = "\n".join(step_lines).strip()
         step = _run_structural_edit(
             user_text=user_text,
             focus_file=focus_file,
@@ -2534,6 +2920,7 @@ def _run_structural_multi_symbol_edit(
             forbidden_symbol_names=forbidden,
             baseline_content_override=current_content,
             defer_persist=defer,
+            cache_key_base=cache_key_base,
         )
         step_meta = step.get("meta", {}) or {}
         step_meta["structural_sequence_total"] = total
@@ -2545,8 +2932,32 @@ def _run_structural_multi_symbol_edit(
             or out.startswith("[Staged file_edit]")
             or out.startswith("[Candidate file_edit]")
         )
+        if not ok and out.startswith("[No-op file_edit:"):
+            dbg(f"structural.sequence_noop_continue step={idx}/{total} target={name}")
+            step_meta["structural_sequence_noop"] = True
+            step_meta["structural_sequence_continued"] = True
+            current_content = str(step.get("candidate_content") or current_content)
+            last_result = step
+            continue
         if not ok:
             dbg(f"structural.sequence_failed step={idx}/{total} target={name}")
+            if current_content != baseline_content:
+                partial_reason = (
+                    f"structural sequence stopped at step {idx}/{total} "
+                    f"(target `{name}`): {out or 'failed'}"
+                )
+                dbg(
+                    "structural.sequence_partial_apply "
+                    f"step={idx}/{total} target={name}"
+                )
+                return _finalize_sequence_result(
+                    result=step,
+                    baseline=baseline_content,
+                    final_content=current_content,
+                    total_steps=total,
+                    completed_steps=idx - 1,
+                    partial_failure_reason=partial_reason,
+                )
             return step
         current_content = str(step.get("candidate_content") or current_content)
         last_result = step
@@ -2559,8 +2970,15 @@ def _run_structural_multi_symbol_edit(
             full_context=full_context,
             analysis_packet=analysis_packet,
             sliced_request=sliced_request,
+            cache_key_base=cache_key_base,
         )
-    return last_result
+    return _finalize_sequence_result(
+        result=last_result,
+        baseline=baseline_content,
+        final_content=current_content,
+        total_steps=total,
+        completed_steps=total,
+    )
 
 
 def _run_patch_edit(
@@ -2594,6 +3012,10 @@ def _run_patch_edit(
             sliced_request=sliced_request,
         )
     else:
+        structural_cache_base = _build_structural_cache_key_base(
+            focus_file=focus_file,
+            request_text=(sliced_request or user_text or ""),
+        )
         structural_targets = select_target_symbols(
             user_text=(sliced_request or user_text or ""),
             focus_file=focus_file,
@@ -2634,6 +3056,7 @@ def _run_patch_edit(
                 analysis_packet=analysis_packet,
                 sliced_request=sliced_request,
                 target_names=target_names,
+                cache_key_base=structural_cache_base,
             )
             rmeta = result.get("meta", {}) or {}
             rmeta.setdefault("structural_sequence_total", len(target_names))
@@ -2645,6 +3068,7 @@ def _run_patch_edit(
                 full_context=full_context,
                 analysis_packet=analysis_packet,
                 sliced_request=sliced_request,
+                cache_key_base=structural_cache_base,
             )
         rmeta = result.get("meta", {}) or {}
         rmeta.setdefault("edit_mode", "structural")

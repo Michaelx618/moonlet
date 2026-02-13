@@ -21,15 +21,15 @@ class StructuralOutputContractTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertIn("int add(int a, int b)", normalized)
 
-    def test_rejects_partial_markers(self) -> None:
+    def test_salvages_partial_markers(self) -> None:
         normalized, err = normalize_structural_output(
             "BEGIN_SYMBOL\nint add(int a, int b) { return a + b; }\n",
             target_symbol="add",
             target_kind="function",
             focus_file="sample.c",
         )
-        self.assertEqual(normalized, "")
-        self.assertEqual(err, "missing_symbol_markers")
+        self.assertIsNone(err)
+        self.assertIn("int add(int a, int b)", normalized)
 
     def test_accepts_markerless_valid_single_symbol(self) -> None:
         output = (
@@ -242,7 +242,7 @@ class StructuralOutputContractTests(unittest.TestCase):
         self.assertEqual(normalized, "")
         self.assertEqual(err, "multiple_root_level_blocks")
 
-    def test_rejects_python_one_liner_def(self) -> None:
+    def test_repairs_python_one_liner_def(self) -> None:
         output = (
             "BEGIN_SYMBOL\n"
             "def apply_discount(product, percent): return product\n"
@@ -254,8 +254,9 @@ class StructuralOutputContractTests(unittest.TestCase):
             target_kind="function",
             focus_file="sample.py",
         )
-        self.assertEqual(normalized, "")
-        self.assertEqual(err, "python_one_liner_def_not_allowed")
+        self.assertIsNone(err)
+        self.assertIn("def apply_discount(product, percent):", normalized)
+        self.assertIn("\n    return product\n", normalized)
 
     def test_accepts_python_multiline_with_non_four_space_indent(self) -> None:
         output = (

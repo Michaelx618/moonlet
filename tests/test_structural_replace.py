@@ -79,6 +79,32 @@ class StructuralReplaceTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "signature_modified")
 
+    def test_signature_change_allowed_when_requested(self) -> None:
+        original = (
+            "int add(int a, int b) {\n"
+            "  return a + b;\n"
+            "}\n"
+            "int mul(int a, int b) {\n"
+            "  return a * b;\n"
+            "}\n"
+        )
+        index = build_symbol_index("sample.c", original)
+        target = [s for s in index if s.name == "add"][0]
+        replacement = (
+            "long add(int a, int b) {\n"
+            "  return (long)a + (long)b;\n"
+            "}\n"
+        )
+        candidate = apply_symbol_replacement(original, target, replacement)
+        ok, reason = validate_structural_candidate(
+            focus_file="sample.c",
+            original_content=original,
+            candidate_content=candidate,
+            target=target,
+            allow_signature_change=True,
+        )
+        self.assertTrue(ok, msg=reason)
+
     def test_rejects_changes_outside_target_span(self) -> None:
         original = (
             "int add(int a, int b) {\n"
@@ -163,6 +189,61 @@ class StructuralReplaceTests(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertEqual(reason, "forbidden_symbol_definition_in_step")
+
+    def test_replacement_unit_allows_missing_trailing_newline(self) -> None:
+        replacement = (
+            "def apply_discount(product, percent):\n"
+            "    return product"
+        )
+        ok, reason = validate_replacement_symbol_unit(
+            focus_file="sample.py",
+            replacement_text=replacement,
+            target_name="apply_discount",
+            target_kind="function",
+        )
+        self.assertTrue(ok, msg=reason)
+
+    def test_replacement_unit_normalized_mode_enforces_signature_gate(self) -> None:
+        original_symbol = (
+            "int add(int a, int b) {\n"
+            "  return a + b;\n"
+            "}\n"
+        )
+        replacement = (
+            "long add(int a, int b) {\n"
+            "  return (long)a + (long)b;\n"
+            "}\n"
+        )
+        ok, reason = validate_replacement_symbol_unit(
+            focus_file="sample.c",
+            replacement_text=replacement,
+            target_name="add",
+            target_kind="function",
+            original_symbol_text=original_symbol,
+            normalized_mode=True,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "signature_modified")
+
+    def test_replacement_unit_normalized_mode_skips_scope_check(self) -> None:
+        original_symbol = (
+            "int add(int a, int b) {\n"
+            "  return a + b;\n"
+            "}\n"
+        )
+        replacement = (
+            "int add(int a, int b) { return a + b; }\n"
+            "int mul(int a, int b) { return a * b; }\n"
+        )
+        ok, reason = validate_replacement_symbol_unit(
+            focus_file="sample.c",
+            replacement_text=replacement,
+            target_name="add",
+            target_kind="function",
+            original_symbol_text=original_symbol,
+            normalized_mode=True,
+        )
+        self.assertTrue(ok, msg=reason)
 
 
 if __name__ == "__main__":

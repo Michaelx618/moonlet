@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -153,6 +154,7 @@ class _LlamaServerBackend:
         top_p: float,
         timeout_s: int,
         stop: Optional[List[str]] = None,
+        cache_key: str = "",
     ) -> str:
         self.ensure_started()
         payload = {
@@ -162,6 +164,13 @@ class _LlamaServerBackend:
             "top_p": float(top_p),
             "stream": False,
         }
+        if bool(getattr(config, "STRUCTURAL_KV_CACHE_ENABLED", True)):
+            payload["cache_prompt"] = True
+        if cache_key:
+            slots = max(1, int(getattr(config, "LLAMA_SERVER_CACHE_SLOTS", 32)))
+            slot = int(hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:8], 16) % slots
+            payload["id_slot"] = int(slot)
+            dbg(f"llama-server cache slot={slot} key={cache_key[:24]}")
         stop_list = [s for s in (stop or []) if s]
         if stop_list:
             payload["stop"] = stop_list
@@ -450,7 +459,9 @@ def _stream_reply_cli(
     max_new: int,
     stop_sequences: Optional[List[str]],
     temperature: Optional[float],
+    cache_key: str = "",
 ) -> str:
+    _ = cache_key
     dbg(f"stream_reply: gguf-cli prompt_len={len(prompt)}")
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
     dbg(f"stream_reply: gguf-cli max_new={capped_max_new}")
@@ -513,6 +524,7 @@ def _stream_reply_server(
     max_new: int,
     stop_sequences: Optional[List[str]],
     temperature: Optional[float],
+    cache_key: str = "",
 ) -> str:
     dbg(f"stream_reply: gguf-server prompt_len={len(prompt)}")
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
@@ -537,6 +549,7 @@ def _stream_reply_server(
                 top_p=config.TOP_P,
                 timeout_s=config.GEN_TIMEOUT,
                 stop=stop_sequences,
+                cache_key=cache_key,
             )
     except Exception as exc:
         msg = str(exc)
@@ -577,6 +590,7 @@ def stream_reply(
     max_new: int = 0,
     stop_sequences: Optional[List[str]] = None,
     temperature: Optional[float] = None,
+    cache_key: str = "",
 ) -> str:
     """Stream model output while returning full text."""
     if _BACKEND_KIND == "gguf_server":
@@ -587,6 +601,7 @@ def stream_reply(
             max_new,
             stop_sequences,
             temperature,
+            cache_key,
         )
     if _BACKEND_KIND == "gguf_cli":
         return _stream_reply_cli(
@@ -596,6 +611,7 @@ def stream_reply(
             max_new,
             stop_sequences,
             temperature,
+            cache_key,
         )
 
     dbg(f"stream_reply: gguf prompt_len={len(prompt)}")

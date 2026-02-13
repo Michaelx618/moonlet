@@ -372,119 +372,16 @@ def structural_output_skeleton(
     original_symbol_text: str = "",
     original_signature_line: str = "",
 ) -> List[str]:
-    ext = Path(focus_file or "").suffix.lower()
-    name = (target_name or "name").strip() or "name"
-    sig = (original_signature_line or "").strip()
+    _ = original_symbol_text
+    _ = original_signature_line
+    _ = focus_file
+    name = (target_name or "target").strip() or "target"
+    kind = (target_kind or "symbol").strip() or "symbol"
     out: List[str] = [
-        "HARD RULES:",
-        "Group 1 — Markers:",
-        "- Output MUST contain exactly one BEGIN_SYMBOL and one END_SYMBOL.",
-        "- Nothing outside markers.",
-        "- No markdown/diff/file blocks.",
-        "Group 2 — Single-Symbol:",
-        "- Return exactly one updated target symbol at module/top-level.",
+        "OUTPUT CONTRACT:",
+        f"- Return the updated {kind} `{name}` only.",
+        "- Keep the same signature unless the request explicitly asks to change it.",
         "- No other top-level symbols.",
-        "",
-        "OUTPUT FORMAT:",
-        "- Return exactly:",
-        "  BEGIN_SYMBOL",
-        "  <one updated symbol definition only>",
-        "  END_SYMBOL",
-        "- Output only the updated target symbol definition. No other text.",
-        "",
-        "Group 3 — Language-Shape:",
-    ]
-
-    if ext == ".py":
-        header = _python_extract_header_line(
-            original_signature_line=original_signature_line,
-            original_symbol_text=original_symbol_text,
-            target_name=name,
-            target_kind=target_kind,
-        )
-        header_ws = _python_header_indent(header)
-        body_indent = _python_body_indent(header_ws, original_symbol_text or "")
-        out += [
-            "Python skeleton:",
-            "BEGIN_SYMBOL",
-            header,
-            f"{body_indent}pass",
-            "END_SYMBOL",
-            "- Python: header must be on its own line and body must be indented.",
-            *(
-                [
-                    "- Python class target: class may contain nested methods/attributes; do not emit extra top-level defs/classes.",
-                    "- If request is about __post_init__, add/modify only __post_init__ inside the class.",
-                ]
-                if str(target_kind or "").strip().lower() == "class"
-                else [
-                    "- Python function target: return exactly one def with an indented body (no one-liner).",
-                ]
-            ),
-        ]
-        return out
-
-    if ext in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"}:
-        sig_line = sig or "<exact original function signature>"
-        out += [
-            "C/C++ skeleton:",
-            "BEGIN_SYMBOL",
-            f"{sig_line} {{",
-            "    <body>",
-            "}",
-            "END_SYMBOL",
-            "- C/C++: balanced braces and keep signature/header style.",
-        ]
-        return out
-
-    if ext == ".java":
-        sig_line = sig or "<exact original method signature>"
-        out += [
-            "Java skeleton:",
-            "BEGIN_SYMBOL",
-            f"{sig_line} {{",
-            "    <body>",
-            "}",
-            "END_SYMBOL",
-            "- Java: balanced braces and keep signature/header style.",
-        ]
-        return out
-
-    if ext in {".js", ".jsx", ".ts", ".tsx"}:
-        style = _js_ts_decl_style(original_symbol_text or "")
-        if style == "arrow":
-            decl = f"const {name} = (<same params>) => {{"
-        else:
-            decl = f"function {name}(<same params>) {{"
-        out += [
-            "JavaScript / TypeScript skeleton:",
-            "BEGIN_SYMBOL",
-            decl,
-            "    <body>",
-            "}",
-            "END_SYMBOL",
-            "- JS/TS: balanced braces and keep original declaration style.",
-        ]
-        return out
-
-    if ext == ".go":
-        out += [
-            "Go skeleton:",
-            "BEGIN_SYMBOL",
-            f"func {name}(<same params>) <same returns> {{",
-            "    <body>",
-            "}",
-            "END_SYMBOL",
-            "- Go: balanced braces and keep receiver/signature style.",
-        ]
-        return out
-
-    out += [
-        "Generic skeleton:",
-        "BEGIN_SYMBOL",
-        "<same symbol header/signature as original>",
-        "<body>",
-        "END_SYMBOL",
     ]
     return out
 
@@ -495,16 +392,17 @@ def structural_structure_rules(
     original_signature_line: str = "",
     original_symbol_text: str = "",
 ) -> List[str]:
+    _ = original_symbol_text
     sig = (original_signature_line or "").strip()
+    name = (target_name or "target").strip() or "target"
+    kind = (target_kind or "symbol").strip() or "symbol"
     rules: List[str] = [
         "STRUCTURE RULES:",
-        "- Preserve the same symbol kind/name.",
-        "- Preserve the same signature (params + return type) unless user explicitly requests a signature change.",
-        "- Keep the existing block/control-flow layout unless explicitly requested.",
-        "- Do NOT add or remove other top-level symbols.",
+        f"- Edit only `{name}` ({kind}).",
+        "- No unrelated top-level changes.",
     ]
     if sig:
-        rules.append(f"- Original signature/header: {sig}")
+        rules.append(f"- Keep signature/header unless explicitly requested: {sig}")
     return rules
 
 
@@ -513,42 +411,23 @@ def structural_format_retry_rules(
     target_name: str = "",
     target_kind: str = "",
 ) -> List[str]:
-    ext = Path(focus_file or "").suffix.lower()
-    name = (target_name or "target_symbol").strip() or "target_symbol"
-    lines: List[str] = [
+    _ = focus_file
+    _ = target_name
+    _ = target_kind
+    return [
         "RETRY RULES:",
-        "- Return exactly BEGIN_SYMBOL, one updated symbol definition, END_SYMBOL.",
-        "- Output only the updated target symbol definition. No other text.",
-        "- Fix formatting only; do not change logic.",
+        "- You must output exactly one symbol. Start with BEGIN_SYMBOL and end with END_SYMBOL. No other text.",
+        "BEGIN_SYMBOL",
+        "END_SYMBOL",
     ]
-    if ext == ".py":
-        lines += [
-            f"- Python: keep `{name}` header on its own line.",
-            "- Python: keep a multi-line indented body (no one-line def/class).",
-            "- Python: keep trailing newline.",
-        ]
-    elif ext in {".js", ".jsx", ".ts", ".tsx"}:
-        lines += [
-            "- JS/TS: keep original declaration style and balanced braces.",
-        ]
-    elif ext in {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".java", ".go"}:
-        lines += [
-            "- Keep signature/header style unchanged and braces balanced.",
-        ]
-    return lines
 
 
 def structural_general_retry_rules() -> List[str]:
     return [
         "RETRY RULES:",
-        "- Keep structural mode. Do NOT switch to unified diff.",
-        "- Return ONLY the full definition of TARGET_SYMBOL.",
-        "- Wrap output exactly with BEGIN_SYMBOL and END_SYMBOL markers.",
-        "- No includes, no additional top-level symbols, and no line-number prefixes.",
-        "- No markdown fences, unified diff, file blocks, or explanations.",
-        "- Ensure TARGET_SYMBOL is syntactically valid source code.",
-        "- Replace original side-effect statements when adding checks; do not duplicate them.",
-        "- If diagnostics indicate no-op, ensure output differs from current symbol.",
+        "- Keep structural mode and return only the requested target symbol.",
+        "- No explanation and no unrelated top-level symbols.",
+        "- Keep signature unless explicitly requested.",
     ]
 
 
@@ -954,6 +833,7 @@ def validate_structural_candidate(
     original_content: str,
     candidate_content: str,
     target: StructuralTarget,
+    allow_signature_change: bool = False,
 ) -> Tuple[bool, str]:
     if (candidate_content or "") == (original_content or ""):
         return False, "no_effective_change"
@@ -1002,7 +882,7 @@ def validate_structural_candidate(
     if not original_symbol_text.strip() or not candidate_symbol_text.strip():
         return False, "target_symbol_missing_after_replacement"
 
-    if target.kind in {"function", "method"}:
+    if target.kind in {"function", "method"} and not allow_signature_change:
         orig_sig = _extract_signature_info(original_symbol_text)
         cand_sig = _extract_signature_info(candidate_symbol_text)
         if not orig_sig or not cand_sig:
@@ -1079,21 +959,32 @@ def validate_replacement_symbol_unit(
     target_kind: str,
     original_symbol_text: str = "",
     forbidden_symbol_names: Optional[List[str]] = None,
+    allow_signature_change: bool = False,
+    enforce_shape_guard: bool = True,
+    normalized_mode: bool = False,
 ) -> Tuple[bool, str]:
-    if Path(focus_file or "").suffix.lower() == ".py":
-        if not _python_parses_as_module(replacement_text or ""):
-            return False, "replacement_symbol_syntax_invalid"
-        if not str(replacement_text or "").endswith("\n"):
-            return False, "replacement_shape_missing_trailing_newline"
-    scope_ok, scope_err = _validate_replacement_symbol_scope(
-        focus_file=focus_file,
-        text=replacement_text or "",
-        target_symbol=target_name,
-        target_kind=target_kind,
-        markerless=False,
-    )
-    if not scope_ok:
-        return False, scope_err or "replacement_symbol_shape_invalid"
+    if normalized_mode:
+        if not allow_signature_change:
+            sig_err = _signature_change_error(
+                target_kind=target_kind,
+                original_symbol_text=original_symbol_text,
+                replacement_text=replacement_text,
+            )
+            if sig_err:
+                return False, sig_err
+    else:
+        if Path(focus_file or "").suffix.lower() == ".py":
+            if not _python_parses_as_module(replacement_text or ""):
+                return False, "replacement_symbol_syntax_invalid"
+        scope_ok, scope_err = _validate_replacement_symbol_scope(
+            focus_file=focus_file,
+            text=replacement_text or "",
+            target_symbol=target_name,
+            target_kind=target_kind,
+            markerless=False,
+        )
+        if not scope_ok:
+            return False, scope_err or "replacement_symbol_shape_invalid"
     offender = _contains_forbidden_symbol_defs(
         focus_file=focus_file,
         text=replacement_text or "",
@@ -1101,14 +992,52 @@ def validate_replacement_symbol_unit(
     )
     if offender:
         return False, "forbidden_symbol_definition_in_step"
-    shape_err = _shape_consistency_error(
-        focus_file=focus_file,
-        original_symbol_text=original_symbol_text,
-        replacement_text=replacement_text,
-    )
-    if shape_err:
-        return False, shape_err
+    if enforce_shape_guard and not allow_signature_change:
+        shape_err = _shape_consistency_error(
+            focus_file=focus_file,
+            original_symbol_text=original_symbol_text,
+            replacement_text=replacement_text,
+        )
+        if shape_err:
+            return False, shape_err
     return True, ""
+
+
+def _signature_change_error(
+    target_kind: str,
+    original_symbol_text: str,
+    replacement_text: str,
+) -> str:
+    kind = str(target_kind or "").strip().lower()
+    original = str(original_symbol_text or "")
+    replacement = str(replacement_text or "")
+    if not original.strip() or not replacement.strip():
+        return ""
+    if kind in {"function", "method"}:
+        orig_sig = _extract_signature_info(original)
+        cand_sig = _extract_signature_info(replacement)
+        if not orig_sig or not cand_sig:
+            return "signature_modified"
+        if orig_sig[0] != cand_sig[0]:
+            return "signature_modified"
+        if int(orig_sig[1]) != int(cand_sig[1]):
+            return "signature_modified"
+        o_ret = (orig_sig[2] or "").strip()
+        c_ret = (cand_sig[2] or "").strip()
+        if o_ret and c_ret and _normalize_space(o_ret) != _normalize_space(c_ret):
+            return "signature_modified"
+        return ""
+    if kind == "class":
+        original_header = _first_nonblank_line(original)
+        replacement_header = _first_nonblank_line(replacement)
+        if (
+            original_header
+            and replacement_header
+            and _normalize_header_for_compare(original_header)
+            != _normalize_header_for_compare(replacement_header)
+        ):
+            return "signature_modified"
+    return ""
 
 
 def extract_target_snippet(content: str, target: StructuralTarget, padding_lines: int = 1) -> str:
@@ -1118,6 +1047,272 @@ def extract_target_snippet(content: str, target: StructuralTarget, padding_lines
     start = max(1, int(target.line_start) - max(0, int(padding_lines)))
     end = min(len(lines), int(target.line_end) + max(0, int(padding_lines)))
     return "\n".join(lines[start - 1 : end]).strip()
+
+
+def _target_symbol_text(content: str, target: StructuralTarget) -> str:
+    try:
+        return _slice_by_byte_range(content or "", int(target.byte_start), int(target.byte_end)).strip()
+    except Exception:
+        return extract_target_snippet(content or "", target, padding_lines=0).strip()
+
+
+def _symbol_signature_line(text: str) -> str:
+    for ln in (text or "").splitlines():
+        if ln.strip():
+            return ln.rstrip()
+    return ""
+
+
+def _request_wants_behavior_context(user_text: str) -> bool:
+    low = (user_text or "").lower()
+    if not low:
+        return False
+    signals = (
+        "behavior",
+        "logic",
+        "bug",
+        "edge case",
+        "correctness",
+        "wrong",
+        "fix",
+        "should",
+        "regression",
+        "unexpected",
+    )
+    return any(tok in low for tok in signals)
+
+
+def _identifier_counts(text: str) -> Counter:
+    ids = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", text or "")
+    return Counter(ids)
+
+
+def _direct_call_names(text: str) -> Set[str]:
+    keywords = {
+        "if", "for", "while", "switch", "return", "catch", "throw", "sizeof",
+        "print", "assert", "await", "yield", "new", "lambda",
+    }
+    calls = set(re.findall(r"(?<!\.)\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text or ""))
+    return {c for c in calls if c not in keywords}
+
+
+def _annotation_type_names(text: str) -> Set[str]:
+    out: Set[str] = set()
+    for m in re.finditer(r":\s*([A-Za-z_][A-Za-z0-9_\.]*)", text or ""):
+        out.add(str(m.group(1) or "").split(".")[-1])
+    for m in re.finditer(r"->\s*([A-Za-z_][A-Za-z0-9_\.]*)", text or ""):
+        out.add(str(m.group(1) or "").split(".")[-1])
+    return {x for x in out if x}
+
+
+def _top_level_constant_map(content: str, index: List[StructuralTarget]) -> Dict[str, Tuple[int, str]]:
+    occupied: List[Tuple[int, int]] = []
+    for sym in index:
+        if str(sym.parent or "").strip():
+            continue
+        occupied.append((int(sym.line_start), int(sym.line_end)))
+    lines = (content or "").splitlines()
+    out: Dict[str, Tuple[int, str]] = {}
+    for i, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        inside_symbol = any(s <= i <= e for s, e in occupied)
+        if inside_symbol:
+            continue
+        m = re.match(r"^\s*([A-Z][A-Z0-9_]{1,})\s*=\s*(.+)$", line)
+        if not m:
+            continue
+        name = str(m.group(1) or "").strip()
+        out[name] = (i, line.rstrip())
+    return out
+
+
+def _closest_callsite_blocks(
+    content: str,
+    target: StructuralTarget,
+    target_name: str,
+    max_sites: int = 2,
+) -> List[str]:
+    lines = (content or "").splitlines()
+    if not lines or not target_name:
+        return []
+    pat = re.compile(rf"\b{re.escape(target_name)}\s*\(")
+    hits: List[Tuple[int, int]] = []
+    for i, line in enumerate(lines, start=1):
+        if i >= int(target.line_start) and i <= int(target.line_end):
+            continue
+        if not pat.search(line):
+            continue
+        if re.search(rf"\b(?:def|class|function)\s+{re.escape(target_name)}\b", line):
+            continue
+        prev = "\n".join(lines[max(0, i - 3) : i]).lower()
+        if "__name__" in prev and "__main__" in prev:
+            continue
+        dist = abs(i - int(target.line_start))
+        hits.append((dist, i))
+    hits.sort(key=lambda t: t[0])
+    blocks: List[str] = []
+    for _dist, line_no in hits[: max(0, int(max_sites))]:
+        s = max(1, line_no - 1)
+        e = min(len(lines), line_no + 1)
+        block = "\n".join(f"{ln}| {lines[ln - 1]}" for ln in range(s, e + 1)).strip()
+        if not block:
+            continue
+        blocks.append(f"CALLSITE L{line_no}:\n{block}")
+    return blocks
+
+
+def _pack_within_budget(text: str, max_lines: int, max_bytes: int) -> bool:
+    line_count = len((text or "").splitlines())
+    byte_count = len((text or "").encode("utf-8"))
+    return line_count <= max(1, int(max_lines)) and byte_count <= max(1, int(max_bytes))
+
+
+def build_packed_context(
+    target: StructuralTarget,
+    content: str,
+    index: List[StructuralTarget],
+    user_text: str,
+    focus_file: str = "",
+    max_lines: int = 200,
+    max_bytes: int = 8192,
+) -> str:
+    lines = (content or "").splitlines()
+    if not lines:
+        return ""
+    ext = Path(focus_file or "").suffix.lower()
+    lang = "python" if ext == ".py" else (ext.lstrip(".") or "source")
+    target_text = _target_symbol_text(content or "", target)
+    if not target_text:
+        target_text = extract_target_snippet(content or "", target, padding_lines=0)
+    target_text = target_text.strip()
+    if not target_text:
+        return ""
+
+    top_level = [s for s in (index or []) if not str(s.parent or "").strip()]
+    id_counts = _identifier_counts(target_text)
+    dep_names: Set[str] = set()
+    dep_names.update(_direct_call_names(target_text))
+    dep_names.update(_annotation_type_names(target_text))
+    dep_names.discard(target.name)
+
+    name_map: Dict[str, StructuralTarget] = {}
+    for sym in top_level:
+        low = str(sym.name or "").strip().lower()
+        if low and low not in name_map:
+            name_map[low] = sym
+
+    dep_symbols: List[Tuple[int, StructuralTarget]] = []
+    for dep in dep_names:
+        sym = name_map.get(str(dep).lower())
+        if not sym:
+            continue
+        score = int(id_counts.get(sym.name, 0))
+        dep_symbols.append((score, sym))
+    dep_symbols.sort(key=lambda t: (-t[0], int(t[1].line_start), t[1].name))
+
+    const_map = _top_level_constant_map(content or "", top_level)
+    const_hits: List[Tuple[int, str, int, str]] = []
+    for name, (line_no, line_text) in const_map.items():
+        score = int(id_counts.get(name, 0))
+        if score <= 0:
+            continue
+        const_hits.append((score, name, line_no, line_text))
+    const_hits.sort(key=lambda t: (-t[0], t[2], t[1]))
+
+    header_block = (
+        f"FILE: {focus_file}\n"
+        f"LANGUAGE: {lang}\n"
+        f"TARGET_SYMBOL: {target.kind} {target.name}\n"
+        "NOTE: edit ONLY this target symbol."
+    )
+    target_block = (
+        "TARGET SYMBOL (CURRENT):\n"
+        f"{target_text}"
+    )
+
+    dep_full: List[str] = []
+    dep_sig: List[str] = []
+    dep_cap = max(1, int(getattr(config, "STRUCTURAL_PACKED_MAX_DEPS", 6)))
+    for _score, sym in dep_symbols[:dep_cap]:
+        text = _target_symbol_text(content or "", sym)
+        if not text:
+            continue
+        sig = _symbol_signature_line(text)
+        dep_full.append(f"DEP {sym.kind} `{sym.name}`:\n{text}")
+        if sig:
+            dep_sig.append(f"DEP SIG {sym.kind} `{sym.name}`: {sig}")
+    const_blocks = [
+        f"DEP CONST L{line_no} `{name}`: {line_text}"
+        for _score, name, line_no, line_text in const_hits[:dep_cap]
+    ]
+
+    callsite_blocks: List[str] = []
+    if _request_wants_behavior_context(user_text):
+        callsite_blocks = _closest_callsite_blocks(
+            content=content or "",
+            target=target,
+            target_name=target.name,
+            max_sites=max(0, int(getattr(config, "STRUCTURAL_PACKED_MAX_CALLSITES", 2))),
+        )
+
+    contract_lines = [
+        "OUTPUT CONTRACT:",
+        f"- Return updated `{target.kind} {target.name}` only.",
+        "- No explanation.",
+        "- Keep same signature unless explicitly requested.",
+    ]
+    if ext == ".py":
+        contract_lines.append("- Python: use normal multi-line def/class.")
+    contract_block = "\n".join(contract_lines)
+
+    def compose(
+        include_callsites: bool,
+        use_dep_signatures: bool,
+        dep_limit: int,
+    ) -> str:
+        sections: List[str] = [header_block, target_block]
+        if dep_full or const_blocks:
+            dep_sections: List[str] = []
+            if use_dep_signatures:
+                dep_sections.extend(dep_sig[:dep_limit])
+            else:
+                dep_sections.extend(dep_full[:dep_limit])
+            dep_sections.extend(const_blocks[:dep_limit])
+            if dep_sections:
+                sections.append("MINIMAL DEPENDENCIES:\n" + "\n\n".join(dep_sections))
+        if include_callsites and callsite_blocks:
+            sections.append("CALL SITES:\n" + "\n\n".join(callsite_blocks))
+        sections.append(contract_block)
+        return "\n\n".join(s for s in sections if s).strip()
+
+    dep_count = max(len(dep_full), len(dep_sig), len(const_blocks))
+    text = compose(include_callsites=True, use_dep_signatures=False, dep_limit=dep_count)
+    if _pack_within_budget(text, max_lines=max_lines, max_bytes=max_bytes):
+        return text
+
+    text = compose(include_callsites=False, use_dep_signatures=False, dep_limit=dep_count)
+    if _pack_within_budget(text, max_lines=max_lines, max_bytes=max_bytes):
+        return text
+
+    text = compose(include_callsites=False, use_dep_signatures=True, dep_limit=dep_count)
+    if _pack_within_budget(text, max_lines=max_lines, max_bytes=max_bytes):
+        return text
+
+    top_dep_limit = min(3, max(1, dep_count))
+    text = compose(include_callsites=False, use_dep_signatures=True, dep_limit=top_dep_limit)
+    if _pack_within_budget(text, max_lines=max_lines, max_bytes=max_bytes):
+        return text
+
+    hard_bytes = max(256, int(max_bytes))
+    hard_lines = max(12, int(max_lines))
+    trimmed_lines = text.splitlines()[:hard_lines]
+    trimmed = "\n".join(trimmed_lines)
+    if len(trimmed.encode("utf-8")) > hard_bytes:
+        data = trimmed.encode("utf-8")[:hard_bytes]
+        trimmed = data.decode("utf-8", errors="ignore").rstrip()
+    return trimmed.strip()
 
 
 def _contains_forbidden_symbol_defs(
@@ -1411,16 +1606,16 @@ def normalize_structural_output(
     has_begin = "BEGIN_SYMBOL" in text
     has_end = "END_SYMBOL" in text
     if has_begin or has_end:
-        if text.count("BEGIN_SYMBOL") != 1 or text.count("END_SYMBOL") != 1:
-            return "", "missing_symbol_markers"
-        m = re.search(r"BEGIN_SYMBOL\s*(.*?)\s*END_SYMBOL", text, re.DOTALL)
-        if not m:
-            return "", "missing_symbol_markers"
-        prefix = text[: m.start()].strip()
-        suffix = text[m.end() :].strip()
-        if prefix or suffix:
-            return "", "unexpected_text_outside_markers"
-        text = (m.group(1) or "").strip()
+        if text.count("BEGIN_SYMBOL") == 1 and text.count("END_SYMBOL") == 1:
+            m = re.search(r"BEGIN_SYMBOL\s*(.*?)\s*END_SYMBOL", text, re.DOTALL)
+            if m:
+                text = (m.group(1) or "").strip()
+            else:
+                text = text.replace("BEGIN_SYMBOL", "").replace("END_SYMBOL", "").strip()
+                dbg("structural.marker_salvage=malformed_markers")
+        else:
+            text = text.replace("BEGIN_SYMBOL", "").replace("END_SYMBOL", "").strip()
+            dbg("structural.marker_salvage=partial_markers")
     else:
         markerless = text.strip()
         marker_ok, marker_reason = _matches_single_target_symbol(
@@ -1453,6 +1648,10 @@ def normalize_structural_output(
     is_python_file = Path(focus_file or "").suffix.lower() == ".py"
     if is_python_file:
         if _python_has_one_line_header_body(text):
+            repaired = _repair_python_compact_def(text)
+            if repaired and repaired != text:
+                text = repaired
+        if _python_has_one_line_header_body(text):
             return "", "python_one_liner_def_not_allowed"
         repaired = _repair_python_compact_def(text)
         if (
@@ -1465,8 +1664,8 @@ def normalize_structural_output(
             text = repaired
         if not _python_has_indented_body(text):
             return "", "replacement_shape_indentation_invalid"
-        if not text.endswith("\n"):
-            text = f"{text}\n"
+    if not text.endswith("\n"):
+        text = f"{text}\n"
     if _is_brace_language_file(focus_file):
         if not _has_balanced_braces(text):
             return "", "brace_mismatch"

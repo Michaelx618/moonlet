@@ -1201,6 +1201,7 @@ def build_prompt(
     error_message: str = "",
     pre_sliced_request: Optional[str] = None,
     focus_content_override: Optional[str] = None,
+    context_override: str = "",
     analysis_packet: str = "",
     plan_contract: str = "",
 ) -> Tuple[str, Dict[str, object]]:
@@ -1210,19 +1211,33 @@ def build_prompt(
     use_diff_contract = mode == "agent" and (output_contract or "").strip().lower() == "diff"
     use_structural_contract = mode == "agent" and (output_contract or "").strip().lower() == "structural"
     sliced_for_context = pre_sliced_request or (user_text or "")
-    file_context, ctx_meta = _build_file_context(
-        focus_file,
-        full_context,
-        sliced_for_context or (user_text or ""),
-        focus_content_override=focus_content_override,
-        symbol_focus=use_structural_contract and bool(focus_file),
-        symbol_name=structural_target,
-        symbol_kind=structural_kind,
-        symbol_line_start=int(structural_line_start or 0),
-        symbol_line_end=int(structural_line_end or 0),
-        symbol_byte_start=int(structural_byte_start or 0),
-        symbol_byte_end=int(structural_byte_end or 0),
-    )
+    if context_override:
+        file_context = str(context_override or "").strip()
+        ctx_meta = {
+            "mode_used": "packed_structural_context",
+            "context_bytes": len(file_context),
+            "snippets_used": ["packed_context_override"],
+            "include_count": 0,
+            "include_chars": 0,
+        }
+        dbg(
+            "context_policy=packed reason=structural_packed_context_override "
+            f"bytes={ctx_meta['context_bytes']}"
+        )
+    else:
+        file_context, ctx_meta = _build_file_context(
+            focus_file,
+            full_context,
+            sliced_for_context or (user_text or ""),
+            focus_content_override=focus_content_override,
+            symbol_focus=use_structural_contract and bool(focus_file),
+            symbol_name=structural_target,
+            symbol_kind=structural_kind,
+            symbol_line_start=int(structural_line_start or 0),
+            symbol_line_end=int(structural_line_end or 0),
+            symbol_byte_start=int(structural_byte_start or 0),
+            symbol_byte_end=int(structural_byte_end or 0),
+        )
 
     if mode == "agent":
         # Agent mode: keep semantic essentials, trim low-priority context first.

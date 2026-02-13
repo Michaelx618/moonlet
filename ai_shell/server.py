@@ -344,6 +344,10 @@ class APIServer(BaseHTTPRequestHandler):
                     agent.agent_history.clear()
                 except Exception:
                     pass
+                try:
+                    agent.reset_structural_kv_cache(reason="new_chat")
+                except Exception:
+                    pass
                 self._json(200, {"status": "ok"})
             except Exception as exc:
                 self._json(500, {"error": str(exc)})

@@ -14,7 +14,12 @@ def main():
     # Start each app launch with a fresh chat session.
     try:
         from . import state
+        from . import agent
         state.clear_chat_session()
+        try:
+            agent.reset_structural_kv_cache(reason="startup")
+        except Exception:
+            pass
         print("[Started new chat session]", file=sys.stderr)
     except Exception:
         pass

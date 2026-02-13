@@ -73,7 +73,39 @@ STRUCTURAL_LOW_ENTROPY_DOMINANCE = float(
 STRUCTURAL_APPLY_ON_INVALID_SYMBOL = os.getenv(
     "SC2_STRUCTURAL_APPLY_ON_INVALID_SYMBOL", "false"
 ).lower() in ("1", "true", "yes")
-
+NORMALIZER_ENABLED = os.getenv(
+    "SC2_NORMALIZER", "true"
+).lower() in ("1", "true", "yes")
+STRUCTURAL_OPTIONAL_VERIFY_ENABLED = os.getenv(
+    "SC2_STRUCTURAL_OPTIONAL_VERIFY_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+STRUCTURAL_OPTIONAL_SEMANTIC_ENABLED = os.getenv(
+    "SC2_STRUCTURAL_OPTIONAL_SEMANTIC_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+STRUCTURAL_PACKED_MAX_LINES = int(
+    os.getenv("SC2_STRUCTURAL_PACKED_MAX_LINES", "200")
+)
+STRUCTURAL_PACKED_MAX_BYTES = int(
+    os.getenv("SC2_STRUCTURAL_PACKED_MAX_BYTES", "8192")
+)
+STRUCTURAL_PACKED_MAX_DEPS = int(
+    os.getenv("SC2_STRUCTURAL_PACKED_MAX_DEPS", "6")
+)
+STRUCTURAL_PACKED_MAX_CALLSITES = int(
+    os.getenv("SC2_STRUCTURAL_PACKED_MAX_CALLSITES", "2")
+)
+STRUCTURAL_KV_CACHE_ENABLED = os.getenv(
+    "SC2_STRUCTURAL_KV_CACHE_ENABLED", "true"
+).lower() in ("1", "true", "yes")
+STRUCTURAL_PACKED_CONTEXT_VERSION = str(
+    os.getenv("SC2_STRUCTURAL_PACKED_CONTEXT_VERSION", "1")
+).strip() or "1"
+STRUCTURAL_RULES_VERSION = str(
+    os.getenv("SC2_STRUCTURAL_RULES_VERSION", "1")
+).strip() or "1"
+LLAMA_SERVER_CACHE_SLOTS = int(
+    os.getenv("SC2_LLAMA_SERVER_CACHE_SLOTS", "32")
+)
 # Optional GGUF path for local quantized model (llama.cpp backend)
 GGUF_PATH = os.getenv("SC2_GGUF")
 GGUF_CTX = int(os.getenv("SC2_CTX_TOK", "4096"))

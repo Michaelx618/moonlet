@@ -31658,6 +31658,12 @@ ${contents.value}`;
     if (t2 === "[Applied file_edit]") {
       return "Applied code changes.";
     }
+    if (t2 === "[No-op file_edit: target already up to date]") {
+      return "No code changes needed. Target is already up to date.";
+    }
+    if (t2.startsWith("[No-op file_edit:")) {
+      return "No effective code changes were produced.";
+    }
     return t2;
   }
   async function loadConversationHistory() {
@@ -32387,6 +32393,9 @@ ${contents.value}`;
     let rawResponseBuf = "";
     let responseThrottleTimer = null;
     let metaSummaryLocked = false;
+    let pendingNoopRun = false;
+    let pendingNoopBody = "No code changes were applied. Target is already up to date.";
+    let pendingMetaFocusFile = "";
     function flushResponse() {
       if (metaSummaryLocked) return;
       responseThrottleTimer = null;
@@ -32454,6 +32463,8 @@ ${contents.value}`;
             setStatus(`Done ${dur}`, "");
             const failureKind = String(d.failure_kind || "none");
             const failureReason = String(d.failure_reason || "");
+            const noopRun = Boolean(d.noop) || String(d.output || "").startsWith("[No-op file_edit:");
+            pendingMetaFocusFile = String(d.focus_file || currentFile || "");
             let renderedMetaSummary = false;
             if (d.files_changed && d.files_changed.length > 0) {
               const fc = d.files_changed;
@@ -32496,7 +32507,10 @@ ${contents.value}`;
               rawResponseBuf = "";
               renderedMetaSummary = true;
             }
-            if (failureKind && failureKind !== "none") {
+            if (noopRun && !(d.diff && d.diff.trim())) {
+              pendingNoopRun = true;
+              pendingNoopBody = "No code changes were applied. Target is already up to date.";
+            } else if (failureKind && failureKind !== "none" && failureKind !== "noop") {
               const reason = esc(failureReason || "Agent reported a failure.");
               const tag = esc(failureKind.toUpperCase());
               const attemptInfo = d.attempt_index && d.attempt_total ? ` &middot; attempt ${Number(d.attempt_index)}/${Number(d.attempt_total)}` : "";
@@ -32564,16 +32578,45 @@ ${contents.value}`;
           await openLspForPath(currentFile, nextContent);
           const canCompare = Boolean(preRequestFile && preRequestFile === currentFile && preRequestContent !== null);
           const computedDiff = canCompare ? buildUnifiedDiffFromContents(currentFile, preRequestContent, nextContent) : "";
+          let finalHasDiff = false;
           if (computedDiff) {
+            finalHasDiff = true;
             preChangeContentByFile[currentFile] = String(preRequestContent);
             window._pendingDiff = computedDiff;
             window._perFileDiffs = window._perFileDiffs || {};
             window._perFileDiffs[currentFile] = computedDiff;
             applyDiffHighlights(computedDiff);
+            const computedSummary = summarizeDiff(computedDiff, currentFile || pendingMetaFocusFile || "");
+            responseEl.innerHTML = computedSummary;
+            responseEl.classList.add("has-content");
+            rawResponseBuf = "";
+            metaSummaryLocked = true;
+            if (activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
+              const metaText = responseEl.textContent ? responseEl.textContent.trim() : "";
+              if (metaText) {
+                panelTranscript[activeTranscriptIndex].assistant = metaText;
+                renderPanelTranscript();
+              }
+            }
           } else if (window._pendingDiff) {
+            finalHasDiff = Boolean(String(window._pendingDiff || "").trim());
             preChangeContentByFile[currentFile] = preRequestContent !== null ? String(preRequestContent) : getEditorText();
             applyDiffHighlights(window._pendingDiff);
             window._pendingDiff = null;
+          }
+          if (!finalHasDiff && pendingNoopRun) {
+            responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${pendingNoopBody}</div>`;
+            responseEl.classList.add("has-content");
+            rawResponseBuf = "";
+            clearDiffHighlights();
+            metaSummaryLocked = true;
+            if (activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
+              const metaText = responseEl.textContent ? responseEl.textContent.trim() : "";
+              if (metaText) {
+                panelTranscript[activeTranscriptIndex].assistant = metaText;
+                renderPanelTranscript();
+              }
+            }
           }
         } catch {
         }
