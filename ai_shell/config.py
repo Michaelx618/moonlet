@@ -15,7 +15,9 @@ DEBUG = os.getenv("SC2_DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_LOG_PATH = os.getenv(
     "SC2_DEBUG_LOG", "/Users/michael/moonlet/runtime-debug.log"
 )
-DEBUG_DUMP_VERBOSE = os.getenv("SC2_DEBUG_DUMP_VERBOSE", "").lower() in ("1", "true", "yes")
+# SC2_DEBUG_DUMP_VERBOSE=1: write full model output to debug log (no truncation).
+# Default: true (full dump). Set to false for truncated output.
+DEBUG_DUMP_VERBOSE = os.getenv("SC2_DEBUG_DUMP_VERBOSE", "true").lower() in ("1", "true", "yes")
 DEBUG_DUMP_MAX_LINES = int(os.getenv("SC2_DEBUG_DUMP_MAX_LINES", "20"))
 DEBUG_DUMP_MAX_CHARS = int(os.getenv("SC2_DEBUG_DUMP_MAX_CHARS", "2000"))
 GEN_TIMEOUT = int(os.getenv("SC2_GEN_TIMEOUT", "120"))
@@ -33,6 +35,11 @@ REVERT_ON_FAILURE = os.getenv("SC2_REVERT_ON_FAILURE", "false").lower() in ("1",
 STAGE_EDITS = os.getenv("SC2_STAGE_EDITS", "true").lower() in ("1", "true", "yes")
 # Analysis symbol allowlist can over-constrain edits; keep off by default.
 ENFORCE_ANALYSIS_ALLOWLIST = os.getenv("SC2_ENFORCE_ANALYSIS_ALLOWLIST", "false").lower() in ("1", "true", "yes")
+
+# Semantic search (optional: pip install sentence-transformers)
+SEMANTIC_SEARCH_ENABLED = os.getenv("SC2_SEMANTIC_SEARCH", "").lower() in ("1", "true", "yes")
+EMBEDDING_MODEL = os.getenv("SC2_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+SEMANTIC_TOP_K = int(os.getenv("SC2_SEMANTIC_TOP_K", "5"))
 
 # Patch protocol (unified diff contract) knobs
 PATCH_LEGACY_FILEBLOCK_FALLBACK = os.getenv(
@@ -56,53 +63,6 @@ PATCH_FULL_FILE_MAX_LINES = int(os.getenv("SC2_PATCH_FULL_FILE_MAX_LINES", "500"
 PATCH_TINY_SINGLE_HUNK_MAX_LINES = int(
     os.getenv("SC2_PATCH_TINY_SINGLE_HUNK_MAX_LINES", "200")
 )
-TASK_CARD_MIN_TOKENS = int(os.getenv("SC2_TASK_CARD_MIN_TOKENS", "1500"))
-SMOKE_ENABLED = os.getenv("SC2_SMOKE_ENABLED", "true").lower() in ("1", "true", "yes")
-SMOKE_TIMEOUT_DEFAULT = int(os.getenv("SC2_SMOKE_TIMEOUT_DEFAULT", "20"))
-SMOKE_MAX_SNIPPET_LINES = int(os.getenv("SC2_SMOKE_MAX_SNIPPET_LINES", "30"))
-STRUCTURAL_MAX_NEW = int(os.getenv("SC2_STRUCTURAL_MAX_NEW", "256"))
-STRUCTURAL_TINY_MAX_LINES = int(os.getenv("SC2_STRUCTURAL_TINY_MAX_LINES", "30"))
-STRUCTURAL_TINY_MAX_BYTES = int(os.getenv("SC2_STRUCTURAL_TINY_MAX_BYTES", "700"))
-STRUCTURAL_LOW_ENTROPY_ENABLED = os.getenv(
-    "SC2_STRUCTURAL_LOW_ENTROPY_ENABLED", "true"
-).lower() in ("1", "true", "yes")
-STRUCTURAL_LOW_ENTROPY_MIN_LEN = int(os.getenv("SC2_STRUCTURAL_LOW_ENTROPY_MIN_LEN", "80"))
-STRUCTURAL_LOW_ENTROPY_DOMINANCE = float(
-    os.getenv("SC2_STRUCTURAL_LOW_ENTROPY_DOMINANCE", "0.72")
-)
-STRUCTURAL_APPLY_ON_INVALID_SYMBOL = os.getenv(
-    "SC2_STRUCTURAL_APPLY_ON_INVALID_SYMBOL", "false"
-).lower() in ("1", "true", "yes")
-NORMALIZER_ENABLED = os.getenv(
-    "SC2_NORMALIZER", "true"
-).lower() in ("1", "true", "yes")
-STRUCTURAL_OPTIONAL_VERIFY_ENABLED = os.getenv(
-    "SC2_STRUCTURAL_OPTIONAL_VERIFY_ENABLED", "false"
-).lower() in ("1", "true", "yes")
-STRUCTURAL_OPTIONAL_SEMANTIC_ENABLED = os.getenv(
-    "SC2_STRUCTURAL_OPTIONAL_SEMANTIC_ENABLED", "false"
-).lower() in ("1", "true", "yes")
-STRUCTURAL_PACKED_MAX_LINES = int(
-    os.getenv("SC2_STRUCTURAL_PACKED_MAX_LINES", "200")
-)
-STRUCTURAL_PACKED_MAX_BYTES = int(
-    os.getenv("SC2_STRUCTURAL_PACKED_MAX_BYTES", "8192")
-)
-STRUCTURAL_PACKED_MAX_DEPS = int(
-    os.getenv("SC2_STRUCTURAL_PACKED_MAX_DEPS", "6")
-)
-STRUCTURAL_PACKED_MAX_CALLSITES = int(
-    os.getenv("SC2_STRUCTURAL_PACKED_MAX_CALLSITES", "2")
-)
-STRUCTURAL_KV_CACHE_ENABLED = os.getenv(
-    "SC2_STRUCTURAL_KV_CACHE_ENABLED", "true"
-).lower() in ("1", "true", "yes")
-STRUCTURAL_PACKED_CONTEXT_VERSION = str(
-    os.getenv("SC2_STRUCTURAL_PACKED_CONTEXT_VERSION", "1")
-).strip() or "1"
-STRUCTURAL_RULES_VERSION = str(
-    os.getenv("SC2_STRUCTURAL_RULES_VERSION", "1")
-).strip() or "1"
 LLAMA_SERVER_CACHE_SLOTS = int(
     os.getenv("SC2_LLAMA_SERVER_CACHE_SLOTS", "32")
 )

@@ -1,0 +1,4 @@
+# Optional: enables semantic search in relevance pipeline.
+# Set SC2_SEMANTIC_SEARCH=1 to use.
+# pip install -r requirements-semantic.txt
+sentence-transformers>=2.2.0

@@ -623,20 +623,29 @@ def discover_target_file(
     }
 
     # CamelCase words (e.g. "Queue", "LinkedList") — only multi-case names
-    # like "LinkedList" or words that look like identifiers, not plain English.
     candidates = []
     for w in re.findall(r"\b([A-Z][a-zA-Z0-9]+)\b", user_text):
         if w in _STOP:
             continue
-        # Skip words that are ALL CAPS (acronyms like "ASCII", "PCRS") or
-        # just a capitalised common word — keep CamelCase and likely class names
         if w.isupper() and len(w) > 2:
             continue  # "ASCII", "PCRS", "TAS"
         candidates.append(w)
 
-    # Cap at 5 candidates to avoid ripgrep spam
-    candidates = candidates[:5]
+    # Snake_case / common C symbols (main, fork, parent, child) when no CamelCase
+    _SNAKE_STOP = {"the", "and", "for", "with", "from", "run", "use", "try", "see", "fix"}
+    if not candidates:
+        for w in re.findall(r"\b([a-z][a-z0-9_]{2,})\b", text_lower):
+            if w in _SNAKE_STOP:
+                continue
+            if w in ("main", "fork", "parent", "child", "exec", "create", "handler"):
+                candidates.append(w)
+                break  # one snake_case candidate is enough
+        for w in re.findall(r"\b([a-z][a-z0-9_]+)\b", text_lower):
+            if w not in _SNAKE_STOP and len(w) >= 4 and w not in candidates:
+                candidates.append(w)
+                break
 
+    candidates = candidates[:5]
     if not candidates:
         return focus_file or ""
 
@@ -645,7 +654,7 @@ def discover_target_file(
         content = read_single_file_for_context(focus_file).get(focus_file, "")
         if content:
             symbols = _treesitter_parse(focus_file, content)
-            sym_names = {s.name for s in symbols if s.kind == "class"}
+            sym_names = {s.name for s in symbols if s.kind in ("class", "function", "method")}
             for cand in candidates:
                 # Exact match
                 if cand in sym_names:
@@ -659,9 +668,16 @@ def discover_target_file(
 
     # --- Ripgrep across the project ---
     try:
-        from .tools import grep_symbol_definitions
+        from .tools import grep_search, grep_symbol_definitions
         for cand in candidates:
-            result = grep_symbol_definitions(cand)
+            # Prefer definition pattern for CamelCase; for snake_case use call/def pattern
+            cand_lower = cand.lower()
+            is_snake = cand_lower == cand and "_" in cand or cand_lower in ("main", "fork", "parent", "child", "exec", "create", "handler")
+            if is_snake:
+                pattern = rf"\b{re.escape(cand)}\s*\("
+                result = grep_search(pattern, literal=False, max_results=20)
+            else:
+                result = grep_symbol_definitions(cand)
             for match in result.matches:
                 found_file = match.file.lstrip("./")
                 # Skip the file we already checked (no match there)

@@ -7,13 +7,15 @@ from typing import List
 AGENT_SYSTEM_PROMPT = (
     "You are a code-editing assistant. Enforce TASK_CARD rules when a task card is present; "
     "otherwise follow the user request. Keep edits minimal, preserve unrelated code, "
-    "keep the file buildable/syntactically valid, and do not modify main unless explicitly requested."
+    "keep the file buildable/syntactically valid. "
+    "Before editing, consider: edge cases, error handling, and consistency with existing code. "
+    "Apply the same analytical rigor you would in a code review."
 ).strip()
 
 STRUCTURAL_MINIMALITY_PROMPT = (
     "IMPORTANT:\n"
     "- Make the smallest possible change.\n"
-    "- Do NOT add new validation, logging, or error handling unless explicitly requested.\n"
+    "- Add validation and error handling when the request implies robustness (e.g., implement, complete, fix, make robust) or when the code clearly needs it. Otherwise keep changes minimal.\n"
     "- Do NOT duplicate existing logic.\n"
     "- Modify only what is necessary to satisfy the request."
 )

@@ -5,19 +5,11 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import config
 from . import state
-from .files import get_include, read_file_text, read_single_file_for_context
+from .files import get_include, get_root, read_file_text, read_single_file_for_context
+from .relevance import find_relevant_files
 from .prompts import (
-    AGENT_SYSTEM_PROMPT,
-    STRUCTURAL_MINIMALITY_PROMPT,
     _ext,
     _language_name_for_ext,
-)
-from .structural import (
-    structural_output_skeleton,
-    structural_structure_rules,
-    line_to_byte_range,
-    byte_to_line,
-    slice_by_byte_range,
 )
 from .utils import dbg, dbg_dump
 
@@ -62,10 +54,6 @@ def trim_to_budget(sections: List[Tuple[str, str]], budget: int) -> str:
 def _score_snippet(text: str, keywords: List[str]) -> int:
     lowered = text.lower()
     return sum(lowered.count(word) for word in keywords if word)
-
-
-def _looks_like_task_card(text: str) -> bool:
-    return str(text or "").lstrip().startswith("TASK_CARD")
 
 
 _STOPWORDS = frozenset({
@@ -244,186 +232,6 @@ def _imports_window(lines: List[str]) -> Optional[Tuple[int, int]]:
     return (1, min(len(lines), max(24, end + 12)))
 
 
-def _structural_is_tiny(content: str) -> bool:
-    line_count = len((content or "").splitlines())
-    byte_count = len((content or "").encode("utf-8"))
-    return (
-        line_count <= max(1, int(getattr(config, "STRUCTURAL_TINY_MAX_LINES", 30)))
-        or byte_count <= max(1, int(getattr(config, "STRUCTURAL_TINY_MAX_BYTES", 700)))
-    )
-
-
-def _line_to_byte_range_local(content: str, line_start: int, line_end: int) -> Tuple[int, int]:
-    return line_to_byte_range(content, line_start, line_end)
-
-
-def _byte_to_line_local(content: str, byte_pos: int) -> int:
-    return byte_to_line(content, byte_pos)
-
-
-def _slice_bytes_local(content: str, start: int, end: int) -> str:
-    return slice_by_byte_range(content, start, end)
-
-
-def _resolve_symbol_span(
-    focus_file: str,
-    content: str,
-    symbol_name: str,
-    symbol_kind: str,
-    line_start: int,
-    line_end: int,
-    byte_start: int,
-    byte_end: int,
-) -> Tuple[int, int, int, int]:
-    data_len = len((content or "").encode("utf-8"))
-    s_byte = int(byte_start or 0)
-    e_byte = int(byte_end or 0)
-    s_line = int(line_start or 1)
-    e_line = int(line_end or s_line)
-    if e_line < s_line:
-        e_line = s_line
-
-    if not (0 <= s_byte < e_byte <= data_len):
-        try:
-            syms = extract_symbols_treesitter(focus_file, content=content) or []
-        except Exception:
-            syms = []
-        low_name = str(symbol_name or "").strip().lower()
-        low_kind = str(symbol_kind or "").strip().lower()
-        for sym in syms:
-            name = str(getattr(sym, "name", "") or "").strip().lower()
-            kind = str(getattr(sym, "kind", "") or "").strip().lower()
-            if low_name and name != low_name:
-                continue
-            if low_kind and kind != low_kind:
-                continue
-            cand_s = int(getattr(sym, "start_byte", 0) or 0)
-            cand_e = int(getattr(sym, "end_byte", 0) or 0)
-            if 0 <= cand_s < cand_e <= data_len:
-                s_byte, e_byte = cand_s, cand_e
-                s_line = int(getattr(sym, "line", s_line) or s_line)
-                e_line = int(getattr(sym, "end_line", e_line) or e_line)
-                if e_line < s_line:
-                    e_line = s_line
-                break
-
-    if not (0 <= s_byte < e_byte <= data_len):
-        s_byte, e_byte = _line_to_byte_range_local(content, s_line, e_line)
-
-    if e_byte <= s_byte:
-        s_byte = max(0, min(data_len, s_byte))
-        e_byte = max(s_byte, min(data_len, e_byte))
-    if e_byte <= s_byte:
-        s_byte, e_byte = _line_to_byte_range_local(content, max(1, s_line), max(1, e_line))
-
-    s_line = _byte_to_line_local(content, s_byte)
-    e_line = _byte_to_line_local(content, max(s_byte, e_byte - 1))
-    if e_line < s_line:
-        e_line = s_line
-    return s_line, e_line, s_byte, e_byte
-
-
-def _is_comment_or_blank(line: str) -> bool:
-    stripped = (line or "").strip()
-    if not stripped:
-        return True
-    return stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*") or stripped.startswith("*/")
-
-
-def _structural_prelude_window(lines: List[str]) -> Tuple[int, int]:
-    if not lines:
-        return (1, 1)
-    total = len(lines)
-    max_scan = min(total, 120)
-    include_re = re.compile(
-        r"^\s*(#\s*include\b|import\b|from\b.+\bimport\b|using\b|package\b|namespace\b|module\b)"
-    )
-    decl_re = re.compile(
-        r"^\s*(#\s*define\b|typedef\b|const\b|static\s+const\b|enum\b|struct\b|class\b|type\b|using\b)"
-    )
-
-    saw_include = False
-    end = 0
-    for idx in range(1, max_scan + 1):
-        line = lines[idx - 1]
-        if include_re.match(line):
-            saw_include = True
-            end = idx
-            continue
-        if not saw_include:
-            if _is_comment_or_blank(line):
-                continue
-            break
-        if _is_comment_or_blank(line) or decl_re.match(line):
-            end = idx
-            continue
-        break
-
-    if saw_include and end > 0:
-        return (1, min(total, end))
-    return (1, min(total, 80))
-
-
-def _language_needs_neighborhood(focus_file: str) -> bool:
-    ext = _ext(focus_file)
-    return ext in {".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go", ".java", ".ts", ".tsx", ".js", ".jsx"}
-
-
-def _request_mentions_neighborhood(user_text: str) -> bool:
-    low = (user_text or "").lower()
-    phrases = (
-        "nearby",
-        "neighbor",
-        "context around",
-        "around this",
-        "around that",
-        "above",
-        "below",
-        "adjacent",
-        "surrounding",
-        "depends on nearby",
-    )
-    return any(p in low for p in phrases)
-
-
-def _target_refs_nearby_identifiers(
-    target_text: str,
-    lines: List[str],
-    start_line: int,
-    end_line: int,
-) -> bool:
-    if not target_text or not lines:
-        return False
-    ids = {
-        tok
-        for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", target_text)
-        if len(tok) >= 4
-    }
-    if not ids:
-        return False
-    low_ids = {x.lower() for x in ids}
-    total = len(lines)
-    before_s = max(1, int(start_line) - 20)
-    before_e = max(0, int(start_line) - 1)
-    after_s = min(total + 1, int(end_line) + 1)
-    after_e = min(total, int(end_line) + 20)
-    nearby_lines: List[str] = []
-    if before_e >= before_s:
-        nearby_lines.extend(lines[before_s - 1 : before_e])
-    if after_e >= after_s:
-        nearby_lines.extend(lines[after_s - 1 : after_e])
-    if not nearby_lines:
-        return False
-    nearby_text = "\n".join(nearby_lines).lower()
-    hits = 0
-    for ident in low_ids:
-        if re.search(rf"\b{re.escape(ident)}\b", nearby_text):
-            hits += 1
-            if hits >= 2:
-                return True
-    return False
-
-
 def _symbol_spans_for_file(
     focus_file: str,
     content: str,
@@ -539,33 +347,27 @@ def _helper_windows_for_calls(
     return out
 
 
-def _build_context_pack_text(
+def build_freedom_context(
     user_text: str,
     candidate_files: List[str],
-    diagnostics_text: str = "",
     max_chars: int = 14000,
-    required_symbols: Optional[List[str]] = None,
-    primary_file: str = "",
 ) -> str:
-    constraints = [
-        "Return only unified diff output.",
-        "No markdown fences and no prose outside diff.",
-        "Keep edits minimal; do not reformat unrelated lines.",
+    """Build multi-file context for freedom mode. Uses tree-sitter + grep for snippets.
+    Model decides which file(s) to edit; no single-file bias."""
+    if not candidate_files:
+        return ""
+    parts: List[str] = [
+        "FILES (edit any or all as needed):",
+        f"REQUEST: {(user_text or '').strip()}",
     ]
-    parts: List[str] = ["CONTEXT PACK:", f"REQUEST SUMMARY: {(user_text or '').strip()}"]
-    parts.append("CONSTRAINTS:")
-    for c in constraints:
-        parts.append(f"- {c}")
-
     keywords = _keywords_from_text(user_text or "")
-    for focus_file in candidate_files[: max(1, config.PATCH_MAX_FILES_PER_DIFF)]:
+    max_files = min(len(candidate_files), config.PATCH_MAX_FILES_PER_DIFF)
+    for focus_file in candidate_files[:max_files]:
         content = read_single_file_for_context(focus_file).get(focus_file, "")
         if content is None:
             content = ""
         lines = content.splitlines()
-        required = [str(s or "").strip() for s in (required_symbols or []) if str(s or "").strip()]
         parts.append(f"\nFILE: {focus_file}")
-        parts.append(f"FILE_HASH: {_sha256_text(content)}")
         summary = _build_file_summary(
             focus_file,
             content,
@@ -576,69 +378,22 @@ def _build_context_pack_text(
         if summary:
             parts.append(summary)
 
-        # For small files, include full content to stabilize hunk generation.
         if len(lines) <= max(1, int(config.PATCH_FULL_FILE_MAX_LINES)):
             parts.append("FULL FILE:")
             parts.append(content)
-            dbg(
-                "context_pack.full_file_small "
-                f"file={focus_file} lines={len(lines)}"
-            )
+            dbg(f"freedom_context: full file {focus_file} lines={len(lines)}")
             continue
 
-        # Stub-focused shaping: include target function bodies + tiny imports/header section.
-        if required and (not primary_file or focus_file == primary_file):
-            anchored_windows: List[Tuple[int, int, str]] = []
-            imp = _imports_window(lines)
-            if imp:
-                anchored_windows.append((imp[0], imp[1], "imports"))
-            fn_windows, found_symbols, all_spans = _target_function_windows(
-                focus_file,
-                content,
-                required,
-            )
-            anchored_windows.extend(fn_windows)
-            helper_windows = _helper_windows_for_calls(
-                lines,
-                fn_windows,
-                all_spans,
-                excluded_symbols=found_symbols | set(required),
-                max_helpers=2,
-            )
-            anchored_windows.extend(helper_windows)
-            if fn_windows:
-                merged = _merge_line_windows(
-                    [(s, e) for s, e, _a in anchored_windows],
-                    max_lines=8,
-                )
-                parts.append("SNIPPETS:")
-                for start, end in merged:
-                    anchor_type = "mixed"
-                    for s, e, a in anchored_windows:
-                        if s <= end and start <= e:
-                            anchor_type = a
-                            break
-                    snippet = "\n".join(lines[start - 1 : end]) if lines else ""
-                    parts.append(f"@@ SNIPPET {anchor_type} {start}-{end}")
-                    parts.append(snippet)
-                dbg(
-                    "context_pack.stub_focus "
-                    f"file={focus_file} functions={len(fn_windows)} helpers={len(helper_windows)}"
-                )
-                continue
-
-        diag_anchors = _parse_diag_lines_for_file(diagnostics_text, focus_file)
         sym_anchors = _symbol_anchor_lines(focus_file, content, keywords)
         search_anchors = _search_anchor_lines(focus_file, keywords)
         anchor_rows: List[Tuple[int, str]] = []
-        anchor_rows.extend((ln, "diagnostic") for ln in diag_anchors)
         anchor_rows.extend((ln, "symbol") for ln in sym_anchors)
         anchor_rows.extend((ln, "search") for ln in search_anchors)
 
         win = max(config.PATCH_CONTEXT_WINDOW_MIN, min(config.PATCH_CONTEXT_WINDOW_MAX, 140))
         half = max(10, win // 2)
         windows: List[Tuple[int, int]] = []
-        for line_no, _anchor in anchor_rows[:16]:
+        for line_no, _ in anchor_rows[:16]:
             windows.append((max(1, line_no - half), min(len(lines) or 1, line_no + half)))
         imp = _imports_window(lines)
         if imp:
@@ -649,18 +404,14 @@ def _build_context_pack_text(
         merged = _merge_line_windows(windows, max_lines=6)
         parts.append("SNIPPETS:")
         for start, end in merged:
-            anchor_type = "mixed"
-            for ln, typ in anchor_rows:
-                if start <= ln <= end:
-                    anchor_type = typ
-                    break
             snippet = "\n".join(lines[start - 1 : end]) if lines else ""
-            parts.append(f"@@ SNIPPET {anchor_type} {start}-{end}")
+            parts.append(f"@@ {start}-{end}")
             parts.append(snippet)
 
     text = "\n".join(parts).strip()
     if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "\n...[context pack truncated]"
+        text = text[:max_chars].rstrip() + "\n...[truncated]"
+    dbg(f"freedom_context: {max_files} files, {len(text)} chars")
     return text
 
 
@@ -913,13 +664,6 @@ def _build_file_context(
     full_context: bool,
     user_text: str,
     focus_content_override: Optional[str] = None,
-    symbol_focus: bool = False,
-    symbol_name: str = "",
-    symbol_kind: str = "",
-    symbol_line_start: int = 0,
-    symbol_line_end: int = 0,
-    symbol_byte_start: int = 0,
-    symbol_byte_end: int = 0,
 ) -> Tuple[str, Dict[str, object]]:
     """Build file context. Returns (context_text, context_meta).
     context_meta has: mode_used, context_bytes, snippets_used."""
@@ -944,85 +688,6 @@ def _build_file_context(
             line_count = len(content.splitlines())
             small_file_lines = max(1, int(config.PATCH_TINY_SINGLE_HUNK_MAX_LINES))
             is_small_file = line_count <= small_file_lines
-            if symbol_focus:
-                byte_count = len((content or "").encode("utf-8"))
-                is_tiny_structural = _structural_is_tiny(content)
-                if is_tiny_structural:
-                    section = content
-                    sections.append(section)
-                    ctx_meta["mode_used"] = "full_file"
-                    ctx_meta["context_bytes"] = len(section)
-                    ctx_meta["snippets_used"] = [f"full_file@{focus_file}"]
-                    dbg(
-                        "context_policy=full reason=structural_tiny_file_full_context "
-                        f"lines={line_count} bytes={byte_count}"
-                    )
-                    return "\n\n".join(sections), ctx_meta
-                lines = content.splitlines()
-                target_name = str(symbol_name or "").strip()
-                target_kind = str(symbol_kind or "").strip()
-                start, end, s_byte, e_byte = _resolve_symbol_span(
-                    focus_file=focus_file,
-                    content=content,
-                    symbol_name=target_name,
-                    symbol_kind=target_kind,
-                    line_start=int(symbol_line_start or 0),
-                    line_end=int(symbol_line_end or 0),
-                    byte_start=int(symbol_byte_start or 0),
-                    byte_end=int(symbol_byte_end or 0),
-                )
-                target_text = _slice_bytes_local(content, s_byte, e_byte).strip()
-                if not target_text:
-                    target_text = "\n".join(lines[max(1, start) - 1 : min(line_count, end)]).strip()
-
-                prelude_s, prelude_e = _structural_prelude_window(lines)
-                prelude_text = "\n".join(lines[prelude_s - 1 : prelude_e]).strip()
-
-                include_neighborhood = (
-                    _language_needs_neighborhood(focus_file)
-                    or _request_mentions_neighborhood(user_text)
-                    or _target_refs_nearby_identifiers(target_text, lines, start, end)
-                )
-                neighborhood_text = ""
-                if include_neighborhood:
-                    before_s = max(1, start - 20)
-                    before_e = max(0, start - 1)
-                    after_s = min(line_count + 1, end + 1)
-                    after_e = min(line_count, end + 20)
-                    parts: List[str] = []
-                    if before_e >= before_s:
-                        parts.append("BEFORE_TARGET:")
-                        parts.append("\n".join(lines[before_s - 1 : before_e]).strip())
-                    if after_e >= after_s:
-                        parts.append("AFTER_TARGET:")
-                        parts.append("\n".join(lines[after_s - 1 : after_e]).strip())
-                    neighborhood_text = "\n\n".join([p for p in parts if p]).strip()
-
-                target_label = target_name or "<symbol>"
-                section = (
-                    f"FILE: {focus_file}\n"
-                    f"LANGUAGE: {lang}\n"
-                    "PRELUDE:\n"
-                    f"{prelude_text}\n\n"
-                    "TARGET_SYMBOL:\n"
-                    f"{target_text}"
-                )
-                if neighborhood_text:
-                    section += f"\n\nNEIGHBORHOOD:\n{neighborhood_text}"
-                sections.append(section)
-                ctx_meta["mode_used"] = "focused_symbol"
-                ctx_meta["context_bytes"] = len(section)
-                snippet_labels = [f"prelude@L{prelude_s}-{prelude_e}", f"symbol@L{start}-{end}"]
-                if neighborhood_text:
-                    snippet_labels.append(f"neighborhood@L{max(1, start-20)}-{min(line_count, end+20)}")
-                ctx_meta["snippets_used"] = snippet_labels
-                dbg(
-                    "context_policy=focused reason=structural_symbol_context_pack "
-                    f"lines={line_count} bytes={byte_count} symbol={target_label} "
-                    f"neighborhood={1 if bool(neighborhood_text) else 0}"
-                )
-                # Symbol-focused context is intentionally lean; skip full-file logic.
-                return "\n\n".join(sections), ctx_meta
             if full_context or is_small_file or not _is_existing_nontiny(content):
                 # Explicit full context, small files, and tiny/new files use full content.
                 body = content
@@ -1124,6 +789,11 @@ def _build_chat_history(mode: str = "chat") -> str:
                 return True
         return False
 
+    # Per-turn char caps for history (no hard cap; these control prompt size)
+    HISTORY_USER_CHARS = 450
+    HISTORY_ASSISTANT_CHARS = 400
+    HISTORY_NOTE_CHARS = 350
+
     def _short(s: str, n: int = 220) -> str:
         s = re.sub(r"\s+", " ", (s or "")).strip()
         if len(s) <= n:
@@ -1147,10 +817,9 @@ def _build_chat_history(mode: str = "chat") -> str:
     lines = []
     for user_text, assistant_text in pairs:
         if user_text:
-            lines.append(f"User: {_short(user_text, 220)}")
+            lines.append(f"User: {_short(user_text, HISTORY_USER_CHARS)}")
         if assistant_text:
-            # Cap assistant responses in chat history to 200 chars
-            trimmed = _short(assistant_text, 200)
+            trimmed = _short(assistant_text, HISTORY_ASSISTANT_CHARS)
             lines.append(f"Assistant: {trimmed}")
     try:
         change_notes = list(state.get_change_notes() or [])
@@ -1159,28 +828,10 @@ def _build_chat_history(mode: str = "chat") -> str:
     if change_notes:
         lines.append("Recent code changes:")
         for note in change_notes[-2:]:
-            note_text = _short(str(note or ""), 200)
+            note_text = _short(str(note or ""), HISTORY_NOTE_CHARS)
             if note_text:
                 lines.append(f"- {note_text}")
     return "\n".join(lines)
-
-
-def _task_card_required_symbols(task_card_text: str) -> List[str]:
-    """Extract required symbol names from TASK_CARD work items."""
-    if not task_card_text:
-        return []
-    out: List[str] = []
-    seen = set()
-    for line in task_card_text.splitlines():
-        m = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)`", line)
-        if not m:
-            continue
-        name = m.group(1).strip()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out[:10]
 
 
 def build_prompt(
@@ -1208,8 +859,6 @@ def build_prompt(
     """Build a prompt from prioritized sections and budget.
     Returns (prompt_text, context_meta) where context_meta has:
     mode_used, context_bytes, snippets_used."""
-    use_diff_contract = mode == "agent" and (output_contract or "").strip().lower() == "diff"
-    use_structural_contract = mode == "agent" and (output_contract or "").strip().lower() == "structural"
     sliced_for_context = pre_sliced_request or (user_text or "")
     if context_override:
         file_context = str(context_override or "").strip()
@@ -1230,281 +879,42 @@ def build_prompt(
             full_context,
             sliced_for_context or (user_text or ""),
             focus_content_override=focus_content_override,
-            symbol_focus=use_structural_contract and bool(focus_file),
-            symbol_name=structural_target,
-            symbol_kind=structural_kind,
-            symbol_line_start=int(structural_line_start or 0),
-            symbol_line_end=int(structural_line_end or 0),
-            symbol_byte_start=int(structural_byte_start or 0),
-            symbol_byte_end=int(structural_byte_end or 0),
         )
-
-    if mode == "agent":
-        # Agent mode: keep semantic essentials, trim low-priority context first.
-        history = ""
-        if not force_file_block and not use_diff_contract and not use_structural_contract:
-            history = _build_chat_history("agent")
-            if history:
-                dbg("prompt_buffer: history included")
-            else:
-                dbg("prompt_buffer: history skipped")
-        req_text = (pre_sliced_request or user_text or "").strip()
-        dbg(f"prompt_buffer: request_slice_len={len(req_text)}")
-        if not req_text:
-            req_text = (user_text or "").strip()
-        required_symbols = _task_card_required_symbols(req_text)
-
-        if use_diff_contract and focus_file:
-            candidate_files: List[str] = [focus_file]
-            try:
-                include_files = list(get_include() or [])
-            except Exception:
-                include_files = []
-            for rel in include_files:
-                if rel and rel != focus_file:
-                    candidate_files.append(rel)
-            file_context = _build_context_pack_text(
-                req_text,
-                candidate_files=candidate_files,
-                diagnostics_text=error_message or "",
-                max_chars=max(2000, int(config.CTX_CHAR_BUDGET * 0.8)),
-                required_symbols=required_symbols,
-                primary_file=focus_file,
-            )
-            ctx_meta["mode_used"] = "context_pack"
-            ctx_meta["context_bytes"] = len(file_context)
-            ctx_meta["snippets_used"] = candidate_files[: config.PATCH_MAX_FILES_PER_DIFF]
-            dbg(
-                "context_pack.metrics "
-                f"files={len(ctx_meta['snippets_used'])} "
-                f"bytes={ctx_meta['context_bytes']}"
-            )
-
-        instruction_block = [
-            AGENT_SYSTEM_PROMPT,
-            "Work from TASK_CARD when present; otherwise work from USER_REQUEST and file context below.",
-            "You may reason internally in chat style, but output only the required artifact.",
-        ]
-        if use_structural_contract:
-            instruction_block.append(STRUCTURAL_MINIMALITY_PROMPT)
-        if focus_file:
-            instruction_block.append(f"Target file: {focus_file}")
-        if error_message:
-            instruction_block.append(f"Previous error: {error_message}")
-        output_rules = []
-        structure_block = ""
-        if use_diff_contract:
-            tiny_single_hunk = False
-            if focus_file:
-                try:
-                    if focus_content_override is not None:
-                        _tiny_content = focus_content_override
-                    else:
-                        _tiny_content = read_single_file_for_context(focus_file).get(focus_file, "")
-                    _tiny_lines = len((_tiny_content or "").splitlines())
-                    tiny_single_hunk = _tiny_lines < max(
-                        1, int(config.PATCH_TINY_SINGLE_HUNK_MAX_LINES)
-                    )
-                except Exception:
-                    tiny_single_hunk = False
-            output_rules = [
-                "OUTPUT RULES:",
-                "- Return ONLY a unified diff patch.",
-                "- No markdown fences and no prose/explanations.",
-                "- Include --- / +++ headers and valid @@ hunks.",
-                "- The diff must apply to the provided CONTEXT PACK.",
-                *(
-                    [
-                        "- Tiny-file policy: this file is under 200 lines; prefer a single hunk.",
-                        "- If needed, multiple non-overlapping hunks are allowed for tiny files.",
-                    ]
-                    if tiny_single_hunk
-                    else [
-                        "- Use one hunk per function; if editing two functions, output two hunks.",
-                        "- Each hunk must include strong unchanged anchors (signature/context lines).",
-                        "- Do not span one hunk across two functions.",
-                    ]
-                ),
-                "- Keep edits minimal and do not reformat unrelated lines.",
-                "RESPONSE:",
-            ]
-        elif use_structural_contract and focus_file:
-            original_symbol = (structural_original_symbol or "").strip()
-            if original_symbol:
-                sym_lines = original_symbol.splitlines()
-                if len(sym_lines) > 120:
-                    original_symbol = "\n".join(sym_lines[:120]).rstrip() + "\n# ... truncated ..."
-                symbol_already_in_context = original_symbol in (file_context or "")
-                structure_lines = []
-                if symbol_already_in_context:
-                    structure_lines.append(
-                        "ORIGINAL_TARGET_SYMBOL is already present in CONTEXT PACK above; do not duplicate it."
-                    )
-                else:
-                    structure_lines.extend(
-                        [
-                            "ORIGINAL_TARGET_SYMBOL (verbatim):",
-                            original_symbol,
-                        ]
-                    )
-                structure_lines.extend(
-                    structural_structure_rules(
-                        target_kind=structural_kind,
-                        target_name=structural_target,
-                        original_signature_line=structural_signature_line,
-                        original_symbol_text=original_symbol,
-                    )
-                )
-                structure_block = "\n".join(structure_lines).strip()
-            output_rules = [
-                *structural_output_skeleton(
-                    focus_file=focus_file,
-                    target_name=structural_target,
-                    target_kind=structural_kind,
-                    original_symbol_text=structural_original_symbol,
-                    original_signature_line=structural_signature_line,
-                ),
-                "RESPONSE:",
-            ]
-        elif force_file_block and focus_file:
-            output_rules = [
-                "OUTPUT RULES:",
-                f"- Return exactly ONE block: [[[file: {focus_file}]]] ... [[[end]]].",
-                "- Output the FULL updated file content (not a snippet).",
-                "- Modify only the target file; preserve unrelated code/structure.",
-                "- Satisfy TASK_CARD work items with minimal edits.",
-                "- Keep code buildable/syntactically valid.",
-                "- Do not modify main unless explicitly requested.",
-                *(
-                    [f"- Required symbols to complete in this pass: {', '.join(required_symbols)}."]
-                    if required_symbols else []
-                ),
-                "- Never assume file/stream cursor position; set/restore cursor before reads/writes.",
-                "RESPONSE:",
-            ]
-        else:
-            output_rules = ["RESPONSE:"]
-        request_label = "TASK_CARD" if _looks_like_task_card(req_text) else "USER_REQUEST"
-        mandatory_parts = [
-            "\n".join(instruction_block),
-            f"{request_label}:\n{req_text}",
-        ]
-        if structure_block:
-            mandatory_parts.append(structure_block)
-        mandatory_parts.append("\n".join(output_rules))
-        dependency_block = ""
-        if analysis_packet:
-            try:
-                parsed = json.loads(analysis_packet)
-            except Exception:
-                parsed = {}
-            dep_items = parsed.get("dependency_context") if isinstance(parsed, dict) else []
-            if isinstance(dep_items, list) and dep_items:
-                compact_rows: List[str] = []
-                for item in dep_items[:2]:
-                    if not isinstance(item, dict):
-                        continue
-                    f = str(item.get("file") or "").strip()
-                    sym = str(item.get("symbol") or "").strip()
-                    snip = re.sub(r"\s+", " ", str(item.get("snippet") or "")).strip()[:220]
-                    if not snip:
-                        continue
-                    lead = f"{f}:{sym}" if (f or sym) else "dependency"
-                    compact_rows.append(f"- {lead} :: {snip}")
-                if compact_rows:
-                    dependency_block = "DEPENDENCY CONTEXT:\n" + "\n".join(compact_rows)
-        rule_lines = [ln.strip() for ln in AGENT_SYSTEM_PROMPT.splitlines() if ln.strip()]
-        if focus_file:
-            rule_lines.append(f"Target file: {focus_file}")
-        if use_diff_contract:
-            rule_lines.append("Output contract: unified diff only.")
-        elif use_structural_contract:
-            rule_lines.append("Output contract: structural symbol replacement only.")
-            if structural_target:
-                rule_lines.append(f"Target symbol: {structural_target}.")
-        elif force_file_block and focus_file:
-            rule_lines.append(f"Return one file block for {focus_file}.")
-            rule_lines.append("Output full updated file content, not snippets.")
-            if required_symbols:
-                rule_lines.append(f"Required symbols: {', '.join(required_symbols)}.")
-        if error_message:
-            rule_lines.append("Fix previous error.")
-        dbg(f"agent_rules_count={len(rule_lines)}")
-        dbg_dump("agent_rules_effective", "\n".join(rule_lines))
-
-        optional_parts: List[str] = []
-        if dependency_block:
-            optional_parts.append(dependency_block)
-        if file_context:
-            optional_parts.append(file_context)
-        if history:
-            optional_parts.append(f"Recent commands:\n{history}")
-
-        prompt = "\n\n".join(mandatory_parts[:-1] + optional_parts + [mandatory_parts[-1]])
-        budget = config.CTX_CHAR_BUDGET
-        if len(prompt) <= budget:
-            return prompt, ctx_meta
-
-        # Trim low-priority sections in order:
-        # include snippets -> history -> previews/examples -> mandatory only.
-        dbg(f"agent_prompt_trim: over_budget initial_len={len(prompt)} budget={budget}")
-        context_no_includes = file_context
-        if context_no_includes:
-            context_no_includes = re.sub(
-                r"(?:^|\n)INCLUDE:\s[^\n]+(?:\n.*?)*(?=\nINCLUDE:|\Z)",
-                "",
-                context_no_includes,
-                flags=re.DOTALL,
-            ).strip()
-
-        prompt = "\n\n".join(
-            mandatory_parts[:-1]
-            + ([context_no_includes] if context_no_includes else [])
-            + ([f"Recent commands:\n{history}"] if history else [])
-            + [mandatory_parts[-1]]
-        )
-        if len(prompt) <= budget:
-            dbg("agent_prompt_trim: removed include snippets")
-            return prompt, ctx_meta
-
-        prompt = "\n\n".join(
-            mandatory_parts[:-1]
-            + ([context_no_includes] if context_no_includes else [])
-            + [mandatory_parts[-1]]
-        )
-        if len(prompt) <= budget:
-            dbg("agent_prompt_trim: removed history")
-            return prompt, ctx_meta
-
-        compact_context = _head_tail(context_no_includes, 1000) if context_no_includes else ""
-        prompt = "\n\n".join(
-            mandatory_parts[:-1]
-            + ([compact_context] if compact_context else [])
-            + [mandatory_parts[-1]]
-        )
-        if len(prompt) <= budget:
-            dbg("agent_prompt_trim: compacted context head+tail")
-            return prompt, ctx_meta
-
-        # Last resort: shrink task card text, keep output rules intact.
-        req_text = _head_tail(req_text, 700)
-        mandatory_parts[1] = f"TASK_CARD:\n{req_text}"
-        prompt = "\n\n".join(mandatory_parts[:-1] + [mandatory_parts[-1]])
-        if len(prompt) > budget:
-            dbg("agent_prompt_trim: hard_cap_applied keep OUTPUT RULES+RESPONSE")
-            tail = mandatory_parts[-1]
-            room = max(0, budget - len(tail) - 2)
-            head = "\n\n".join(mandatory_parts[:-1])[:room]
-            prompt = f"{head}\n\n{tail}"
-        return prompt, ctx_meta
 
     # Chat mode: use section-based template.
+    # When user asks to read a file but no focus_file, discover it for context.
+    effective_focus = focus_file
+    if not effective_focus and user_text:
+        low = (user_text or "").lower()
+        read_intent = bool(
+            re.search(r"\b(?:read|show|open|display|what'?s?\s+in)\s+(?:the\s+)?", low)
+            or re.search(r"\b(?:makefile|readme|dockerfile)\b", low)
+        )
+        if read_intent:
+            discovered = find_relevant_files(user_text, open_file=None)
+            if discovered:
+                effective_focus = discovered[0]
+                dbg(f"chat: discovered focus_file for read intent: {effective_focus}")
+    if effective_focus and not file_context:
+        file_context, ctx_meta = _build_file_context(
+            effective_focus,
+            full_context=False,
+            user_text=sliced_for_context or (user_text or ""),
+            focus_content_override=focus_content_override,
+        )
     # Keep short conversational turns lean to avoid history/context bleed.
-    system = (
-        "You are a helpful assistant. "
-        "Default to concise responses: short answer first, then only essential details. "
-        "Avoid long preambles and avoid repeating the user's prompt."
-    )
+    if mode == "chat_for_agent":
+        system = (
+            "You are a code-editing assistant.Do what the user says and nothing more "
+            "When the user asks for code: give code only with minimal explanation. "
+            "You may edit one or more files; indicate which file each block goes to."
+        )
+    else:
+        system = (
+            "You are a helpful assistant. "
+            "Default to concise responses: short answer first, then only essential details. "
+            "Avoid long preambles and avoid repeating the user's prompt."
+        )
     user_trimmed = (user_text or "").strip()
     low = user_trimmed.lower()
     short_chat = (

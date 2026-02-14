@@ -1,3 +1,4 @@
+import difflib
 import os
 import re
 import subprocess
@@ -12,9 +13,24 @@ from .utils import dbg
 try:
     from file_utils import generate_diff, is_security_concern
 except ImportError:
-    # Fallback if file_utils not available
-    def generate_diff(*args, **kwargs):
-        return ""
+    # Fallback: real diff so green lines always show when file_utils unavailable
+    def generate_diff(
+        old_content: str,
+        new_content: str,
+        filepath: str,
+        context_lines: int = 3,
+    ) -> str:
+        old_lines = (old_content or "").splitlines(keepends=True)
+        new_lines = (new_content or "").splitlines(keepends=True)
+        diff = difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=str(filepath),
+            tofile=str(filepath),
+            lineterm="",
+            n=context_lines,
+        )
+        return "".join(diff)
 
     def is_security_concern(*args, **kwargs):
         return False
@@ -326,14 +342,14 @@ def _is_new_or_empty_file(focus_file: str) -> bool:
 
 def apply_blocks_with_report(
     blocks: List[Tuple[str, str]], show_diff: bool = True, dry_run: bool = False
-) -> Tuple[List[str], List[Dict[str, str]]]:
+) -> Tuple[List[str], List[Dict[str, str]], Dict[str, str], Dict[str, str]]:
     """Apply file blocks with optional diff preview.
 
-    Enhanced with diff generation from Continue codebase.
+    Returns (touched, skipped, per_file_diffs, per_file_staged) for UI staging.
     """
     if not blocks:
         dbg("apply_blocks: no blocks to apply")
-        return [], []
+        return [], [], {}, {}
     dbg(f"apply_blocks: count={len(blocks)}")
     if len(blocks) > 1:
         per_path: Dict[str, Dict[str, Tuple[str, str]]] = {}
@@ -364,6 +380,8 @@ def apply_blocks_with_report(
         blocks = normalized_blocks
     touched: List[str] = []
     skipped: List[Dict[str, str]] = []
+    per_file_diffs: Dict[str, str] = {}
+    per_file_staged: Dict[str, str] = {}
     for rel_path, content in blocks:
         try:
             rel_path = _norm_rel_path(rel_path)
@@ -407,17 +425,26 @@ def apply_blocks_with_report(
                 diff = generate_diff(old_content, content, str(target))
                 print(f"\n[Diff for {rel_path}]:")
                 print(diff)
+                per_file_diffs[rel_path] = diff
             except Exception as exc:
                 print(f"[warning] Could not generate diff: {exc}")
+        elif not target.exists() and content.strip():
+            try:
+                diff = generate_diff("", content, str(target))
+                per_file_diffs[rel_path] = diff
+            except Exception:
+                pass
         if old_content is not None and old_content == content:
             dbg(f"apply_blocks: no-op write (identical) for {rel_path}")
             skipped.append({"path": rel_path, "reason": "identical_content"})
             continue
         dbg(f"apply_blocks: writing {rel_path} bytes={len(content)}")
-        _write_atomic(target, content)
-        print(f"[wrote] {rel_path}")
+        if not dry_run:
+            _write_atomic(target, content)
+            print(f"[wrote] {rel_path}")
         touched.append(rel_path)
-    return touched, skipped
+        per_file_staged[rel_path] = content
+    return touched, skipped, per_file_diffs, per_file_staged
 
 
 def apply_blocks(blocks: List[Tuple[str, str]], show_diff: bool = True) -> List[str]:
@@ -775,7 +802,8 @@ def apply_unified_diff(
     hunks: list,
     anchor_line: int = 0,
     root_override: Optional[Path] = None,
-) -> None:
+    dry_run: bool = False,
+) -> Optional[str]:
     """Apply parsed unified diff hunks to a file using context matching.
 
     hunks: list of DiffHunk objects (from parse_unified_diff).
@@ -859,8 +887,11 @@ def apply_unified_diff(
             file_lines[insert_pos:insert_pos] = replacement
             dbg(f"apply_diff: pure insertion at line {insert_pos + 1}, "
                 f"inserted {len(replacement)} lines")
-            _write_atomic(target, "\n".join(file_lines) + ("\n" if file_lines else ""))
-            return
+            result = "\n".join(file_lines) + ("\n" if file_lines else "")
+            if dry_run:
+                return result
+            _write_atomic(target, result)
+            return None
 
         # Find where this hunk matches in the file.
         # Prefer rg-derived hint when enabled (and no explicit anchor_line).
@@ -925,7 +956,11 @@ def apply_unified_diff(
         dbg(f"apply_diff: hunk applied at line {pos + 1}, "
             f"removed {n_expected} lines, inserted {len(replacement)} lines")
 
-    _write_atomic(target, "\n".join(file_lines) + ("\n" if file_lines else ""))
+    result = "\n".join(file_lines) + ("\n" if file_lines else "")
+    if dry_run:
+        return result
+    _write_atomic(target, result)
+    return None
 
 
 def _test_rg_hint_default_behavior() -> Tuple[bool, str]:

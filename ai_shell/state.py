@@ -70,7 +70,7 @@ def get_change_notes() -> List[str]:
     return list(state.get("change_notes") or [])
 
 
-MAX_CHAT_HISTORY = 7
+MAX_CHAT_HISTORY = 12  # turns kept; prompt_buffer truncates per turn: user 450, assistant 400, notes 350 chars
 MAX_CHANGE_NOTES = 2
 MAX_FAILURE_HISTORY = 7
 

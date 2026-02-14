@@ -78,7 +78,14 @@ def classify_intent(
     # --- DELETE_FILE: explicit file deletion ---
     if re.search(r"\b(delete|remove)\b.*\b(file|module)\b", text):
         return DELETE_FILE
-    if re.search(r"\bdelete\b.*\b" + re.escape((focus_file or "").lower()) + r"\b", text):
+    if re.search(r"\b(delete|remove)\b.*\b" + re.escape((focus_file or "").lower()) + r"\b", text):
+        return DELETE_FILE
+    # delete/remove Makefile, Dockerfile, etc.
+    if re.search(
+        r"\b(delete|remove)\b[^\n]{0,60}\b(makefile|gnumakefile|dockerfile|cmakelists\.txt)\b",
+        text,
+        re.IGNORECASE,
+    ):
         return DELETE_FILE
 
     # --- CLEAR_RANGE: erase / clear / wipe content ---
@@ -175,8 +182,38 @@ def _detect_language_ext(text: str, fallback: str = ".py") -> str:
     return fallback
 
 
+def classify_reference_files(user_text: str, files: List[str]) -> List[str]:
+    """Classify which files are reference (read-only context) vs focus (to edit).
+    Uses prompt semantics: read/run/try/compile -> reference; modify/edit/update -> focus.
+    """
+    if not user_text or not files:
+        return []
+    low = user_text.lower()
+    refs: List[str] = []
+    for path in files:
+        stem = Path(path).stem.lower()
+        name = Path(path).name.lower()
+        # Reference: read X, run X, try X — require stem as whole word (parent != parentcreates)
+        if re.search(rf"\b(?:read|open)\s+[^\n]*\b{re.escape(stem)}\b", low):
+            refs.append(path)
+        elif re.search(rf"\b(?:run|try|execute)\s+[^\n]*\b{re.escape(stem)}\b", low):
+            refs.append(path)
+        elif "makefile" in name and re.search(r"\b(?:use|compile)\s+(?:the\s+)?makefile", low):
+            refs.append(path)
+    return list(dict.fromkeys(refs))
+
+
 def extract_target_files(user_text: str) -> List[str]:
-    """Extract filenames the user actually wants created/modified."""
+    """Extract filenames the user actually wants created/modified.
+
+    Target selection rules:
+    - File must be mentioned in the request with an action verb nearby (edit, update,
+      create, fix, add, modify, delete, etc.) within ~120 chars.
+    - Supports: .c, .py, .js, etc. and extensionless names (Makefile, Dockerfile, etc.).
+    - File must exist in repo, OR be an explicit create request, OR be a build file
+      (Makefile, etc.) with an edit verb.
+    - Skips: stdlib headers, incidental #include/import refs, readme.md, package.json.
+    """
     if not user_text:
         return []
     _CODE_EXTS = (
@@ -191,10 +228,19 @@ def extract_target_files(user_text: str) -> List[str]:
     )
     ext_re = "|".join(re.escape(e) for e in _CODE_EXTS)
     file_pat = re.compile(rf"\b([A-Za-z0-9_./-]+\.(?:{ext_re}))\b", re.IGNORECASE)
+    # Extensionless build/config files (Makefile, Dockerfile, etc.)
+    _EXTENSIONLESS_NAMES = (
+        "makefile", "gnumakefile", "cmakelists.txt",
+        "dockerfile", "containerfile", "vagrantfile",
+        "justfile", "gemfile", "rakefile", "procfile", "brewfile",
+    )
+    extless_re = "|".join(re.escape(n) for n in _EXTENSIONLESS_NAMES)
+    extless_pat = re.compile(rf"\b([A-Za-z0-9_./-]*?(?:{extless_re}))\b", re.IGNORECASE)
     _ACTION_VERBS = {
         "modify", "create", "implement", "write", "update", "change",
         "edit", "fix", "add", "submit", "push", "commit", "complete",
         "finish", "build", "make", "ensure", "updated",
+        "delete", "remove",
     }
     _SKIP = {"readme.md", "license.md", "changelog.md", "package.json"}
     _STD_HEADERS = {
@@ -216,6 +262,11 @@ def extract_target_files(user_text: str) -> List[str]:
         re.IGNORECASE,
     )
     all_files = [(m.start(), _norm_rel_path(m.group(1))) for m in file_pat.finditer(user_text)]
+    for m in extless_pat.finditer(user_text):
+        path = _norm_rel_path(m.group(1))
+        if path and Path(path).name.lower() in _EXTENSIONLESS_NAMES:
+            all_files.append((m.start(), path))
+    all_files.sort(key=lambda t: t[0])
 
     root = get_root()
 
@@ -248,6 +299,10 @@ def extract_target_files(user_text: str) -> List[str]:
         )
         return any(re.search(p, low_text, re.IGNORECASE) for p in patterns)
 
+    def _is_extensionless_build_edit(path: str) -> bool:
+        """Include Makefile, Dockerfile, etc. when user has edit/update verb (even if file missing)."""
+        return Path(path).name.lower() in _EXTENSIONLESS_NAMES
+
     def _is_incidental_reference(pos: int, fname: str) -> bool:
         low_name = fname.lower()
         stem = Path(fname).stem.lower()
@@ -275,7 +330,11 @@ def extract_target_files(user_text: str) -> List[str]:
             continue
         window = user_text[max(0, pos - 120): pos + len(fname) + 120]
         if _verb_re.search(window):
-            if not (_exists_in_repo(fname) or _is_explicit_create_request(fname)):
+            if not (
+                _exists_in_repo(fname)
+                or _is_explicit_create_request(fname)
+                or _is_extensionless_build_edit(fname)
+            ):
                 continue
             seen.add(low)
             result.append(fname)
@@ -288,7 +347,11 @@ def extract_target_files(user_text: str) -> List[str]:
                     continue
                 if _is_incidental_reference(pos, fname):
                     continue
-                if not (_exists_in_repo(fname) or _is_explicit_create_request(fname)):
+                if not (
+                    _exists_in_repo(fname)
+                    or _is_explicit_create_request(fname)
+                    or _is_extensionless_build_edit(fname)
+                ):
                     continue
                 seen.add(low)
                 result.append(fname)

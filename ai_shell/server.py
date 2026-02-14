@@ -12,6 +12,7 @@ from . import config
 from . import agent
 from . import prompt_buffer, state
 from .agent import run_agent_meta
+from .relevance import find_relevant_files
 from .files import (
     get_include,
     get_root,
@@ -27,6 +28,8 @@ from .files import (
 from .model import backend_name, backend_status, stream_reply_chunks
 from .utils import dbg
 
+import difflib
+
 try:
     from file_utils import (
         generate_diff,
@@ -34,8 +37,23 @@ try:
         validate_file_path,
     )
 except ImportError:
-    def generate_diff(*args, **kwargs):
-        return ""
+    def generate_diff(
+        old_content: str,
+        new_content: str,
+        filepath: str,
+        context_lines: int = 3,
+    ) -> str:
+        old_lines = (old_content or "").splitlines(keepends=True)
+        new_lines = (new_content or "").splitlines(keepends=True)
+        diff = difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=str(filepath),
+            tofile=str(filepath),
+            lineterm="",
+            n=context_lines,
+        )
+        return "".join(diff)
 
     def is_security_concern(*args, **kwargs):
         return False
@@ -132,6 +150,13 @@ class APIServer(BaseHTTPRequestHandler):
                         focus_file, get_root(), must_exist=False
                     )
                     focus_file = str(target.relative_to(get_root()))
+
+                # Agent mode: when no file open, discover target from request text
+                if mode == "agent" and not (focus_file or "").strip():
+                    discovered = find_relevant_files(text, open_file=None)
+                    if discovered:
+                        focus_file = discovered[0]
+                        dbg(f"agent: discovered focus_file from request: {focus_file}")
 
                 if mode == "chat":
                     chat_max_new = config.MAX_NEW

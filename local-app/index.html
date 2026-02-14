@@ -48,9 +48,31 @@
       .app {
         display: grid;
         grid-template-rows: 38px 1fr 32px;
-        grid-template-columns: 240px 1fr;
+        grid-template-columns: 240px 1fr auto;
         height: 100vh;
       }
+      .right-panel {
+        --right-panel-width: 360px;
+        min-width: 280px;
+        max-width: 50vw;
+        width: var(--right-panel-width);
+        flex-shrink: 0;
+        background: var(--bg-surface);
+        border-left: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .right-panel-resize {
+        position: absolute;
+        left: -4px;
+        top: 0;
+        bottom: 0;
+        width: 8px;
+        cursor: col-resize;
+        z-index: 10;
+      }
+      .right-panel-resize:hover { background: rgba(137, 180, 250, 0.1); }
 
       /* ─── Title Bar ─── */
       .titlebar {
@@ -322,12 +344,13 @@
         color: var(--red);
       }
 
-      /* ─── Main Area ─── */
+      /* ─── Main Area (center: editor + terminal) ─── */
       .main {
-        display: grid;
-        grid-template-rows: 32px 1fr auto;
+        display: flex;
+        flex-direction: column;
         overflow: hidden;
         background: var(--bg-base);
+        min-width: 0;
       }
 
       /* Tab bar */
@@ -505,16 +528,28 @@
       .hl-op { color: var(--accent-dim); }     /* operators */
       .hl-self { color: var(--red); font-style: italic; }  /* self/this */
 
-      /* ─── Bottom Panel (Chat / Response) ─── */
-      .bottom-panel {
+      /* ─── Center Terminal (between editor and right panel) ─── */
+      .center-terminal {
         border-top: 1px solid var(--border);
         background: var(--bg-surface);
         display: flex;
         flex-direction: column;
         max-height: 280px;
-        min-height: 120px;
+        min-height: 80px;
         resize: vertical;
         overflow: hidden;
+        flex-shrink: 0;
+      }
+      .center-terminal.collapsed { max-height: 32px; min-height: 32px; }
+      .center-terminal .terminal-output { flex: 1; min-height: 60px; }
+
+      /* ─── Right Panel (Agent / Assistant) ─── */
+      .right-panel .agent-panel {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        overflow: hidden;
+        min-height: 0;
       }
       .panel-tabs {
         display: flex;
@@ -1046,7 +1081,7 @@
         <button class="explorer-menu-item danger" id="menuDeleteFile">Delete</button>
       </div>
 
-      <!-- Main Editor Area -->
+      <!-- Main Editor Area (center) -->
       <div class="main">
         <div class="tab-bar">
           <div class="tab active" id="editorTab">
@@ -1057,7 +1092,7 @@
           <div style="flex:1;"></div>
         </div>
 
-        <div class="editor-wrap">
+        <div class="editor-wrap" style="flex:1; min-height:0;">
           <div class="editor-container">
             <div class="welcome" id="welcomeScreen">
               <div class="welcome-icon">&#9790;</div>
@@ -1077,14 +1112,25 @@
           </div>
         </div>
 
-        <!-- Bottom Panel -->
-        <div class="bottom-panel">
-          <div class="resize-handle" id="resizeHandle"></div>
-          <div class="panel-tabs">
-            <div class="panel-tab active" id="assistantTabBtn">Assistant</div>
+        <!-- Terminal (bottom of center, between files and agent) -->
+        <div class="center-terminal hidden" id="centerTerminal">
+          <div class="resize-handle" id="terminalResizeHandle"></div>
+          <div class="panel-tabs" style="height:30px;">
+            <div class="panel-tab active">Terminal</div>
+            <button class="btn btn-sm" id="terminalCloseBtn" title="Close terminal">Close</button>
+            <div style="flex:1;"></div>
+          </div>
+          <div class="terminal-output" id="terminalOutput" style="flex:1;"></div>
+        </div>
+      </div>
+
+      <!-- Right Panel (Agent / Assistant) - expandable -->
+      <div class="right-panel" id="rightPanel" style="position:relative;">
+        <div class="right-panel-resize" id="rightPanelResize" title="Drag to resize"></div>
+        <div class="agent-panel">
+          <div class="panel-tabs" style="height:30px; border-bottom:1px solid var(--border);">
+            <div class="panel-tab active">Assistant</div>
             <button class="btn btn-sm" id="newChatBtn" title="Start a new chat">New Chat</button>
-            <div class="panel-tab hidden" id="terminalTabBtn">Terminal</div>
-            <button class="btn btn-sm hidden" id="terminalCloseBtn" title="Close terminal">Close</button>
             <div class="diff-actions" id="diffActions" style="display:none;">
               <button class="btn-apply" id="btnApply" title="Accept changes">&#10003; Accept</button>
               <button class="btn-reject" id="btnReject" title="Reject changes">&#10007; Reject</button>
@@ -1092,24 +1138,19 @@
             <div style="flex:1;"></div>
             <div class="run-timer" id="runTimer"></div>
           </div>
-          <div class="panel-body">
-            <div class="panel-view active" id="assistantView">
-              <div class="user-prompt-echo" id="userPromptEcho"></div>
-              <div class="response-area" id="response">Ready. Select a file and ask the agent to edit it.</div>
-              <div class="prompt-bar">
-                <textarea class="prompt-input" id="prompt" rows="1" placeholder="Ask the agent... or /run <command>"></textarea>
-                <div class="prompt-actions">
-                  <select id="mode" class="mode-toggle" title="Assistant mode">
-                    <option value="chat">chat</option>
-                    <option value="agent">agent</option>
-                  </select>
-                  <button class="btn-send" id="send" disabled>Send</button>
-                  <button class="btn-cancel" id="cancel">Stop</button>
-                </div>
+          <div class="panel-body" style="flex:1; min-height:0; display:flex; flex-direction:column;">
+            <div class="user-prompt-echo" id="userPromptEcho"></div>
+            <div class="response-area" id="response" style="flex:1;">Ready. Select a file and ask the agent to edit it.</div>
+            <div class="prompt-bar">
+              <textarea class="prompt-input" id="prompt" rows="1" placeholder="Ask the agent... or /run <command>"></textarea>
+              <div class="prompt-actions">
+                <select id="mode" class="mode-toggle" title="Assistant mode">
+                  <option value="chat">chat</option>
+                  <option value="agent">agent</option>
+                </select>
+                <button class="btn-send" id="send" disabled>Send</button>
+                <button class="btn-cancel" id="cancel">Stop</button>
               </div>
-            </div>
-            <div class="panel-view hidden" id="terminalView">
-              <div class="terminal-output" id="terminalOutput"></div>
             </div>
           </div>
         </div>

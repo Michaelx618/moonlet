@@ -65,14 +65,12 @@ const params = new URLSearchParams(window.location.search);
       const statusBarLangEl = document.getElementById("statusBarLang");
       const statusBarInfoEl = document.getElementById("statusBarInfo");
       const titleFilepath = document.getElementById("titleFilepath");
-      const resizeHandle = document.getElementById("resizeHandle");
+      const terminalResizeHandle = document.getElementById("terminalResizeHandle");
+      const rightPanelResize = document.getElementById("rightPanelResize");
+      const centerTerminal = document.getElementById("centerTerminal");
       const runFileBtn = document.getElementById("runFileBtn");
       const openTerminalBtn = document.getElementById("openTerminalBtn");
-      const assistantTabBtn = document.getElementById("assistantTabBtn");
       const newChatBtn = document.getElementById("newChatBtn");
-      const terminalTabBtn = document.getElementById("terminalTabBtn");
-      const assistantView = document.getElementById("assistantView");
-      const terminalView = document.getElementById("terminalView");
       const terminalOutputEl = document.getElementById("terminalOutput");
       const terminalCloseBtn = document.getElementById("terminalCloseBtn");
       const explorerMenuEl = document.getElementById("explorerMenu");
@@ -531,37 +529,21 @@ const params = new URLSearchParams(window.location.search);
         else if (type === "error") statusDot.classList.add("error");
       }
 
-      function setPanelTab(which) {
-        const isTerminal = which === "terminal";
-        assistantTabBtn.classList.toggle("active", !isTerminal);
-        terminalTabBtn.classList.toggle("active", isTerminal);
-        assistantView.classList.toggle("active", !isTerminal);
-        terminalView.classList.toggle("active", isTerminal);
-        terminalView.classList.toggle("hidden", !terminalVisible);
-        terminalCloseBtn.classList.toggle("hidden", !isTerminal);
-        if (isTerminal) {
-          document.getElementById("diffActions").style.display = "none";
-        } else if (activeDiffHighlights || window._pendingDiff) {
-          document.getElementById("diffActions").style.display = "flex";
+      function setTerminalVisible(visible) {
+        terminalVisible = Boolean(visible);
+        if (centerTerminal) {
+          centerTerminal.classList.toggle("hidden", !terminalVisible);
         }
-        if (isTerminal) {
+        if (terminalVisible) {
           setTimeout(() => {
+            try { if (xtermFit) xtermFit.fit(); } catch {}
             try { editorView && editorView.contentDOM.blur(); } catch {}
             try { promptEl.blur(); } catch {}
             try {
               if (xterm) xterm.focus();
-              else terminalOutputEl.focus();
+              else if (terminalOutputEl) terminalOutputEl.focus();
             } catch {}
           }, 0);
-        }
-      }
-
-      function setTerminalVisible(visible) {
-        terminalVisible = Boolean(visible);
-        terminalTabBtn.classList.toggle("hidden", !terminalVisible);
-        terminalView.classList.toggle("hidden", !terminalVisible);
-        if (!terminalVisible) {
-          setPanelTab("assistant");
         }
       }
 
@@ -1771,7 +1753,28 @@ const params = new URLSearchParams(window.location.search);
           (window._pendingDiff && window._pendingDiff.trim()) ||
           (window._perFileDiffs && currentFile && window._perFileDiffs[currentFile] && window._perFileDiffs[currentFile].trim())
         );
-        if (currentFile && hasDiffContext) {
+        const hasPerFileStaged = window._perFileStaged && Object.keys(window._perFileStaged).length > 0;
+        if (hasPerFileStaged) {
+          // Multi-file (or single-file staged): save all staged files
+          const stagedPaths = Object.keys(window._perFileStaged);
+          for (const path of stagedPaths) {
+            const content = window._perFileStaged[path];
+            try {
+              await api("/file", { method: "POST", body: JSON.stringify({ path, content }) });
+            } catch (e) {
+              setStatus(`Failed to save ${path}`, "error");
+              return;
+            }
+          }
+          setStatus(`Changes accepted (${stagedPaths.length} file${stagedPaths.length !== 1 ? "s" : ""})`, "");
+          showApplySummary(currentFile);
+          window._perFileStaged = {};
+          if (window._perFileDiffs) {
+            for (const p of stagedPaths) delete window._perFileDiffs[p];
+          }
+          window._pendingDiff = null;
+          for (const p of stagedPaths) delete preChangeContentByFile[p];
+        } else if (currentFile && hasDiffContext) {
           await saveFile();
           setStatus("Changes accepted", "");
           showApplySummary(currentFile);
@@ -1904,17 +1907,50 @@ const params = new URLSearchParams(window.location.search);
             await closeLspForPath(path);
             setLspStatus("off", "LSP disabled (binary file)");
           } else {
-            fileCache[path] = data.content;
-            setViewerContent(data.content);
+            const diskContent = data.content;
+            const pathBase = path.split("/").pop() || path;
+            const stagedKey = window._perFileStaged && Object.keys(window._perFileStaged).find(
+              (k) => k === path || k.split("/").pop() === pathBase
+            );
+            const stagedContent = stagedKey ? window._perFileStaged[stagedKey] : undefined;
+            const contentToShow = stagedContent !== undefined ? stagedContent : diskContent;
+            if (stagedContent !== undefined) {
+              preChangeContentByFile[path] = diskContent;
+            }
+            fileCache[path] = contentToShow;
+            setViewerContent(contentToShow);
             currentFileIsBinary = false;
             hideImagePreview();
-            await openLspForPath(path, data.content);
+            await openLspForPath(path, contentToShow);
           }
           updateCursorPosition();
           setStatus("Ready", "");
           // Show diff highlights if this file was changed in a multi-file edit
-          if (window._perFileDiffs && window._perFileDiffs[path]) {
-            applyDiffHighlights(window._perFileDiffs[path]);
+          const pathBase = path.split("/").pop() || path;
+          const diffKey = window._perFileDiffs && Object.keys(window._perFileDiffs).find(
+            (k) => k === path || k.split("/").pop() === pathBase
+          );
+          const diffToShow = diffKey ? window._perFileDiffs[diffKey] : null;
+          if (diffToShow && diffToShow.trim()) {
+            applyDiffHighlights(diffToShow);
+            document.getElementById("diffActions").style.display = "flex";
+          } else if (preChangeContentByFile[path] !== undefined && window._perFileStaged) {
+            const stagedKey = Object.keys(window._perFileStaged).find(
+              (k) => k === path || k.split("/").pop() === pathBase
+            );
+            if (stagedKey) {
+              const beforeContent = preChangeContentByFile[path];
+              const afterContent = window._perFileStaged[stagedKey];
+              const computed = buildUnifiedDiffFromContents(path, beforeContent, afterContent);
+              if (computed) {
+                applyDiffHighlights(computed);
+                document.getElementById("diffActions").style.display = "flex";
+              } else {
+                clearDiffHighlights();
+              }
+            } else {
+              clearDiffHighlights();
+            }
           } else {
             clearDiffHighlights();
           }
@@ -2105,17 +2141,58 @@ const params = new URLSearchParams(window.location.search);
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
-                  // Store diff for the currently open file (if it was changed)
-                  if (currentFile && d.per_file_diffs && d.per_file_diffs[currentFile]) {
-                    window._pendingDiff = d.per_file_diffs[currentFile];
+                  // Store all per-file diffs for switching between files
+                  window._perFileDiffs = { ...(window._perFileDiffs || {}), ...(d.per_file_diffs || {}) };
+                  // Store per-file staged content for multi-file Accept
+                  if (d.per_file_staged && Object.keys(d.per_file_staged).length > 0) {
+                    window._perFileStaged = { ...(window._perFileStaged || {}), ...d.per_file_staged };
+                  }
+                  // Set _pendingDiff for current file (exact or basename match) so post-stream block can apply
+                  if (currentFile && d.per_file_diffs) {
+                    const base = currentFile.split("/").pop() || currentFile;
+                    const diffKey = Object.keys(d.per_file_diffs).find(
+                      (k) => k === currentFile || k.split("/").pop() === base
+                    );
+                    if (diffKey && d.per_file_diffs[diffKey]) {
+                      window._pendingDiff = d.per_file_diffs[diffKey];
+                    }
                   } else if (d.diff && d.diff.trim()) {
                     window._pendingDiff = d.diff;
                   }
                   if (window._pendingDiff) {
                     document.getElementById("diffActions").style.display = "flex";
                   }
-                  // Store all per-file diffs for switching between files
-                  window._perFileDiffs = { ...(window._perFileDiffs || {}), ...(d.per_file_diffs || {}) };
+                  // Apply staged content + diff highlights for current file (exact or basename match)
+                  if (currentFile && (d.per_file_diffs || d.per_file_staged)) {
+                    const base = currentFile.split("/").pop() || currentFile;
+                    const stagedKey = d.per_file_staged && Object.keys(d.per_file_staged).find(
+                      (k) => k === currentFile || k.split("/").pop() === base
+                    );
+                    const diffKey = d.per_file_diffs && Object.keys(d.per_file_diffs).find(
+                      (k) => k === currentFile || k.split("/").pop() === base
+                    );
+                    const stagedContent = stagedKey ? d.per_file_staged[stagedKey] : undefined;
+                    let diffToApply = diffKey && d.per_file_diffs[diffKey] ? d.per_file_diffs[diffKey] : "";
+                    if (stagedContent !== undefined) {
+                      const beforeContent = getEditorText();
+                      preChangeContentByFile[currentFile] = beforeContent;
+                      setViewerContent(String(stagedContent));
+                      scheduleLspDidChange();
+                      if (!diffToApply) {
+                        diffToApply = buildUnifiedDiffFromContents(currentFile, beforeContent, stagedContent);
+                      }
+                    }
+                    if (diffToApply) {
+                      window._pendingDiff = diffToApply;
+                      if (!diffKey && d.per_file_diffs) {
+                        const keyForStore = stagedKey || currentFile;
+                        window._perFileDiffs = { ...(window._perFileDiffs || {}), [keyForStore]: diffToApply };
+                      }
+                      try { applyDiffHighlights(diffToApply); } catch (_) {}
+                      document.getElementById("diffActions").style.display = "flex";
+                      stagedContentApplied = true;
+                    }
+                  }
                 } else if (d.diff && d.diff.trim()) {
                   // Single-file result
                   window._pendingDiff = d.diff;
@@ -2126,10 +2203,15 @@ const params = new URLSearchParams(window.location.search);
                   }
                   // Apply immediately for current file so red/green markers are visible
                   // even on failure paths where no staged content is returned.
-                  if (currentFile && diffPath && currentFile === diffPath) {
+                  const pathMatches = currentFile && diffPath && (
+                    currentFile === diffPath ||
+                    (currentFile.split("/").pop() || currentFile) === (diffPath.split("/").pop() || diffPath)
+                  );
+                  if (pathMatches) {
                     try {
                       applyDiffHighlights(d.diff);
                     } catch (_) {}
+                    stagedContentApplied = true;
                   }
                   document.getElementById("diffActions").style.display = "flex";
                   const summary = summarizeDiff(d.diff, d.focus_file || "");
@@ -2168,28 +2250,55 @@ const params = new URLSearchParams(window.location.search);
                   }
                 }
                 // Staged edit mode: show candidate content in editor, do not auto-write.
+                let stagedContent = (d.per_file_staged && currentFile && d.per_file_staged[currentFile])
+                  ? d.per_file_staged[currentFile]
+                  : (d.staged_content !== undefined ? d.staged_content : undefined);
+                // Fallback: match by basename when exact path fails (e.g. "w6/parentcreates.c" vs "parentcreates.c")
+                if (stagedContent === undefined && d.per_file_staged && currentFile) {
+                  const base = currentFile.split("/").pop() || currentFile;
+                  const match = Object.keys(d.per_file_staged).find((k) => k === currentFile || k.split("/").pop() === base);
+                  if (match) stagedContent = d.per_file_staged[match];
+                }
+                const stagedForCurrent = stagedContent !== undefined && currentFile &&
+                  (d.staged_file === currentFile || (d.per_file_staged && d.per_file_staged[currentFile]) ||
+                    (d.per_file_staged && Object.keys(d.per_file_staged).some((k) => k === currentFile || k.split("/").pop() === (currentFile.split("/").pop() || currentFile))));
                 if (
-                  d.staged &&
-                  d.staged_file &&
-                  d.staged_content !== undefined &&
-                  currentFile &&
-                  d.staged_file === currentFile
+                  (d.staged || stagedForCurrent) &&
+                  stagedContent !== undefined &&
+                  currentFile
                 ) {
-                  preChangeContentByFile[currentFile] = getEditorText();
-                  setViewerContent(String(d.staged_content));
+                  const beforeContent = getEditorText();
+                  preChangeContentByFile[currentFile] = beforeContent;
+                  setViewerContent(String(stagedContent));
                   scheduleLspDidChange();
                   stagedContentApplied = true;
-                  if (d.diff && d.diff.trim()) {
-                    applyDiffHighlights(d.diff);
+                  const directDiff = d.per_file_diffs && currentFile && d.per_file_diffs[currentFile];
+                  const foundEntry = !directDiff && d.per_file_diffs && currentFile &&
+                    Object.entries(d.per_file_diffs).find(([k]) => k === currentFile || k.split("/").pop() === (currentFile.split("/").pop() || currentFile));
+                  let diffToApply = directDiff || (foundEntry && foundEntry[1]) || (d.diff && d.diff.trim()) || "";
+                  if (!diffToApply) {
+                    diffToApply = buildUnifiedDiffFromContents(currentFile, beforeContent, stagedContent);
+                  }
+                  if (diffToApply) {
+                    applyDiffHighlights(diffToApply);
                     document.getElementById("diffActions").style.display = "flex";
                   }
                 }
-                if (!renderedMetaSummary && d.staged && d.staged_file) {
-                  const stagedMsg = `Staged changes for ${esc(String(d.staged_file))}. Review and click Accept or Reject.`;
+                if (!renderedMetaSummary && (d.staged || (d.per_file_staged && Object.keys(d.per_file_staged).length > 0))) {
+                  const stagedFiles = d.per_file_staged ? Object.keys(d.per_file_staged) : (d.staged_file ? [d.staged_file] : []);
+                  const stagedMsg = stagedFiles.length > 1
+                    ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.`
+                    : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`;
                   responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
+                }
+                if (d.per_file_staged && Object.keys(d.per_file_staged).length > 0) {
+                  window._perFileStaged = { ...(window._perFileStaged || {}), ...d.per_file_staged };
+                }
+                if (d.staged_content !== undefined && d.staged_file) {
+                  window._perFileStaged = { ...(window._perFileStaged || {}), [d.staged_file]: d.staged_content };
                 }
               } catch {}
             } else if (event === "error") {
@@ -2207,8 +2316,42 @@ const params = new URLSearchParams(window.location.search);
             }
             if (doneReceived) { controller.abort(); break; }
           }
-          if (selectedMode === "agent" && currentFile && !stagedContentApplied) {
-            // Only reload the current file (always needed after agent run)
+          if (currentFile && !stagedContentApplied) {
+            // Only reload the current file when we don't have pending staged content.
+            // If we have staged content from meta but it wasn't applied (e.g. focus_file mismatch),
+            // or if diffActions are visible from a prior meta, do NOT overwrite the editor with
+            // file content — that would make "changes disappear" while Apply/Reject stay visible.
+            const stagedKey = window._perFileStaged && (window._perFileStaged[currentFile] !== undefined
+              ? currentFile
+              : Object.keys(window._perFileStaged || {}).find((k) => k === currentFile || k.split("/").pop() === (currentFile.split("/").pop() || currentFile)));
+            const hasPendingStaged = stagedKey && window._perFileStaged[stagedKey];
+            const diffKey = window._perFileDiffs && (window._perFileDiffs[currentFile] !== undefined
+              ? currentFile
+              : Object.keys(window._perFileDiffs || {}).find((k) => k === currentFile || k.split("/").pop() === (currentFile.split("/").pop() || currentFile)));
+            const hasPendingDiff = (window._pendingDiff && window._pendingDiff.trim()) ||
+              (diffKey && window._perFileDiffs && window._perFileDiffs[diffKey]);
+            if (hasPendingStaged || hasPendingDiff) {
+              // Preserve editor: show staged content if we have it, else leave as-is
+              if (hasPendingStaged) {
+                const beforeContent = getEditorText();
+                const stagedContent = window._perFileStaged[stagedKey];
+                preChangeContentByFile[currentFile] = beforeContent;
+                setViewerContent(String(stagedContent));
+                let diffToApply = (diffKey && window._perFileDiffs?.[diffKey]) || window._pendingDiff || "";
+                if (!diffToApply) {
+                  diffToApply = buildUnifiedDiffFromContents(currentFile, beforeContent, stagedContent);
+                }
+                if (diffToApply) {
+                  window._pendingDiff = diffToApply;
+                  if (!diffKey) {
+                    window._perFileDiffs = window._perFileDiffs || {};
+                    window._perFileDiffs[stagedKey || currentFile] = diffToApply;
+                  }
+                  applyDiffHighlights(diffToApply);
+                  document.getElementById("diffActions").style.display = "flex";
+                }
+              }
+            } else {
             try {
               const fileData = await api(`/file?path=${encodeURIComponent(currentFile)}`);
               const nextContent = String((fileData && fileData.content) ?? "");
@@ -2262,6 +2405,7 @@ const params = new URLSearchParams(window.location.search);
                 }
               }
             } catch {}
+            }
             // Only reload file list if agent wrote/created files
             const wrote = rawResponseBuf.includes("[Applied") || rawResponseBuf.includes("[Repaired");
             if (wrote) await loadFiles();
@@ -2335,31 +2479,12 @@ const params = new URLSearchParams(window.location.search);
       document.getElementById("send").onclick = sendPrompt;
       cancelBtn.onclick = () => { if (activeRequest) activeRequest.abort(); };
       refreshBtn.onclick = loadFiles;
-      assistantTabBtn.onclick = () => setPanelTab("assistant");
-      terminalTabBtn.onclick = async () => {
-        setTerminalVisible(true);
-        setPanelTab("terminal");
-        try {
-          setStatus("Starting terminal...", "busy");
-          await ensureTerminalStarted();
-          if (terminalStarted) {
-            setStatus("Terminal ready", "");
-            if (xterm) xterm.focus();
-          } else {
-            setStatus("Terminal unavailable", "error");
-          }
-        } catch (err) {
-          appendTerminal(`[terminal start error] ${String(err)}\n`, "stderr");
-          setStatus("Terminal unavailable", "error");
-        }
-      };
       openTerminalBtn.onclick = async () => {
         if (openTerminalBtn.disabled) {
           setStatus("Import files first", "error");
           return;
         }
         setTerminalVisible(true);
-        setPanelTab("terminal");
         try {
           setStatus("Starting terminal...", "busy");
           await ensureTerminalStarted();
@@ -2384,10 +2509,9 @@ const params = new URLSearchParams(window.location.search);
         const cmd = inferRunCommand(currentFile);
         if (!cmd) {
           setStatus("No run command for this file type", "error");
-          setPanelTab("terminal");
           return;
         }
-        setPanelTab("terminal");
+        setTerminalVisible(true);
         try {
           await ensureTerminalStarted();
           const cwd = relCwdForCurrentFile();
@@ -2425,7 +2549,7 @@ const params = new URLSearchParams(window.location.search);
       };
 
       function handleFallbackTerminalKeydown(e) {
-        if (!terminalVisible || !terminalView.classList.contains("active")) return;
+        if (!terminalVisible) return;
         if (!terminalStarted) return;
         if (!window.electronAPI || !window.electronAPI.terminalWrite) return;
         if (e.metaKey || e.ctrlKey) return;
@@ -2485,7 +2609,7 @@ const params = new URLSearchParams(window.location.search);
       window.addEventListener("resize", hideExplorerMenu);
 
       terminalOutputEl.addEventListener("paste", async (e) => {
-        if (!terminalVisible || !terminalView.classList.contains("active")) return;
+        if (!terminalVisible) return;
         if (!window.electronAPI || !window.electronAPI.terminalWrite) return;
         const text = e.clipboardData ? e.clipboardData.getData("text") : "";
         if (!text) return;
@@ -2502,7 +2626,7 @@ const params = new URLSearchParams(window.location.search);
       // even if focus is not on the hidden xterm textarea.
       document.addEventListener("paste", async (e) => {
         if (e.defaultPrevented) return;
-        if (!terminalVisible || !terminalView.classList.contains("active")) return;
+        if (!terminalVisible) return;
         if (!window.electronAPI || !window.electronAPI.terminalWrite) return;
         const text = e.clipboardData ? e.clipboardData.getData("text") : "";
         if (!text) return;
@@ -2694,20 +2818,44 @@ const params = new URLSearchParams(window.location.search);
       document.getElementById("btnApply").onclick = acceptChanges;
       document.getElementById("btnReject").onclick = rejectChanges;
 
-      // ─── Panel resize ───
+      // ─── Terminal resize (center panel) ───
       (function() {
-        const panel = document.querySelector('.bottom-panel');
-        if (!panel || !resizeHandle) return;
+        const panel = document.getElementById("centerTerminal");
+        if (!panel || !terminalResizeHandle) return;
         let startY, startH;
-        resizeHandle.addEventListener('mousedown', (e) => {
+        terminalResizeHandle.addEventListener('mousedown', (e) => {
           e.preventDefault();
           startY = e.clientY;
           startH = panel.offsetHeight;
           const onMove = (ev) => {
             const delta = startY - ev.clientY;
-            const h = Math.max(120, Math.min(500, startH + delta));
+            const h = Math.max(80, Math.min(500, startH + delta));
             panel.style.maxHeight = h + 'px';
             panel.style.height = h + 'px';
+          };
+          const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+          };
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+      })();
+
+      // ─── Right panel resize (expandable) ───
+      (function() {
+        const panel = document.getElementById("rightPanel");
+        if (!panel || !rightPanelResize) return;
+        let startX, startW;
+        rightPanelResize.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          startX = e.clientX;
+          startW = panel.offsetWidth;
+          const onMove = (ev) => {
+            const delta = ev.clientX - startX;
+            const w = Math.max(280, Math.min(window.innerWidth * 0.5, startW - delta));
+            panel.style.setProperty('--right-panel-width', w + 'px');
+            panel.style.width = w + 'px';
           };
           const onUp = () => {
             document.removeEventListener('mousemove', onMove);
