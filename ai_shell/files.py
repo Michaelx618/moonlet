@@ -106,8 +106,7 @@ def read_file_text(rel_path: str) -> str:
     target = resolve_path(rel_path)
     if not is_allowed_file(target):
         raise PermissionError("file type not allowed")
-    rel_posix = rel_path
-    if INCLUDE_PATHS is not None and rel_path and rel_posix not in INCLUDE_PATHS:
+    if INCLUDE_PATHS is not None and rel_path and not _path_in_include(rel_path):
         raise PermissionError("file not in selected set")
     if not target.exists():
         raise FileNotFoundError(rel_path)
@@ -166,16 +165,30 @@ def write_file_text(rel_path: str, content: str) -> None:
     target = resolve_path(rel_path)
     if not is_allowed_file(target):
         raise PermissionError("file type not allowed")
-    rel_posix = rel_path
-    if INCLUDE_PATHS is not None and rel_path and rel_posix not in INCLUDE_PATHS:
+    # Allow new file creation without include check (model freedom to add files)
+    if INCLUDE_PATHS is not None and rel_path and target.exists() and not _path_in_include(rel_path):
         raise PermissionError("file not in selected set")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content)
 
 
+def delete_file(rel_path: str) -> None:
+    """Delete a file. Must be under root and pass is_edit_allowed."""
+    rel_path = _norm_rel_path(rel_path)
+    target = resolve_path(rel_path)
+    if not target.exists() or not target.is_file():
+        raise FileNotFoundError(rel_path)
+    if not is_edit_allowed(rel_path):
+        raise PermissionError("file not in selected set")
+    if is_security_concern(target):
+        raise PermissionError("Security concern: cannot delete system paths")
+    target.unlink()
+
+
 def set_include(paths: List[str]) -> None:
     global INCLUDE_PATHS
-    if paths is None or not paths:
+    paths = paths if paths is not None else []
+    if not paths:
         INCLUDE_PATHS = None
         print("[Include filter cleared]", file=sys.stderr)
         return
@@ -190,12 +203,58 @@ def set_include(paths: List[str]) -> None:
             f"[Include filter set to {len(INCLUDE_PATHS)} file(s)]",
             file=sys.stderr,
         )
+    # Rebuild file index so agent tools (grep, symbols, list_files) see updated set
+    try:
+        from .index import rebuild_index
+        rebuild_index()
+    except Exception:
+        pass
 
 
 def get_include() -> List[str]:
     if INCLUDE_PATHS:
         return sorted(str(p) for p in INCLUDE_PATHS)
     return []
+
+
+def _path_in_include(rel_path: str) -> bool:
+    """True if path is in include set (or under an include dir). When include not set, returns True."""
+    if not INCLUDE_PATHS:
+        return True
+    rel = _norm_rel_path(rel_path or "").replace("\\", "/")
+    if rel in INCLUDE_PATHS:
+        return True
+    for p in INCLUDE_PATHS:
+        prefix = (p or "").rstrip("/").replace("\\", "/")
+        if prefix and (rel == prefix or rel.startswith(prefix + "/")):
+            return True
+    return False
+
+
+# Paths the agent must never edit (app source, tooling)
+_EDIT_BLOCKLIST_PREFIXES = ("local-app/", "local-app\\", "ai_shell/", "tools/")
+
+
+def is_edit_allowed(rel_path: str, *, allow_new: bool = False) -> bool:
+    """True if the agent may edit this path. Blocks app source and enforces include filter.
+    When allow_new=True, new files are allowed (skip include check) so the model can create files freely."""
+    rel = _norm_rel_path(rel_path or "")
+    if not rel:
+        return False
+    # Never allow editing Moonlet's own source or tooling
+    rel_posix = rel.replace("\\", "/")
+    if any(rel_posix.startswith(p) for p in _EDIT_BLOCKLIST_PREFIXES):
+        return False
+    # When include filter is set, only allow paths in the include set (unless allow_new)
+    if INCLUDE_PATHS and not allow_new:
+        if rel_posix in INCLUDE_PATHS:
+            return True
+        for p in INCLUDE_PATHS:
+            prefix = (p or "").rstrip("/").replace("\\", "/")
+            if prefix and (rel_posix == prefix or rel_posix.startswith(prefix + "/")):
+                return True
+        return False
+    return True
 
 
 def get_root() -> Path:
@@ -205,13 +264,23 @@ def get_root() -> Path:
 def set_root(new_root: str) -> Path:
     global ROOT_PATH
     global INCLUDE_PATHS
-    candidate = Path(new_root).expanduser().resolve()
+    # Sanitize: strip file:// prefix, whitespace
+    path_str = (new_root or "").strip().replace("\\", "/")
+    if path_str.lower().startswith("file://"):
+        path_str = path_str[7:]
+    candidate = Path(path_str).expanduser().resolve()
     if not candidate.exists() or not candidate.is_dir():
         raise ValueError("root must be an existing directory")
     # Allow opening any existing directory, even if currently empty.
     ROOT_PATH = candidate
     INCLUDE_PATHS = None
     print(f"[Root set to: {ROOT_PATH}]", file=sys.stderr)
+    # Rebuild file index so agent tools see the new root
+    try:
+        from .index import rebuild_index
+        rebuild_index()
+    except Exception:
+        pass
     return ROOT_PATH
 
 
@@ -264,7 +333,7 @@ def list_repo_files() -> List[str]:
             if not is_allowed_file(rel):
                 continue
             rel_posix = rel.as_posix()
-            if INCLUDE_PATHS is not None and rel_posix not in INCLUDE_PATHS:
+            if INCLUDE_PATHS is not None and not _path_in_include(rel_posix):
                 continue
             files.append(rel_posix)
             if len(files) >= max_files:
@@ -291,7 +360,7 @@ def read_files_for_context(files: List[str], limit_budget: bool = True) -> Dict[
             continue
         if not is_allowed_file(path):
             continue
-        if INCLUDE_PATHS is not None and rel not in INCLUDE_PATHS:
+        if INCLUDE_PATHS is not None and not _path_in_include(rel):
             continue
         try:
             text = path.read_text()
@@ -320,7 +389,7 @@ def read_single_file_for_context(file_path: str) -> Dict[str, str]:
         return contents
     if not is_allowed_file(path):
         return contents
-    if INCLUDE_PATHS is not None and file_path not in INCLUDE_PATHS:
+    if INCLUDE_PATHS is not None and not _path_in_include(file_path):
         return contents
     try:
         text = path.read_text()
@@ -342,14 +411,14 @@ def _is_new_or_empty_file(focus_file: str) -> bool:
 
 def apply_blocks_with_report(
     blocks: List[Tuple[str, str]], show_diff: bool = True, dry_run: bool = False
-) -> Tuple[List[str], List[Dict[str, str]], Dict[str, str], Dict[str, str]]:
+) -> Tuple[List[str], List[Dict[str, str]], Dict[str, str], Dict[str, str], Dict[str, str]]:
     """Apply file blocks with optional diff preview.
 
-    Returns (touched, skipped, per_file_diffs, per_file_staged) for UI staging.
+    Returns (touched, skipped, per_file_diffs, per_file_staged, per_file_before) for UI staging.
     """
     if not blocks:
         dbg("apply_blocks: no blocks to apply")
-        return [], [], {}, {}
+        return [], [], {}, {}, {}
     dbg(f"apply_blocks: count={len(blocks)}")
     if len(blocks) > 1:
         per_path: Dict[str, Dict[str, Tuple[str, str]]] = {}
@@ -382,10 +451,16 @@ def apply_blocks_with_report(
     skipped: List[Dict[str, str]] = []
     per_file_diffs: Dict[str, str] = {}
     per_file_staged: Dict[str, str] = {}
+    per_file_before: Dict[str, str] = {}
     for rel_path, content in blocks:
         try:
             rel_path = _norm_rel_path(rel_path)
             target = resolve_path(rel_path)
+            allow_new = not (target.exists() and target.is_file())
+            if not is_edit_allowed(rel_path, allow_new=allow_new):
+                skipped.append({"path": rel_path, "reason": "edit_not_allowed"})
+                print(f"[skipped] Edit not allowed (app source or outside include): {rel_path}")
+                continue
             if is_security_concern(target):
                 skipped.append({"path": rel_path, "reason": "security_concern"})
                 print(f"[skipped] Security concern: {rel_path}")
@@ -444,7 +519,8 @@ def apply_blocks_with_report(
             print(f"[wrote] {rel_path}")
         touched.append(rel_path)
         per_file_staged[rel_path] = content
-    return touched, skipped, per_file_diffs, per_file_staged
+        per_file_before[rel_path] = old_content if old_content is not None else ""
+    return touched, skipped, per_file_diffs, per_file_staged, per_file_before
 
 
 def apply_blocks(blocks: List[Tuple[str, str]], show_diff: bool = True) -> List[str]:
@@ -828,14 +904,21 @@ def apply_unified_diff(
             raise PermissionError("Security concern: cannot edit system paths")
         if not is_allowed_file(target):
             raise PermissionError("file type not allowed")
-        if not target.exists():
-            raise FileNotFoundError(focus_file)
+        is_new_file = not target.exists()
+        if is_new_file:
+            # Allow only when diff is "new file" format (--- /dev/null, all hunks insertion-only)
+            all_insert = all(
+                getattr(h, "old_start", 1) == 0 and getattr(h, "old_count", 1) == 0
+                for h in hunks
+            )
+            if not all_insert:
+                raise FileNotFoundError(focus_file)
     if not hunks:
         raise ValueError("No hunks to apply")
 
     # Safety gate removed: allow multi-hunk insert-only patches.
 
-    file_lines = target.read_text().splitlines()
+    file_lines = target.read_text().splitlines() if target.exists() else []
 
     ordered_hunks = sorted(
         list(hunks),
@@ -905,21 +988,37 @@ def apply_unified_diff(
                     f"apply_diff: rg default hint for {rel_focus}: "
                     f"line {rg_hint + 1} -> start {rg_hint + 1}"
                 )
-                pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=4)
+                pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=6)
                 if pos == -1:
-                    pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=6)
+                    pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=10)
 
         if pos == -1:
             pos = _find_hunk_location(file_lines, expected, hint)
         if pos == -1:
-            pos = _find_hunk_location(file_lines, expected, hint, max_fuzz=4)
+            pos = _find_hunk_location(file_lines, expected, hint, max_fuzz=6)
+        if pos == -1:
+            pos = _find_hunk_location(file_lines, expected, hint, max_fuzz=10)
         if pos == -1 and (not config.USE_RG_HINT_DEFAULT or anchor_line > 0):
             rg_hint = _rg_hint_for_expected(
                 rel_focus, expected, root_override=root_override
             )
             if rg_hint is not None:
-                pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=4)
+                pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=6)
+                if pos == -1:
+                    pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=10)
         if pos == -1:
+            # Fallback: use @@ line numbers when context match fails (model may have
+            # produced diff for slightly different file structure).
+            old_start = int(getattr(hunk, "old_start", 0) or 0)
+            n_expected = len(expected)
+            if old_start > 0:
+                pos = old_start - 1  # 0-based
+                dbg(
+                    f"apply_diff: context match failed, using @@ line-number fallback "
+                    f"at line {pos + 1} for {rel_focus}"
+                )
+                file_lines[pos : pos + n_expected] = replacement
+                continue  # next hunk
             expect_preview = [c for _, c in expected[:3]]
             hunk_lines = []
             for p, c in list(getattr(hunk, "lines", []) or [])[:80]:

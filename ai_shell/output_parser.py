@@ -24,7 +24,7 @@ def strip_code_blocks_for_display(text: str) -> str:
         if i == 0:
             explanation_parts.append(part)
         else:
-            # This part started with ``` - find the closing ``` and take nothing
+            # This part started with ``` - find the closing ``` and take text after
             end = part.find("\n```")
             if end >= 0:
                 explanation_parts.append(part[end + 4 :])  # after \n```
@@ -34,12 +34,12 @@ def strip_code_blocks_for_display(text: str) -> str:
     t = re.sub(r"\n?```\s*\n?", "\n", t)
     # Remove [[[file: path]]] ... [[[end]]] blocks
     t = re.sub(r"\[\[\[file:\s*[^\]]+\]\]\].*?\[\[\[end\]\]\]", "", t, flags=re.DOTALL | re.IGNORECASE)
-    # Remove unified diff blocks
+    # Remove unified diff blocks (only when we've seen --- a/ or +++ b/)
     lines = t.split("\n")
     out: list = []
     in_diff = False
     for line in lines:
-        if line.startswith("--- a/") or line.startswith("+++ b/"):
+        if line.startswith("--- a/") or line.startswith("+++ b/") or line.startswith("--- /dev/null"):
             in_diff = True
         if in_diff:
             is_diff_line = (
@@ -52,7 +52,13 @@ def strip_code_blocks_for_display(text: str) -> str:
                 continue
         out.append(line)
     t = "\n".join(out)
-    return t.strip()
+    result = t.strip()
+    # Fallback: if we stripped everything, try to extract "Explanation:" and after
+    if not result and "Explanation" in (text or ""):
+        idx = (text or "").find("Explanation")
+        if idx >= 0:
+            result = text[idx:].strip()
+    return result
 
 
 def _looks_like_code(content: str, min_lines: int = 1) -> bool:
@@ -134,6 +140,9 @@ def extract_markdown_blocks(output: str) -> List[Tuple[str, str]]:
             continue
         # Skip if path_part is a lang tag (c, cpp, etc.) - pattern 2 handles those
         if path_part.lower() in ("c", "cpp", "cc", "cxx", "py", "js", "ts", "go", "rs"):
+            continue
+        # Skip "diff" — that's a unified diff block, not a filename
+        if path_part.lower() == "diff":
             continue
         path = _norm_rel_path(path_part)
         if path:
@@ -222,35 +231,86 @@ def parse_flexible_output(
     if not (output or "").strip():
         return None, None, None
 
-    # 1. Try file blocks
+    # 1. Try unified diff FIRST — strip fences, then use path from header (+++ b/ or --- a/)
+    from .parsing import parse_unified_diff
+
+    # Step 1: Strip ```diff and ``` fences first
+    diff_text = _strip_diff_markdown_fences(output)
+    # Step 2: Check indicator and header for path
+    path_from_header = _get_path_from_diff_header(diff_text)
+    if path_from_header:
+        file_path, hunks, is_delete = parse_unified_diff(diff_text, focus_file=path_from_header)
+        if file_path and hunks:
+            dbg(f"output_parser: parsed unified diff for {file_path} ({len(hunks)} hunks, delete={is_delete})")
+            return "diff", (file_path, hunks, is_delete), None
+
+    # 2. Try file blocks
     blocks = extract_file_blocks(output)
     if not blocks:
         blocks = extract_markdown_blocks(output)
     if not blocks:
         blocks = extract_markdown_lang_only_blocks(output, candidate_paths)
     if blocks:
-        # Resolve inferred paths against candidates (e.g. childcreates.c -> w6/childcreates.c)
         resolved = [
             (_resolve_path_with_candidates(p, candidate_paths), c) for p, c in blocks
         ]
         return "blocks", None, resolved
 
-    # 2. Try unified diff
-    from .parsing import parse_unified_diff
-
-    # Extract path from diff header (+++ b/path is the file being edited)
-    lines = output.split("\n")
-    focus_from_diff = ""
-    for line in lines:
-        if line.startswith("+++ b/"):
-            focus_from_diff = line[len("+++ b/") :].strip().split("\t")[0].strip()
-            break
-        if line.startswith("--- a/") and not focus_from_diff:
-            focus_from_diff = line[len("--- a/") :].strip().split("\t")[0].strip()
-    if focus_from_diff:
-        file_path, hunks = parse_unified_diff(output, focus_file=focus_from_diff)
-        if file_path and hunks:
-            dbg(f"output_parser: parsed unified diff for {file_path} ({len(hunks)} hunks)")
-            return "diff", (file_path, hunks), None
-
     return None, None, None
+
+
+def _reformat_oneliner_diff(block: str) -> str:
+    """Reformat a diff that the model emitted as one line (no newlines) into proper line format."""
+    if not block or block.count("\n") > 2:
+        return block
+    # Split before structural markers: @@ (hunk), --- (file header), +++ (file header)
+    # and before diff content lines: space+minus, space+plus
+    out = re.sub(r" (?=@@ -)", "\n", block)
+    out = re.sub(r" (?=--- a/|--- /dev/null)", "\n", out)
+    out = re.sub(r" (?=\+\+\+ b/|\+\+\+ /dev/null)", "\n", out)
+    # Diff content: " -line" and " +line" become newlines (avoid splitting inside strings)
+    out = re.sub(r" (?=-[^\s]|\+[^\s])", "\n", out)
+    return out.strip()
+
+
+def _strip_diff_markdown_fences(output: str) -> str:
+    """Strip ```diff and ``` fences. Return first diff block only (avoids duplicate apply)."""
+    if not output:
+        return output
+    text = (output or "").replace("\r\n", "\n").replace("\r", "\n")
+    for m in re.finditer(r"```(?:diff)?\s*\n(.*?)(?=\n```|\Z)", text, re.DOTALL):
+        block = (m.group(1) or "").strip()
+        # Accept --- a/path (edit), --- /dev/null (new file), +++ /dev/null (delete)
+        has_minus = ("--- a/" in block) or ("--- /dev/null" in block)
+        has_plus = ("+++ b/" in block) or ("+++ /dev/null" in block)
+        if has_minus and has_plus and "@@" in block:
+            # Model sometimes emits diff as one line; reformat before parsing
+            if block.count("\n") < 2:
+                block = _reformat_oneliner_diff(block)
+                dbg("output_parser: reformatted one-liner diff")
+            # Take only the first diff — model may emit same diff twice
+            lines = block.split("\n")
+            out_lines = []
+            seen_file_header = False
+            for i, line in enumerate(lines):
+                if (line.startswith("--- a/") or line.startswith("--- /dev/null")) and i > 0 and seen_file_header:
+                    break
+                if line.startswith("--- a/") or line.startswith("--- /dev/null"):
+                    seen_file_header = True
+                out_lines.append(line)
+            result = "\n".join(out_lines)
+            dbg("output_parser: stripped diff markdown fences")
+            return result
+    return text
+
+
+def _get_path_from_diff_header(diff_text: str) -> str:
+    """Check indicator and header; return path from +++ b/ (preferred) or --- a/ (for delete), else empty."""
+    plus_path = minus_path = ""
+    for line in (diff_text or "").split("\n"):
+        if line.startswith("+++ b/"):
+            plus_path = line[len("+++ b/") :].strip().split("\t")[0].strip()
+        elif line.startswith("--- a/"):
+            minus_path = line[len("--- a/") :].strip().split("\t")[0].strip()
+    # For delete (+++ /dev/null), plus_path is empty; use minus_path
+    return plus_path or minus_path

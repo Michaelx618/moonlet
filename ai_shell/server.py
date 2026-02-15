@@ -1,5 +1,6 @@
 import base64
 import json
+import sys
 import mimetypes
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from . import prompt_buffer, state
 from .agent import run_agent_meta
 from .relevance import find_relevant_files
 from .files import (
+    delete_file,
     get_include,
     get_root,
     list_repo_files,
@@ -26,6 +28,14 @@ from .files import (
     write_file_text,
 )
 from .model import backend_name, backend_status, stream_reply_chunks
+from .tool_executor import (
+    CHAT_TOOLS_HINT,
+    TOOLS_SYSTEM_HINT,
+    execute_tool,
+    extract_tool_calls,
+    strip_tool_calls_from_output,
+    tool_log,
+)
 from .utils import dbg
 
 import difflib
@@ -130,7 +140,7 @@ class APIServer(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/stream":
-            mode = data.get("mode", "agent")
+            mode = (data.get("mode") or "agent").strip().lower()
             text = data.get("text") or ""
             focus_file = data.get("focus_file")
             file_path = data.get("file_path")
@@ -158,18 +168,62 @@ class APIServer(BaseHTTPRequestHandler):
                         focus_file = discovered[0]
                         dbg(f"agent: discovered focus_file from request: {focus_file}")
 
+                if getattr(config, "DISABLE_FOCUS_FILE", False):
+                    focus_file = None
+
                 if mode == "chat":
                     chat_max_new = config.MAX_NEW
+                    # Give model access to imported files (candidate files) — it chooses which tools to use
+                    chat_context_override = ""
+                    from .index import get_indexed_files
+                    if get_include():
+                        candidate_files = get_indexed_files()
+                        if candidate_files:
+                            chat_context_override = "FILES: " + ", ".join(candidate_files)
+                    if not chat_context_override:
+                        chat_context_override = "Use [[[list_files]]] to see available files."
                     prompt, _ = prompt_buffer.build_prompt(
                         "chat",
                         text,
-                        focus_file=focus_file,
-                        # Chat should use reduced context path to keep latency low.
-                        # The prompt builder still includes file-aware context.
+                        focus_file=None if getattr(config, "DISABLE_FOCUS_FILE", False) else focus_file,
                         full_context=False,
+                        context_override=chat_context_override,
+                        system_append=CHAT_TOOLS_HINT,
                     )
                     output_chunks = []
                     start = time.time()
+                    chat_stop = ["\nUser:", "\nSYSTEM:", "\nCONTEXT:", "\nHISTORY:"]
+                    max_rounds = max(1, int(getattr(config, "MAX_TOOL_ROUNDS", 3)))
+                    for _round in range(max_rounds):
+                        round_chunks = []
+                        for token in stream_reply_chunks(
+                            prompt,
+                            max_new=chat_max_new,
+                            stop_sequences=chat_stop,
+                        ):
+                            round_chunks.append(token)
+                        reply = "".join(round_chunks).strip()
+                        tool_calls = extract_tool_calls(reply)
+                        if not tool_calls:
+                            output_chunks = round_chunks
+                            break
+                        self._sse_send("working", event="status")
+                        tool_log(f"chat round {_round + 1}: model requested {len(tool_calls)} tool(s)")
+                        results = []
+                        for name, arg in tool_calls:
+                            results.append(execute_tool(name, arg))
+                        combined = "\n\n".join(results)
+                        max_chars = getattr(config, "MAX_TOOL_RESULT_CHARS", 0) or 0
+                        if max_chars > 0 and len(combined) > max_chars:
+                            combined = combined[:max_chars] + "\n\n...[truncated]"
+                            tool_log(f"chat round {_round + 1} done: truncated to {max_chars} chars")
+                        else:
+                            tool_log(f"chat round {_round + 1} done: feeding {len(combined)} chars back")
+                        prompt = (
+                            f"{prompt}\n{reply}\n\nTool results:\n{combined}\n\n"
+                            "User: Continue. Use the tool results above.\nAssistant:"
+                        )
+                    output = strip_tool_calls_from_output("".join(output_chunks).strip())
                     chat_buffered = (
                         config.BUFFER_OUTPUT
                         and (
@@ -178,28 +232,7 @@ class APIServer(BaseHTTPRequestHandler):
                             or len(text) >= config.CHAT_BUFFER_INPUT_CHARS
                         )
                     )
-                    chat_stop = ["\nUser:", "\nSYSTEM:", "\nCONTEXT:", "\nHISTORY:"]
-                    if chat_buffered:
-                        last_status = start
-                        for token in stream_reply_chunks(
-                            prompt,
-                            max_new=chat_max_new,
-                            stop_sequences=chat_stop,
-                        ):
-                            output_chunks.append(token)
-                            now = time.time()
-                            if now - last_status >= 0.5:
-                                self._sse_send("working", event="status")
-                                last_status = now
-                    else:
-                        for token in stream_reply_chunks(
-                            prompt,
-                            max_new=chat_max_new,
-                            stop_sequences=chat_stop,
-                        ):
-                            output_chunks.append(token)
-                            self._sse_send(token, event="chunk")
-                    output = "".join(output_chunks).strip()
+                    self._sse_send(output, event="chunk")
                     agent.chat_history.append((text, output))
                     state.append_chat_turn(text, output)
                     meta = {
@@ -212,16 +245,16 @@ class APIServer(BaseHTTPRequestHandler):
                         "truncated": False,
                         "chat_max_new": chat_max_new,
                     }
-                    if chat_buffered:
-                        self._sse_send(output, event="chunk")
                 else:
                     output, meta = run_agent_meta(
                         text,
-                        focus_file=focus_file,
+                        focus_file=None if getattr(config, "DISABLE_FOCUS_FILE", False) else focus_file,
                         silent=True,
                         full_context=bool(file_path),
                     )
                     meta["buffer_mode"] = "direct"
+                    meta["output"] = output  # explanation (code stripped) for agent panel
+                    meta["explanation"] = output  # explicit key for frontend
                     self._attach_path_debug(meta, focus_file)
                     self._sse_send(output, event="chunk")
 
@@ -236,15 +269,31 @@ class APIServer(BaseHTTPRequestHandler):
                     sent_done = True
             return
 
-        # /file (write/upload)
+        # /file (write/upload or delete)
         if parsed.path == "/file":
             rel_path = data.get("path") or ""
             content = data.get("content")
             if not rel_path:
                 self._json(400, {"error": "path is required"})
                 return
+            # content is None or null: delete file
             if content is None:
-                self._json(400, {"error": "content is required"})
+                try:
+                    target = resolve_path(rel_path)
+                    if is_security_concern(target):
+                        self._json(
+                            403,
+                            {"error": "Security concern: cannot delete system paths"},
+                        )
+                        return
+                    delete_file(rel_path)
+                    self._json(200, {"status": "deleted", "path": rel_path})
+                except FileNotFoundError:
+                    self._json(404, {"error": "not found"})
+                except PermissionError as exc:
+                    self._json(403, {"error": str(exc)})
+                except Exception as exc:  # pragma: no cover
+                    self._json(500, {"error": str(exc)})
                 return
             if is_binary_file(rel_path):
                 self._json(
@@ -351,11 +400,21 @@ class APIServer(BaseHTTPRequestHandler):
             if paths is None:
                 self._json(400, {"error": "paths required"})
                 return
+            paths = paths if isinstance(paths, list) else []
             try:
                 set_include(paths)
                 self._json(200, {"include": get_include()})
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[/include error] {exc}\n{tb}", file=sys.stderr)
+                try:
+                    with open("moonlet_import_error.txt", "w") as f:
+                        f.write(f"{exc}\n\n{tb}")
+                except Exception:
+                    pass
+                err_msg = f"{exc}\n\n{tb}"
+                self._json(400, {"error": err_msg})
             return
         if parsed.path == "/history/clear":
             try:
@@ -378,7 +437,7 @@ class APIServer(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(exc)})
             return
         if parsed.path == "/root":
-            new_root = data.get("path")
+            new_root = (data.get("path") or "").strip()
             if not new_root:
                 self._json(400, {"error": "path is required"})
                 return
@@ -389,7 +448,16 @@ class APIServer(BaseHTTPRequestHandler):
 
                 self._json(200, {"root": str(root)})
             except Exception as exc:
-                self._json(400, {"error": str(exc)})
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[/root error] {exc}\n{tb}", file=sys.stderr)
+                try:
+                    with open("moonlet_import_error.txt", "w") as f:
+                        f.write(f"{exc}\n\n{tb}")
+                except Exception:
+                    pass
+                err_msg = f"{exc}\n\n{tb}"
+                self._json(400, {"error": err_msg})
             return
 
         self._json(404, {"error": "unknown endpoint"})
@@ -420,7 +488,16 @@ class APIServer(BaseHTTPRequestHandler):
                 files = list_repo_files()
                 self._json(200, {"files": files})
             except Exception as exc:
-                self._json(500, {"error": str(exc)})
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[/files error] {exc}\n{tb}", file=sys.stderr)
+                try:
+                    with open("moonlet_import_error.txt", "w") as f:
+                        f.write(f"{exc}\n\n{tb}")
+                except Exception:
+                    pass
+                err_msg = f"{exc}\n\n{tb}"
+                self._json(500, {"error": err_msg})
             return
         if parsed.path == "/file":
             qs = parse_qs(parsed.query)
