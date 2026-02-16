@@ -121,6 +121,55 @@ def _infer_path_from_code(body: str) -> Optional[str]:
     return None
 
 
+def _reformat_oneliner_code_block(block: str) -> str:
+    """Reformat a code block emitted as one line (spaces instead of newlines) into proper lines."""
+    if not block or block.count("\n") > 3:
+        return block
+    # Split before preprocessor/keywords (space-separated line starts)
+    out = re.sub(
+        r" (?=#include|#define|#if|#else|#endif|#pragma|"
+        r"int |char |void |if |else |for |while |return |switch |case |break |default |"
+        r"struct |typedef |static |const |extern |"
+        r"def |class |import |from |\}|\{)",
+        "\n",
+        block,
+    )
+    return out.strip()
+
+
+def _infer_path_from_reply_text(
+    output: str, block_start: int, block_end: int, candidate_paths: Optional[List[str]] = None
+) -> Optional[str]:
+    """Infer target file from surrounding reply text (e.g. 'the `checkpasswd.c` file')."""
+    if not output or not candidate_paths:
+        return None
+    # Look at text before and after the code block
+    before = output[:block_start]
+    after = output[block_end:]
+    context = f"{before} {after}"
+    candidates = [_norm_rel_path(p) for p in candidate_paths]
+    # Backtick-quoted filenames: `checkpasswd.c`, `w7/checkpasswd.c`
+    for m in re.finditer(r"`([A-Za-z0-9_./-]+)`", context):
+        mention = (m.group(1) or "").strip()
+        if not mention or mention.lower() in ("c", "cpp", "py", "diff"):
+            continue
+        for c in candidates:
+            if c == mention or c.endswith("/" + mention) or c.split("/")[-1] == mention:
+                return c
+    # "the X file", "for X", "in X", "update X", "complete the X file"
+    for m in re.finditer(r"(?:the|for|in|update|complete)\s+[`']?([A-Za-z0-9_./-]+\.(?:c|py|js|ts|go|rs|java))[`']?", context, re.IGNORECASE):
+        mention = (m.group(1) or "").strip()
+        for c in candidates:
+            if c.endswith(mention) or c.split("/")[-1] == mention:
+                return c
+    # Bare filename in context (e.g. "checkpasswd.c" in "To complete the checkpasswd.c file")
+    for c in candidates:
+        base = c.split("/")[-1]
+        if base and re.search(r"\b" + re.escape(base) + r"\b", context):
+            return c
+    return None
+
+
 def extract_markdown_blocks(output: str) -> List[Tuple[str, str]]:
     """Extract markdown code blocks with path: ```path or ```lang:path."""
     if not output:
@@ -128,9 +177,10 @@ def extract_markdown_blocks(output: str) -> List[Tuple[str, str]]:
     text = (output or "").replace("\r\n", "\n").replace("\r", "\n")
     blocks: List[Tuple[str, str]] = []
 
-    # Pattern 1: ```path or ```file: path - has path (group 1) and body (group 2)
+    # Pattern 1: ```path, ```file: path, or ```lang:path (e.g. ```c:checkpasswd.c)
+    # Accept optional newline after fence (model may emit one-liner)
     pat1 = re.compile(
-        r"```(?:file:\s*)?([A-Za-z0-9_./-]+)\s*\n(.*?)(?=\n```|\Z)",
+        r"```(?:file:\s*)?([A-Za-z0-9_:./-]+)\s*(?:\n)?(.*?)(?=\n```|```|\Z)",
         re.DOTALL,
     )
     for m in pat1.finditer(text):
@@ -138,25 +188,34 @@ def extract_markdown_blocks(output: str) -> List[Tuple[str, str]]:
         body = (m.group(2) or "").strip()
         if not body or not _looks_like_code(body):
             continue
-        # Skip if path_part is a lang tag (c, cpp, etc.) - pattern 2 handles those
-        if path_part.lower() in ("c", "cpp", "cc", "cxx", "py", "js", "ts", "go", "rs"):
-            continue
+        if body.count("\n") < 3 and ("#include" in body or "#define" in body or "def " in body):
+            body = _reformat_oneliner_code_block(body)
         # Skip "diff" — that's a unified diff block, not a filename
         if path_part.lower() == "diff":
+            continue
+        # Handle ```lang:path (e.g. ```c:checkpasswd.c) — use path after colon
+        if ":" in path_part:
+            path_part = path_part.split(":", 1)[-1].strip()
+        # Skip if path_part is a bare lang tag (c, cpp, etc.) — pattern 2 handles those
+        if path_part.lower() in ("c", "cpp", "cc", "cxx", "py", "js", "ts", "go", "rs"):
             continue
         path = _norm_rel_path(path_part)
         if path:
             blocks.append((path, body))
 
     # Pattern 2: ```c, ```cpp, etc. - only body (group 1), infer path from content
+    # Accept optional newline after fence (model may emit one-liner)
     pat2 = re.compile(
-        r"```(?:c|cpp|cc|cxx|py|js|ts|go|rs)\s*\n(.*?)(?=\n```|\Z)",
+        r"```(?:c|cpp|cc|cxx|py|js|ts|go|rs)\s*(?:\n)?(.*?)(?=\n```|```|\Z)",
         re.DOTALL | re.IGNORECASE,
     )
     for m in pat2.finditer(text):
         body = (m.group(1) or "").strip()
         if not body or not _looks_like_code(body):
             continue
+        if body.count("\n") < 3 and ("#include" in body or "#define" in body or "def " in body):
+            body = _reformat_oneliner_code_block(body)
+            dbg("output_parser: reformatted one-liner code block")
         inferred = _infer_path_from_code(body)
         if inferred:
             blocks.append((inferred, body))
@@ -171,31 +230,36 @@ def extract_markdown_lang_only_blocks(
     output: str,
     candidate_paths: Optional[List[str]] = None,
 ) -> List[Tuple[str, str]]:
-    """Extract ```c, ```cpp, etc. blocks (no path), strip markdown, infer path from content or candidates."""
+    """Extract ```c, ```cpp, etc. blocks (no path). Use model's path indicator only — do not fall back to candidates."""
     if not output:
         return []
     text = (output or "").replace("\r\n", "\n").replace("\r", "\n")
-    # Match ```lang\n...\n``` (any common lang)
+    # Match ```lang\n... or ```lang... (model may emit one-liner with no newline after fence)
     pat = re.compile(
-        r"```(?:c|cpp|cc|cxx|py|js|ts|go|rs|java|makefile?)\s*\n(.*?)(?=\n```|\Z)",
+        r"```(?:c|cpp|cc|cxx|py|js|ts|go|rs|java|makefile?)\s*(?:\n)?(.*?)(?=\n```|```|\Z)",
         re.DOTALL | re.IGNORECASE,
     )
     blocks: List[Tuple[str, str]] = []
-    candidates = [_norm_rel_path(p) for p in (candidate_paths or [])]
-    idx = 0
     for m in pat.finditer(text):
         body = (m.group(1) or "").strip()
         if not body or not _looks_like_code(body):
             continue
+        # Model sometimes emits code as one line; normalize before applying
+        if body.count("\n") < 3 and ("#include" in body or "#define" in body or "def " in body):
+            body = _reformat_oneliner_code_block(body)
+            dbg("output_parser: reformatted one-liner code block")
         path = _infer_path_from_code(body)
-        if not path and idx < len(candidates):
-            path = candidates[idx]
-            idx += 1
-        elif not path and candidates:
-            path = candidates[0]
+        # Infer from surrounding reply text (e.g. "the `checkpasswd.c` file")
+        if not path and candidate_paths:
+            path = _infer_path_from_reply_text(text, m.start(), m.end(), candidate_paths)
+        # Only use single candidate when no other signal — never guess from list order
+        if not path and candidate_paths and len(candidate_paths) == 1:
+            path = _norm_rel_path(candidate_paths[0])
         if path:
             blocks.append((path, body))
             dbg(f"output_parser: extracted lang-only block -> {path}")
+        else:
+            dbg("output_parser: skipped lang-only block (no path indicator — use ```path or ```lang:path)")
     return blocks
 
 
@@ -264,12 +328,12 @@ def _reformat_oneliner_diff(block: str) -> str:
     if not block or block.count("\n") > 2:
         return block
     # Split before structural markers: @@ (hunk), --- (file header), +++ (file header)
-    # and before diff content lines: space+minus, space+plus
     out = re.sub(r" (?=@@ -)", "\n", block)
     out = re.sub(r" (?=--- a/|--- /dev/null)", "\n", out)
     out = re.sub(r" (?=\+\+\+ b/|\+\+\+ /dev/null)", "\n", out)
-    # Diff content: " -line" and " +line" become newlines (avoid splitting inside strings)
-    out = re.sub(r" (?=-[^\s]|\+[^\s])", "\n", out)
+    # Diff content lines: " #x" (context), "-x" (removal), "+x" (addition)
+    # Avoid splitting inside @@ (e.g. @@ -1,10 +1,10) — -/+ followed by digit stays
+    out = re.sub(r" (?=#|-(?!\d)|\+(?!\d))", "\n", out)
     return out.strip()
 
 
@@ -278,7 +342,9 @@ def _strip_diff_markdown_fences(output: str) -> str:
     if not output:
         return output
     text = (output or "").replace("\r\n", "\n").replace("\r", "\n")
-    for m in re.finditer(r"```(?:diff)?\s*\n(.*?)(?=\n```|\Z)", text, re.DOTALL):
+    # Accept both ```diff\n... and ```diff... (model may emit one-liner with no newline after fence)
+    # Stop at \n```, ```, or end (closing fence may have no newline before it)
+    for m in re.finditer(r"```(?:diff)?\s*(?:\n)?(.*?)(?=\n```|```|\Z)", text, re.DOTALL):
         block = (m.group(1) or "").strip()
         # Accept --- a/path (edit), --- /dev/null (new file), +++ /dev/null (delete)
         has_minus = ("--- a/" in block) or ("--- /dev/null" in block)

@@ -21,17 +21,18 @@ def _render_section(title: str, content: str) -> str:
 
 
 def trim_to_budget(sections: List[Tuple[str, str]], budget: int) -> str:
-    """Join sections and trim from the end to fit budget."""
+    """Join sections and trim to fit budget. Never truncates the last section (user message)."""
     rendered = [_render_section(title, content) for title, content in sections]
     total = sum(len(chunk) for chunk in rendered)
     if total <= budget:
         return "".join(rendered).strip()
     updated = list(sections)
-    for idx in range(len(updated) - 1, -1, -1):
-        if total <= budget:
-            break
+    # Trim from second-to-last backwards (HISTORY, CONTEXT, SYSTEM). Never trim user message.
+    idx = max(0, len(updated) - 2)
+    while total > budget and idx >= 0:
         title, content = updated[idx]
         if not content:
+            idx -= 1
             continue
         header = f"{title}\n" if title else ""
         trailer = "\n\n"
@@ -40,12 +41,14 @@ def trim_to_budget(sections: List[Tuple[str, str]], budget: int) -> str:
         if allowed <= len(header) + len(trailer):
             updated[idx] = (title, "")
             total -= section_len
-            continue
-        keep_len = max(0, allowed - len(header) - len(trailer))
-        trimmed = content[:keep_len].rstrip()
-        updated[idx] = (title, trimmed)
-        total = total - section_len + len(header) + len(trimmed) + len(trailer)
-        break
+        else:
+            keep_len = max(0, allowed - len(header) - len(trailer))
+            trimmed = content[:keep_len].rstrip()
+            updated[idx] = (title, trimmed)
+            total = total - section_len + len(header) + len(trimmed) + len(trailer)
+        if total <= budget:
+            break
+        idx -= 1
     rendered = [_render_section(title, content) for title, content in updated]
     combined = "".join(rendered).strip()
     return combined[:budget]
@@ -347,74 +350,6 @@ def _helper_windows_for_calls(
     return out
 
 
-def build_freedom_context(
-    user_text: str,
-    candidate_files: List[str],
-    max_chars: int = 14000,
-) -> str:
-    """Build multi-file context for freedom mode. Uses tree-sitter + grep for snippets.
-    Model decides which file(s) to edit; no single-file bias."""
-    if not candidate_files:
-        return ""
-    parts: List[str] = [
-        "FILES (edit any or all as needed):",
-        f"REQUEST: {(user_text or '').strip()}",
-    ]
-    keywords = _keywords_from_text(user_text or "")
-    max_files = min(len(candidate_files), config.PATCH_MAX_FILES_PER_DIFF)
-    for focus_file in candidate_files[:max_files]:
-        content = read_single_file_for_context(focus_file).get(focus_file, "")
-        if content is None:
-            content = ""
-        lines = content.splitlines()
-        parts.append(f"\nFILE: {focus_file}")
-        summary = _build_file_summary(
-            focus_file,
-            content,
-            max_preview=0,
-            max_defs=24,
-            skip_preview=True,
-        )
-        if summary:
-            parts.append(summary)
-
-        if len(lines) <= max(1, int(config.PATCH_FULL_FILE_MAX_LINES)):
-            parts.append("FULL FILE:")
-            parts.append(content)
-            dbg(f"freedom_context: full file {focus_file} lines={len(lines)}")
-            continue
-
-        sym_anchors = _symbol_anchor_lines(focus_file, content, keywords)
-        search_anchors = _search_anchor_lines(focus_file, keywords)
-        anchor_rows: List[Tuple[int, str]] = []
-        anchor_rows.extend((ln, "symbol") for ln in sym_anchors)
-        anchor_rows.extend((ln, "search") for ln in search_anchors)
-
-        win = max(config.PATCH_CONTEXT_WINDOW_MIN, min(config.PATCH_CONTEXT_WINDOW_MAX, 140))
-        half = max(10, win // 2)
-        windows: List[Tuple[int, int]] = []
-        for line_no, _ in anchor_rows[:16]:
-            windows.append((max(1, line_no - half), min(len(lines) or 1, line_no + half)))
-        imp = _imports_window(lines)
-        if imp:
-            windows.append(imp)
-        if not windows and lines:
-            end = min(len(lines), max(40, config.PATCH_CONTEXT_WINDOW_MIN))
-            windows.append((1, end))
-        merged = _merge_line_windows(windows, max_lines=6)
-        parts.append("SNIPPETS:")
-        for start, end in merged:
-            snippet = "\n".join(lines[start - 1 : end]) if lines else ""
-            parts.append(f"@@ {start}-{end}")
-            parts.append(snippet)
-
-    text = "\n".join(parts).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "\n...[truncated]"
-    dbg(f"freedom_context: {max_files} files, {len(text)} chars")
-    return text
-
-
 def _is_existing_nontiny(content: str) -> bool:
     """Return True if file content is substantial (not new/empty/tiny).
     Uses either char count OR line count — whichever signals "nontiny" first."""
@@ -674,6 +609,7 @@ def _build_file_context(
         "snippets_used": [],
     }
     if focus_file:
+        content = ""
         try:
             if focus_content_override is not None:
                 content = focus_content_override
@@ -834,32 +770,41 @@ def _build_chat_history(mode: str = "chat") -> str:
     return "\n".join(lines)
 
 
+def _user_asks_about_code_or_review(user_text: str) -> bool:
+    """True if user is asking about correctness, review, or 'the code'."""
+    if not (user_text or "").strip():
+        return False
+    low = (user_text or "").lower()
+    return bool(
+        re.search(r"\b(correct|correctness|review|check|verify|valid|right|wrong)\b", low)
+        or re.search(r"\b(the\s+)?code\b", low)
+        or re.search(r"is\s+it\s+(correct|right|valid)", low)
+        or "lab" in low and re.search(r"\b(implement|requirement|instruction)", low)
+    )
+
+
 def build_prompt(
     mode: str,
     user_text: str,
     focus_file: Optional[str] = None,
     full_context: bool = False,
-    force_file_block: bool = False,
-    output_contract: str = "",
-    structural_target: str = "",
-    structural_kind: str = "",
-    structural_line_start: int = 0,
-    structural_line_end: int = 0,
-    structural_byte_start: int = 0,
-    structural_byte_end: int = 0,
-    structural_original_symbol: str = "",
-    structural_signature_line: str = "",
-    error_message: str = "",
     pre_sliced_request: Optional[str] = None,
     focus_content_override: Optional[str] = None,
     context_override: str = "",
-    analysis_packet: str = "",
-    plan_contract: str = "",
+    system_append: str = "",
 ) -> Tuple[str, Dict[str, object]]:
     """Build a prompt from prioritized sections and budget.
     Returns (prompt_text, context_meta) where context_meta has:
     mode_used, context_bytes, snippets_used."""
     sliced_for_context = pre_sliced_request or (user_text or "")
+    file_context = ""
+    ctx_meta: Dict[str, object] = {
+        "mode_used": "full_file",
+        "context_bytes": 0,
+        "snippets_used": [],
+        "include_count": 0,
+        "include_chars": 0,
+    }
     if context_override:
         file_context = str(context_override or "").strip()
         ctx_meta = {
@@ -869,6 +814,23 @@ def build_prompt(
             "include_count": 0,
             "include_chars": 0,
         }
+        # Chat and agent mode: read all indexed files into context so model edits real code, not blind
+        if mode in ("chat", "chat_for_agent") and file_context.startswith("FILES:"):
+            max_files = max(0, int(getattr(config, "CHAT_INCLUDE_MAX_FILES", 12)))
+            if max_files > 0:
+                files_part = file_context[6:].strip()  # after "FILES:"
+                paths = [p.strip() for p in files_part.split(",") if p.strip()][:max_files]
+                for path in paths:
+                    try:
+                        content_map = read_single_file_for_context(path)
+                        content = next(iter(content_map.values()), "") if content_map else ""
+                        if content:
+                            file_context = f"{file_context}\n\n--- {path} ---\n{content}"
+                    except Exception:
+                        pass
+                ctx_meta["context_bytes"] = len(file_context)
+                ctx_meta["snippets_used"] = ["packed_context_override", "all_indexed_files"]
+                dbg(f"context: included {len(paths)} indexed file(s) ({len(file_context)} chars)")
         dbg(
             "context_policy=packed reason=structural_packed_context_override "
             f"bytes={ctx_meta['context_bytes']}"
@@ -905,16 +867,20 @@ def build_prompt(
     # Keep short conversational turns lean to avoid history/context bleed.
     if mode == "chat_for_agent":
         system = (
-            "You are a code-editing assistant.Do what the user says and nothing more "
-            "When the user asks for code: give code only with minimal explanation. "
-            "You may edit one or more files; indicate which file each block goes to."
+            "You are orbit, a code-editing assistant. "
+            "Read the relevant files before editing. "
+            "You must output code with a brief explanation. Indicate which file the code goes to."
         )
     else:
         system = (
-            "You are a helpful assistant. "
+            "You are orbit, a helpful assistant. "
+            "Read the relevant files before answering. "
             "Default to concise responses: short answer first, then only essential details. "
             "Avoid long preambles and avoid repeating the user's prompt."
+            "do not output code unless requested."
         )
+    if system_append:
+        system = f"{system}\n\n{system_append}"
     user_trimmed = (user_text or "").strip()
     low = user_trimmed.lower()
     short_chat = (

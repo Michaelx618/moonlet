@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 from . import config
 from .files import get_root
-from .model import stream_reply
+from .model import stream_reply, get_session_cache_key
 from .output_parser import parse_flexible_output, strip_code_blocks_for_display
 from .prompt_buffer import build_prompt
 from .relevance import find_relevant_files
@@ -99,6 +99,8 @@ def run_freedom_edit(
     )
 
     # 3. Tool loop: let agent call grep/symbols/read/list_files, then produce final output
+    # Shared session cache_key so agent and chat reuse same KV slot
+    cache_key = get_session_cache_key()
     reply = ""
     max_rounds = max(1, int(getattr(config, "MAX_TOOL_ROUNDS", 3)))
     for _round in range(max_rounds):
@@ -108,6 +110,7 @@ def run_freedom_edit(
             silent=silent,
             max_new=config.MAX_NEW,
             stop_sequences=["\nUser:", "\nSYSTEM:", "\nCONTEXT:", "\nHISTORY:"],
+            cache_key=cache_key,
         )
         dbg_dump("freedom_edit_reply", reply or "")
 

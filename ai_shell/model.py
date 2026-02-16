@@ -171,6 +171,8 @@ class _LlamaServerBackend:
             slot = int(hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:8], 16) % slots
             payload["id_slot"] = int(slot)
             dbg(f"llama-server cache slot={slot} key={cache_key[:24]}")
+            if getattr(config, "DEBUG_KV_CACHE", False):
+                dbg(f"kv_cache: request slot={slot} prompt_len={len(prompt)} cache_prompt=True")
         stop_list = [s for s in (stop or []) if s]
         if stop_list:
             payload["stop"] = stop_list
@@ -195,6 +197,11 @@ class _LlamaServerBackend:
             obj = json.loads(raw)
         except Exception as exc:
             raise RuntimeError(f"llama-server returned invalid JSON: {exc}")
+
+        if getattr(config, "DEBUG_KV_CACHE", False) and isinstance(obj, dict):
+            cache_tok = obj.get("cache_prompt_tokens") or obj.get("prompt_tokens")
+            timings = obj.get("timings") or {}
+            dbg(f"kv_cache: response cache_prompt_tokens={cache_tok} timings={timings}")
 
         if isinstance(obj, dict):
             if isinstance(obj.get("content"), str):
@@ -737,11 +744,30 @@ def stream_reply(
     return reply
 
 
+def get_session_cache_key() -> str:
+    """Shared cache key for agent and chat — same slot so both modes reuse KV cache.
+    Based on root + include so all requests in the same session share one slot."""
+    try:
+        from .files import get_include, get_root
+        root = str(get_root() or "")
+        include = get_include() or []
+        parts = [root, "|".join(sorted(str(p) for p in include))]
+        raw = "\0".join(parts)
+        key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        if getattr(config, "DEBUG_KV_CACHE", False):
+            slot = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16) % max(1, int(getattr(config, "LLAMA_SERVER_CACHE_SLOTS", 32)))
+            dbg(f"kv_cache: session_key={key} slot={slot} root={root[:40]}... include={len(include)} files")
+        return key
+    except Exception:
+        return ""
+
+
 def stream_reply_chunks(
     prompt: str,
     max_new: int = 0,
     stop_sequences: Optional[List[str]] = None,
     temperature: Optional[float] = None,
+    cache_key: str = "",
 ) -> Iterator[str]:
     """Yield model output chunks for streaming to clients."""
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
@@ -757,6 +783,7 @@ def stream_reply_chunks(
                     top_p=config.TOP_P,
                     timeout_s=config.GEN_TIMEOUT,
                     stop=stop_sequences,
+                    cache_key=cache_key,
                 )
         except Exception as exc:
             yield f"[Model error: {exc}]"

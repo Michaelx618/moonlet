@@ -1755,12 +1755,14 @@ const params = new URLSearchParams(window.location.search);
         );
         const hasPerFileStaged = window._perFileStaged && Object.keys(window._perFileStaged).length > 0;
         if (hasPerFileStaged) {
-          // Multi-file (or single-file staged): save all staged files
+          // Multi-file (or single-file staged): save all staged files (content=null = delete)
           const stagedPaths = Object.keys(window._perFileStaged);
+          const deletedPaths = new Set();
           for (const path of stagedPaths) {
             const content = window._perFileStaged[path];
             try {
               await api("/file", { method: "POST", body: JSON.stringify({ path, content }) });
+              if (content === null) deletedPaths.add(path);
             } catch (e) {
               setStatus(`Failed to save ${path}`, "error");
               return;
@@ -1774,6 +1776,17 @@ const params = new URLSearchParams(window.location.search);
           }
           window._pendingDiff = null;
           for (const p of stagedPaths) delete preChangeContentByFile[p];
+          if (deletedPaths.size > 0) {
+            renderExplorerList();
+            if (currentFile && deletedPaths.has(currentFile)) {
+              currentFile = null;
+              setViewerContent("");
+              showWelcome();
+              tabNameEl.textContent = "Welcome";
+              titleFilepath.textContent = "";
+              statusBarFileEl.textContent = "No file";
+            }
+          }
         } else if (currentFile && hasDiffContext) {
           await saveFile();
           setStatus("Changes accepted", "");
@@ -1788,24 +1801,32 @@ const params = new URLSearchParams(window.location.search);
       }
 
       async function rejectChanges() {
-        // Restore file to pre-change state
+        // Restore all staged files to pre-change state (write before clearing)
+        const stagedPaths = window._perFileStaged ? Object.keys(window._perFileStaged) : [];
+        let restored = 0;
+        for (const p of stagedPaths) {
+          const before = preChangeContentByFile[p];
+          if (before !== undefined) {
+            try {
+              await api("/file", { method: "POST", body: JSON.stringify({ path: p, content: before }) });
+              restored++;
+            } catch { /* continue */ }
+          }
+        }
         if (currentFile && preChangeContentByFile[currentFile] !== undefined) {
-          const preChangeContent = preChangeContentByFile[currentFile];
-          setViewerContent(preChangeContent);
+          setViewerContent(preChangeContentByFile[currentFile]);
           scheduleLspDidChange();
-          // Write restored content back to disk
-          try {
-            await api("/file", { method: "POST", body: JSON.stringify({ path: currentFile, content: preChangeContent }) });
-            markSaved();
-            setStatus("Changes rejected — restored", "");
-          } catch { setStatus("Restore failed", "error"); }
         }
-        if (currentFile && window._perFileDiffs) {
-          delete window._perFileDiffs[currentFile];
+        if (restored > 0) {
+          markSaved();
+          setStatus(`Changes rejected — ${restored} file${restored !== 1 ? "s" : ""} restored`, "");
         }
-        if (currentFile) {
-          delete preChangeContentByFile[currentFile];
+        for (const p of stagedPaths) {
+          delete window._perFileDiffs?.[p];
+          delete preChangeContentByFile[p];
         }
+        if (window._perFileStaged) window._perFileStaged = {};
+        window._pendingDiff = null;
         clearDiffHighlights();
       }
 
@@ -1833,7 +1854,10 @@ const params = new URLSearchParams(window.location.search);
           }
         }
         activeDiffHighlights = { addedLines: added, deletedAtLines: deletedAt };
-        setDiffDecorations(added, deletedAt);
+        // Defer so editor has rendered new content before applying decorations
+        requestAnimationFrame(() => {
+          setDiffDecorations(added, deletedAt);
+        });
         // Show Accept/Reject buttons
         document.getElementById("diffActions").style.display = "flex";
       }
@@ -1913,7 +1937,7 @@ const params = new URLSearchParams(window.location.search);
               (k) => k === path || k.split("/").pop() === pathBase
             );
             const stagedContent = stagedKey ? window._perFileStaged[stagedKey] : undefined;
-            const contentToShow = stagedContent !== undefined ? stagedContent : diskContent;
+            const contentToShow = stagedContent !== undefined ? (stagedContent ?? "") : diskContent;
             if (stagedContent !== undefined) {
               preChangeContentByFile[path] = diskContent;
             }
@@ -1972,9 +1996,10 @@ const params = new URLSearchParams(window.location.search);
         }
         const text = rawText;
         if (!text || activeRequest) return;
-        // Auto-accept pending staged edits when user sends a new command.
-        if (activeDiffHighlights || (window._pendingDiff && window._pendingDiff.trim())) {
-          await acceptChanges();
+        // Discard pending staged edits when user sends a new command (don't auto-apply).
+        if (activeDiffHighlights || (window._pendingDiff && window._pendingDiff.trim()) ||
+            (window._perFileStaged && Object.keys(window._perFileStaged).length > 0)) {
+          await rejectChanges();
         }
         const preRequestFile = currentFile || "";
         const preRequestContent = preRequestFile && !currentFileIsBinary ? getEditorText() : null;
@@ -2113,6 +2138,11 @@ const params = new URLSearchParams(window.location.search);
               }
             } else if (event === "done") {
               doneReceived = true;
+              // In chat mode, never show "Staged for" — that's agent-only; treat as server bug
+              const isChat = (selectedMode || "").toLowerCase() === "chat";
+              if (isChat && /^Staged for:/.test(String(rawResponseBuf || "").trim())) {
+                rawResponseBuf = "Chat mode: no file changes are made. Use agent mode to edit files.";
+              }
               // Final flush of response text
               if (responseThrottleTimer) { clearTimeout(responseThrottleTimer); responseThrottleTimer = null; }
               if (rawResponseBuf && !metaSummaryLocked) flushResponse();
@@ -2120,6 +2150,15 @@ const params = new URLSearchParams(window.location.search);
               try {
                 const d = JSON.parse(data);
                 stopTimer("done");
+                // In chat mode, never process staged/diff meta — chat does not stage files
+                const isChatMode = (selectedMode || "").toLowerCase() === "chat";
+                if (isChatMode && (d.staged || (d.per_file_staged && Object.keys(d.per_file_staged).length > 0))) {
+                  // Ignore staged content; show only explanation/text
+                  d.staged = false;
+                  d.per_file_staged = {};
+                  d.per_file_before = {};
+                  d.files_changed = [];
+                }
                 const dur = d.duration_ms ? `${(d.duration_ms/1000).toFixed(1)}s` : '';
                 setStatus(`Done ${dur}`, "");
                 const failureKind = String(d.failure_kind || "none");
@@ -2127,11 +2166,20 @@ const params = new URLSearchParams(window.location.search);
                 const noopRun = Boolean(d.noop) || String(d.output || "").startsWith("[No-op file_edit:");
                 pendingMetaFocusFile = String(d.focus_file || currentFile || "");
                 let renderedMetaSummary = false;
-                // Multi-file or single-file result
-                if (d.files_changed && d.files_changed.length > 0) {
+                // Multi-file or single-file result (files_changed or fallback: per_file_staged keys)
+                const fc = (d.files_changed && d.files_changed.length > 0)
+                  ? d.files_changed
+                  : (d.per_file_staged && Object.keys(d.per_file_staged).length > 0)
+                    ? Object.keys(d.per_file_staged)
+                    : [];
+                if (fc.length > 0) {
                   // Multi-file result
-                  const fc = d.files_changed;
-                  let html = `<strong>Changed ${fc.length} file${fc.length !== 1 ? 's' : ''}</strong><br>`;
+                  const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
+                  let html = "";
+                  if (explanation) {
+                    html += `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div>`;
+                  }
+                  html += `<strong>Changed ${fc.length} file${fc.length !== 1 ? 's' : ''}</strong><br>`;
                   for (const f of fc) {
                     const fdiff = (d.per_file_diffs || {})[f] || "";
                     const fsum = fdiff ? summarizeDiff(fdiff, f) : esc(f);
@@ -2147,20 +2195,41 @@ const params = new URLSearchParams(window.location.search);
                   if (d.per_file_staged && Object.keys(d.per_file_staged).length > 0) {
                     window._perFileStaged = { ...(window._perFileStaged || {}), ...d.per_file_staged };
                   }
-                  // Set _pendingDiff for current file (exact or basename match) so post-stream block can apply
-                  if (currentFile && d.per_file_diffs) {
-                    const base = currentFile.split("/").pop() || currentFile;
-                    const diffKey = Object.keys(d.per_file_diffs).find(
-                      (k) => k === currentFile || k.split("/").pop() === base
-                    );
-                    if (diffKey && d.per_file_diffs[diffKey]) {
-                      window._pendingDiff = d.per_file_diffs[diffKey];
+                  // Store before content for diff highlights (before = disk, after = staged)
+                  if (d.per_file_before && Object.keys(d.per_file_before).length > 0) {
+                    for (const [p, before] of Object.entries(d.per_file_before)) {
+                      preChangeContentByFile[p] = before;
                     }
+                  }
+                  // Set _pendingDiff so Accept/Reject buttons show (match current file or use first changed)
+                  const stagedPath = (d.staged_file || fc[0] || "");
+                  const base = currentFile ? (currentFile.split("/").pop() || currentFile) : "";
+                  let diffKey = currentFile && d.per_file_diffs ? Object.keys(d.per_file_diffs).find(
+                    (k) => k === currentFile || k.split("/").pop() === base
+                  ) : null;
+                  const pd = d.per_file_diffs || {};
+                  if (diffKey && pd[diffKey]) {
+                    window._pendingDiff = pd[diffKey];
                   } else if (d.diff && d.diff.trim()) {
                     window._pendingDiff = d.diff;
+                  } else if (stagedPath && pd[stagedPath]) {
+                    window._pendingDiff = pd[stagedPath];
+                  } else if (Object.keys(pd).length > 0) {
+                    // Fallback: path mismatch (e.g. checkpasswd.c vs w7/checkpasswd.c) — use first diff
+                    const firstKey = Object.keys(pd).find((k) => k.split("/").pop() === (stagedPath && stagedPath.split("/").pop()) || !stagedPath);
+                    window._pendingDiff = pd[firstKey || Object.keys(pd)[0]];
                   }
                   if (window._pendingDiff) {
                     document.getElementById("diffActions").style.display = "flex";
+                  }
+                  // If changed file not open, switch to it so user sees diff + green lines
+                  if (stagedPath && (!currentFile || (currentFile.split("/").pop() !== stagedPath.split("/").pop()))) {
+                    const li = Array.from(filesEl.querySelectorAll("[data-path]")).find((n) => {
+                      const p = n.dataset.path || "";
+                      return p === stagedPath || p.endsWith("/" + stagedPath) || stagedPath.endsWith("/" + p);
+                    });
+                    if (li) selectFile(stagedPath, li);
+                    // selectFile applies diff highlights when loading (uses _perFileDiffs)
                   }
                   // Apply staged content + diff highlights for current file (exact or basename match)
                   if (currentFile && (d.per_file_diffs || d.per_file_staged)) {
@@ -2172,11 +2241,11 @@ const params = new URLSearchParams(window.location.search);
                       (k) => k === currentFile || k.split("/").pop() === base
                     );
                     const stagedContent = stagedKey ? d.per_file_staged[stagedKey] : undefined;
+                    const beforeContent = (d.per_file_before && stagedKey && d.per_file_before[stagedKey]) || getEditorText();
                     let diffToApply = diffKey && d.per_file_diffs[diffKey] ? d.per_file_diffs[diffKey] : "";
                     if (stagedContent !== undefined) {
-                      const beforeContent = getEditorText();
                       preChangeContentByFile[currentFile] = beforeContent;
-                      setViewerContent(String(stagedContent));
+                      setViewerContent(String(stagedContent ?? ""));
                       scheduleLspDidChange();
                       if (!diffToApply) {
                         diffToApply = buildUnifiedDiffFromContents(currentFile, beforeContent, stagedContent);
@@ -2214,8 +2283,11 @@ const params = new URLSearchParams(window.location.search);
                     stagedContentApplied = true;
                   }
                   document.getElementById("diffActions").style.display = "flex";
+                  const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
                   const summary = summarizeDiff(d.diff, d.focus_file || "");
-                  responseEl.innerHTML = summary;
+                  responseEl.innerHTML = explanation
+                    ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div>${summary}`
+                    : summary;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
@@ -2250,6 +2322,7 @@ const params = new URLSearchParams(window.location.search);
                   }
                 }
                 // Staged edit mode: show candidate content in editor, do not auto-write.
+                const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
                 let stagedContent = (d.per_file_staged && currentFile && d.per_file_staged[currentFile])
                   ? d.per_file_staged[currentFile]
                   : (d.staged_content !== undefined ? d.staged_content : undefined);
@@ -2267,9 +2340,18 @@ const params = new URLSearchParams(window.location.search);
                   stagedContent !== undefined &&
                   currentFile
                 ) {
-                  const beforeContent = getEditorText();
-                  preChangeContentByFile[currentFile] = beforeContent;
-                  setViewerContent(String(stagedContent));
+                  // Use server's per_file_before or existing preChange; never getEditorText() after we may have set staged content
+                  const base = currentFile.split("/").pop() || currentFile;
+                  const stagedKey = d.per_file_staged && Object.keys(d.per_file_staged).find(
+                    (k) => k === currentFile || k.split("/").pop() === base
+                  );
+                  const beforeContent = (d.per_file_before && stagedKey && d.per_file_before[stagedKey]) ||
+                    preChangeContentByFile[currentFile] ||
+                    getEditorText();
+                  if (preChangeContentByFile[currentFile] === undefined) {
+                    preChangeContentByFile[currentFile] = beforeContent;
+                  }
+                  setViewerContent(String(stagedContent ?? ""));
                   scheduleLspDidChange();
                   stagedContentApplied = true;
                   const directDiff = d.per_file_diffs && currentFile && d.per_file_diffs[currentFile];
@@ -2285,11 +2367,14 @@ const params = new URLSearchParams(window.location.search);
                   }
                 }
                 if (!renderedMetaSummary && (d.staged || (d.per_file_staged && Object.keys(d.per_file_staged).length > 0))) {
+                  const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
                   const stagedFiles = d.per_file_staged ? Object.keys(d.per_file_staged) : (d.staged_file ? [d.staged_file] : []);
                   const stagedMsg = stagedFiles.length > 1
                     ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.`
                     : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`;
-                  responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`;
+                  responseEl.innerHTML = explanation
+                    ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`
+                    : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
@@ -2333,10 +2418,12 @@ const params = new URLSearchParams(window.location.search);
             if (hasPendingStaged || hasPendingDiff) {
               // Preserve editor: show staged content if we have it, else leave as-is
               if (hasPendingStaged) {
-                const beforeContent = getEditorText();
+                const beforeContent = preChangeContentByFile[currentFile] ?? getEditorText();
+                if (preChangeContentByFile[currentFile] === undefined) {
+                  preChangeContentByFile[currentFile] = beforeContent;
+                }
                 const stagedContent = window._perFileStaged[stagedKey];
-                preChangeContentByFile[currentFile] = beforeContent;
-                setViewerContent(String(stagedContent));
+                setViewerContent(String(stagedContent ?? ""));
                 let diffToApply = (diffKey && window._perFileDiffs?.[diffKey]) || window._pendingDiff || "";
                 if (!diffToApply) {
                   diffToApply = buildUnifiedDiffFromContents(currentFile, beforeContent, stagedContent);
@@ -2711,8 +2798,11 @@ const params = new URLSearchParams(window.location.search);
           });
           rootEl.value = rootData.root || savedRoot;
           hasUserImported = true;
-          includePaths = [];
-          await api("/include", { method: "POST", body: JSON.stringify({ paths: [] }) });
+          const filesData = await api(`/files?root=${encodeURIComponent(rootEl.value)}`);
+          const allEntries = filesData.files || [];
+          const fileOnlyPaths = allEntries.filter((p) => p && !p.endsWith("/"));
+          includePaths = fileOnlyPaths;
+          await api("/include", { method: "POST", body: JSON.stringify({ paths: fileOnlyPaths }) });
           await loadFiles();
           const restoredFile = await restoreLastOpenedFileForCurrentRoot();
           if (restoredFile) {
@@ -2733,9 +2823,14 @@ const params = new URLSearchParams(window.location.search);
       async function handlePick(importMode = false, createMode = false) {
         try {
           if (!serverReady) { setStatus("Server not ready", "error"); return; }
+          const electronAPI = window.electronAPI;
+          if (!electronAPI || (importMode && !electronAPI.pickFiles) || (!importMode && !electronAPI.pickRoot)) {
+            setStatus("Import unavailable (not running in app)", "error");
+            return;
+          }
           const res = importMode
-            ? await window.electronAPI.pickFiles()
-            : await window.electronAPI.pickRoot({ allowCreate: createMode });
+            ? await electronAPI.pickFiles()
+            : await electronAPI.pickRoot({ allowCreate: createMode });
           if (!res) return;
           let newRoot, filePaths, isDirectory;
           if (importMode) {
@@ -2745,6 +2840,8 @@ const params = new URLSearchParams(window.location.search);
           } else {
             newRoot = res; filePaths = []; isDirectory = true;
           }
+          if (!newRoot) return;
+          newRoot = String(newRoot).trim();
           if (!newRoot) return;
           if (lspDocChangeTimer) {
             clearTimeout(lspDocChangeTimer);
@@ -2761,8 +2858,11 @@ const params = new URLSearchParams(window.location.search);
           hasUserImported = true;
           await new Promise(r => setTimeout(r, 200));
           if (isDirectory || !filePaths.length) {
-            includePaths = [];
-            await api("/include", { method: "POST", body: JSON.stringify({ paths: [] }) });
+            const filesData = await api(`/files?root=${encodeURIComponent(rootEl.value)}`);
+            const allEntries = filesData.files || [];
+            const fileOnlyPaths = allEntries.filter((p) => p && !p.endsWith("/"));
+            includePaths = fileOnlyPaths;
+            await api("/include", { method: "POST", body: JSON.stringify({ paths: fileOnlyPaths }) });
           } else {
             const relPaths = filePaths
               .map(p => { if (!p) return ""; let r = p; if (p.startsWith(newRoot)) { r = p.slice(newRoot.length).replace(/^\/+/, ""); } return r; })
@@ -2782,7 +2882,32 @@ const params = new URLSearchParams(window.location.search);
             setViewerContent("No files found.\n\n1. Check the directory contains code/text files\n2. Files match allowed extensions\n3. Files are not in ignored directories");
           }
         } catch (err) {
-          setStatus("Import failed", "error");
+          const msg = String(err && err.message ? err.message : err);
+          let displayMsg = "Import failed";
+          if (msg.includes("HTTP 400") || msg.includes("HTTP 500")) {
+            try {
+              const rest = msg.replace(/^HTTP \d+:\s*/, "");
+              const json = typeof rest === "string" ? JSON.parse(rest) : rest;
+              if (json && json.error) {
+                displayMsg = String(json.error);
+                console.error("Import error (full traceback):\n", displayMsg);
+              }
+            } catch (_) {}
+          } else if (msg.includes("HTTP 409")) {
+            displayMsg = "Root mismatch — try again";
+          } else if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+            displayMsg = "Server unreachable — is it running?";
+          } else if (msg.length < 80) {
+            displayMsg = msg;
+          } else if (msg.includes("local variable") || msg.includes("UnboundLocalError")) {
+            displayMsg = msg.slice(0, 120) + " — see moonlet_import_error.txt in project folder";
+          }
+          const firstLine = displayMsg.split("\n")[0] || displayMsg;
+          const hasTraceback = displayMsg.includes("Traceback") || displayMsg.includes("  File ");
+          const statusDisplay = hasTraceback
+            ? firstLine + " — open Console (Cmd+Option+I) for traceback"
+            : (displayMsg.length > 200 ? firstLine + " (see console)" : displayMsg);
+          setStatus(statusDisplay, "error");
           console.error(err);
         }
       }

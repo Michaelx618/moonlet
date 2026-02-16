@@ -9,9 +9,9 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-from .files import ROOT_PATH
+from .files import get_include, get_root
 from .utils import dbg
 
 
@@ -20,6 +20,16 @@ from .utils import dbg
 # ---------------------------------------------------------------------------
 
 _RG_BIN = "rg"  # assumes ripgrep is on PATH
+
+
+def _grep_include_paths() -> Optional[List[str]]:
+    """When include filter is set, return exact paths to search — only imported files, nothing else."""
+    include = get_include()
+    if not include:
+        return None
+    # Use indexed files (respects include) — grep searches only those files
+    from .index import get_indexed_files
+    return get_indexed_files()
 
 
 @dataclass
@@ -47,19 +57,22 @@ def grep_search(
     literal: bool = True,
     file_glob: str = "",
     context_lines: int = 0,
+    include_paths: Optional[List[str]] = None,
 ) -> GrepResult:
     """Run ripgrep search across the repo. Returns structured matches.
 
     Args:
         query: search pattern (escaped to literal by default)
-        root: repo root (defaults to ROOT_PATH)
+        root: repo root (defaults to get_root())
         max_results: cap on number of matches
         literal: if True, treat query as literal (not regex)
         file_glob: optional glob filter (e.g. "*.py")
         context_lines: lines of context around each match (0 = just the match)
+        include_paths: when set, search only these paths (relative to root).
+            Used when user has imported specific files; prevents searching app source.
     """
     if root is None:
-        root = ROOT_PATH
+        root = get_root()
 
     if not query.strip():
         return GrepResult(query=query)
@@ -86,7 +99,15 @@ def grep_search(
     for d in ("node_modules", ".git", "__pycache__", ".venv", "core", "extensions"):
         cmd.extend(["--glob", f"!{d}/"])
 
-    cmd.extend(["--", query, "."])
+    # When include filter is set, search ONLY those files — nothing else
+    if include_paths is None:
+        include_paths = _grep_include_paths()
+    if include_paths is not None:
+        # Restrict to imported files; empty list = no files to search
+        search_paths = include_paths if include_paths else ["/dev/null"]  # no matches
+    else:
+        search_paths = ["."]
+    cmd.extend(["--", query] + search_paths)
 
     try:
         result = subprocess.run(
@@ -104,7 +125,7 @@ def grep_search(
         return GrepResult(query=query, truncated=True)
 
     matches = []
-    for line in result.stdout.splitlines():
+    for line in (result.stdout or "").splitlines():
         # Format: file:line:content
         m = re.match(r"^(.+?):(\d+)[:|-](.*)$", line)
         if m:
@@ -128,6 +149,7 @@ def grep_symbol_definitions(
     symbol: str,
     root: Path = None,
     file_glob: str = "",
+    include_paths: Optional[List[str]] = None,
 ) -> GrepResult:
     """Find where a symbol is defined (class, def, function, const, etc.)."""
     # Regex: start of line, optional whitespace, def/class/function/const/let/var, then symbol
@@ -138,6 +160,7 @@ def grep_symbol_definitions(
         literal=False,
         file_glob=file_glob,
         max_results=20,
+        include_paths=include_paths,
     )
 
 
@@ -170,7 +193,7 @@ def extract_symbols_treesitter(
     Supports Python, JavaScript, TypeScript, Go, Rust, Java, C/C++, Ruby, and more.
     """
     if root is None:
-        root = ROOT_PATH
+        root = get_root()
 
     try:
         from tree_sitter_languages import get_parser

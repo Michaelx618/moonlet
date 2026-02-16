@@ -3,7 +3,7 @@ import os
 # Model/runtime knobs
 MODEL_NAME = os.getenv("SC2_MODEL", "bigcode/starcoder2-3b")
 # Default output budget for model replies
-MAX_NEW = int(os.getenv("SC2_MAX_NEW", "4096"))
+MAX_NEW = int(os.getenv("SC2_MAX_NEW", "8000"))
 PLAN_MAX_NEW = int(os.getenv("SC2_PLAN_MAX_NEW", "4096"))
 DIFF_MAX_NEW = int(os.getenv("SC2_DIFF_MAX_NEW", "4096"))
 CHAT_MAX_NEW = int(os.getenv("SC2_CHAT_MAX_NEW", "768"))
@@ -12,6 +12,10 @@ CHAT_SHORT_INPUT_CHARS = int(os.getenv("SC2_CHAT_SHORT_INPUT_CHARS", "24"))
 TEMPERATURE = float(os.getenv("SC2_TEMP", "0.25"))
 TOP_P = float(os.getenv("SC2_TOP_P", "0.9"))
 DEBUG = os.getenv("SC2_DEBUG", "").lower() in ("1", "true", "yes")
+# SC2_DEBUG_KV=1: log KV cache slot, session key, and server response cache stats
+DEBUG_KV_CACHE = os.getenv("SC2_DEBUG_KV", "").lower() in ("1", "true", "yes")
+# SC2_DEBUG_CHAT=1: log chat prompt, context size, rounds, tools used (for debugging "no context")
+DEBUG_CHAT = os.getenv("SC2_DEBUG_CHAT", "").lower() in ("1", "true", "yes")
 DEBUG_LOG_PATH = os.getenv(
     "SC2_DEBUG_LOG", "/Users/michael/moonlet/runtime-debug.log"
 )
@@ -35,6 +39,9 @@ REVERT_ON_FAILURE = os.getenv("SC2_REVERT_ON_FAILURE", "false").lower() in ("1",
 STAGE_EDITS = os.getenv("SC2_STAGE_EDITS", "true").lower() in ("1", "true", "yes")
 # Analysis symbol allowlist can over-constrain edits; keep off by default.
 ENFORCE_ANALYSIS_ALLOWLIST = os.getenv("SC2_ENFORCE_ANALYSIS_ALLOWLIST", "false").lower() in ("1", "true", "yes")
+
+# Relevance pipeline: when True, find_relevant_files returns [] (no FILES fed to model)
+DISABLE_RELEVANCE = os.getenv("SC2_DISABLE_RELEVANCE", "true").lower() in ("1", "true", "yes")
 
 # Semantic search (optional: pip install sentence-transformers)
 SEMANTIC_SEARCH_ENABLED = os.getenv("SC2_SEMANTIC_SEARCH", "").lower() in ("1", "true", "yes")
@@ -63,6 +70,8 @@ PATCH_FULL_FILE_MAX_LINES = int(os.getenv("SC2_PATCH_FULL_FILE_MAX_LINES", "500"
 PATCH_TINY_SINGLE_HUNK_MAX_LINES = int(
     os.getenv("SC2_PATCH_TINY_SINGLE_HUNK_MAX_LINES", "200")
 )
+# Freedom mode: cap total context chars to avoid bloated prompts (default 5000)
+FREEDOM_CONTEXT_MAX_CHARS = int(os.getenv("SC2_FREEDOM_CONTEXT_MAX_CHARS", "5000"))
 LLAMA_SERVER_CACHE_SLOTS = int(
     os.getenv("SC2_LLAMA_SERVER_CACHE_SLOTS", "32")
 )
@@ -86,18 +95,32 @@ SERVER_PORT = int(os.getenv("SC2_PORT", "8000"))
 BUFFER_OUTPUT = os.getenv("SC2_BUFFER", "1") not in {"0", "false", "False"}
 CHAT_BUFFER_PROMPT_CHARS = int(os.getenv("SC2_CHAT_BUFFER_PROMPT_CHARS", "3200"))
 CHAT_BUFFER_INPUT_CHARS = int(os.getenv("SC2_CHAT_BUFFER_INPUT_CHARS", "400"))
+# Chat mode: max files to include in context (0 = list only, no content; 12 = read up to 12 files)
+CHAT_INCLUDE_MAX_FILES = int(os.getenv("SC2_CHAT_INCLUDE_MAX_FILES", "12"))
 STATE_PATH = os.getenv("SC2_STATE_PATH", "~/.moonlet_state.json")
 DISABLE_HISTORY = os.getenv("SC2_DISABLE_HISTORY", "false").lower() in ("1", "true", "yes")
 MAX_BUFFER_CHARS = int(os.getenv("SC2_MAX_BUFFER_CHARS", "200000"))
+# Prompt char budget (raise to reduce truncation; ~4 chars/token). Default 8000 tokens worth.
 CTX_CHAR_BUDGET = int(
     os.getenv(
         "SC2_CTX_CHAR_BUDGET",
-        str((GGUF_CTX if GGUF_CTX else 2048) * 3),
+        "32000",  # ~8000 tokens; was (GGUF_CTX or 2048) * 3
     )
 )
 # Multi-file agent limits
 MAX_PLAN_FILES = int(os.getenv("SC2_MAX_PLAN_FILES", "5"))
 MAX_MULTI_MODEL_CALLS = int(os.getenv("SC2_MAX_MULTI_CALLS", "8"))
+
+# Agent tool loop: max rounds (SC2_MAX_TOOL_ROUNDS). Default 3 allows: round 1 discover
+# (list_files/grep), round 2 read file, round 3 produce answer. Loop exits early when
+# model produces output without tool calls.
+MAX_TOOL_ROUNDS = int(os.getenv("SC2_MAX_TOOL_ROUNDS", "3"))
+# Cap tool results fed back to model (0 = no limit, full freedom for read results)
+MAX_TOOL_RESULT_CHARS = int(os.getenv("SC2_MAX_TOOL_RESULT_CHARS", "0"))
+# Log tool calls to stderr (set SC2_DEBUG_TOOLS=0 to disable)
+DEBUG_TOOLS = os.getenv("SC2_DEBUG_TOOLS", "1").lower() not in ("0", "false", "no")
+# Disable focus file context (no file content in prompt; set SC2_DISABLE_FOCUS_FILE=1)
+DISABLE_FOCUS_FILE = os.getenv("SC2_DISABLE_FOCUS_FILE", "1").lower() in ("1", "true", "yes")
 
 ALLOWED_EXTS = {
     # Documents / markup

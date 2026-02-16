@@ -632,7 +632,7 @@ def discover_target_file(
         candidates.append(w)
 
     # Snake_case / common C symbols (main, fork, parent, child) when no CamelCase
-    _SNAKE_STOP = {"the", "and", "for", "with", "from", "run", "use", "try", "see", "fix"}
+    _SNAKE_STOP = {"the", "and", "for", "with", "from", "run", "use", "try", "see", "fix", "code"}
     if not candidates:
         for w in re.findall(r"\b([a-z][a-z0-9_]{2,})\b", text_lower):
             if w in _SNAKE_STOP:

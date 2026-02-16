@@ -18,6 +18,20 @@ def dbg(message: str):
         pass
 
 
+def dbg_chat(message: str):
+    """Log when SC2_DEBUG_CHAT=1. Use for chat prompt/context debugging."""
+    if not getattr(config, "DEBUG_CHAT", False):
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[chat_debug] [{ts} pid={os.getpid()}] {message}"
+    print(line, file=sys.stderr)
+    try:
+        with open(config.DEBUG_LOG_PATH, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
 def dbg_dump(label: str, text: str):
     """Dump debug output. Truncated by default; full dump when SC2_DEBUG_VERBOSE=true."""
     if not config.DEBUG:

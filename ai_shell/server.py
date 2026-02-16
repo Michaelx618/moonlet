@@ -27,7 +27,8 @@ from .files import (
     is_binary_file,
     write_file_text,
 )
-from .model import backend_name, backend_status, stream_reply_chunks
+from .model import backend_name, backend_status, stream_reply_chunks, get_session_cache_key
+from .prompt_buffer import _user_asks_about_code_or_review
 from .tool_executor import (
     CHAT_TOOLS_HINT,
     TOOLS_SYSTEM_HINT,
@@ -36,7 +37,7 @@ from .tool_executor import (
     strip_tool_calls_from_output,
     tool_log,
 )
-from .utils import dbg
+from .utils import dbg, dbg_chat
 
 import difflib
 
@@ -168,8 +169,18 @@ class APIServer(BaseHTTPRequestHandler):
                         focus_file = discovered[0]
                         dbg(f"agent: discovered focus_file from request: {focus_file}")
 
+                focus_before_disable = focus_file
                 if getattr(config, "DISABLE_FOCUS_FILE", False):
                     focus_file = None
+
+                # Chat: use focus_file for correctness/review questions even when DISABLE_FOCUS_FILE
+                chat_focus = (
+                    focus_before_disable
+                    if mode == "chat"
+                    and focus_before_disable
+                    and _user_asks_about_code_or_review(text)
+                    else focus_file
+                )
 
                 if mode == "chat":
                     chat_max_new = config.MAX_NEW
@@ -182,24 +193,33 @@ class APIServer(BaseHTTPRequestHandler):
                             chat_context_override = "FILES: " + ", ".join(candidate_files)
                     if not chat_context_override:
                         chat_context_override = "Use [[[list_files]]] to see available files."
-                    prompt, _ = prompt_buffer.build_prompt(
+                    prompt, ctx_meta = prompt_buffer.build_prompt(
                         "chat",
                         text,
-                        focus_file=None if getattr(config, "DISABLE_FOCUS_FILE", False) else focus_file,
+                        focus_file=chat_focus,
                         full_context=False,
                         context_override=chat_context_override,
                         system_append=CHAT_TOOLS_HINT,
                     )
+                    dbg_chat(
+                        f"chat prompt_len={len(prompt)} context_bytes={ctx_meta.get('context_bytes', 0)} "
+                        f"focus_file={focus_file or 'none'} mode_used={ctx_meta.get('mode_used', '?')}"
+                    )
                     output_chunks = []
                     start = time.time()
                     chat_stop = ["\nUser:", "\nSYSTEM:", "\nCONTEXT:", "\nHISTORY:"]
+                    cache_key = get_session_cache_key()
                     max_rounds = max(1, int(getattr(config, "MAX_TOOL_ROUNDS", 3)))
+                    rounds_used = 0
+                    tools_called = []
                     for _round in range(max_rounds):
+                        rounds_used = _round + 1
                         round_chunks = []
                         for token in stream_reply_chunks(
                             prompt,
                             max_new=chat_max_new,
                             stop_sequences=chat_stop,
+                            cache_key=cache_key,
                         ):
                             round_chunks.append(token)
                         reply = "".join(round_chunks).strip()
@@ -207,6 +227,7 @@ class APIServer(BaseHTTPRequestHandler):
                         if not tool_calls:
                             output_chunks = round_chunks
                             break
+                        tools_called.extend([f"{n}({a[:30]}...)" if len(a) > 30 else f"{n}({a})" for n, a in tool_calls])
                         self._sse_send("working", event="status")
                         tool_log(f"chat round {_round + 1}: model requested {len(tool_calls)} tool(s)")
                         results = []
@@ -224,6 +245,10 @@ class APIServer(BaseHTTPRequestHandler):
                             "User: Continue. Use the tool results above.\nAssistant:"
                         )
                     output = strip_tool_calls_from_output("".join(output_chunks).strip())
+                    dbg_chat(
+                        f"chat done rounds_used={rounds_used} tools={tools_called or 'none'} "
+                        f"final_prompt_len={len(prompt)} reply_len={len(output)}"
+                    )
                     chat_buffered = (
                         config.BUFFER_OUTPUT
                         and (
@@ -426,10 +451,6 @@ class APIServer(BaseHTTPRequestHandler):
                     pass
                 try:
                     agent.agent_history.clear()
-                except Exception:
-                    pass
-                try:
-                    agent.reset_structural_kv_cache(reason="new_chat")
                 except Exception:
                     pass
                 self._json(200, {"status": "ok"})

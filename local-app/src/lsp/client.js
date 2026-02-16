@@ -110,9 +110,7 @@ export function createLspClient({ electronAPI, onStatus, onDiagnostics }) {
     }
 
     if (msg.method === "window/logMessage") {
-      const level = Number(msg.params && msg.params.type ? msg.params.type : 3);
-      const message = String(msg.params && msg.params.message ? msg.params.message : "");
-      if (level <= 2) emitStatus("error", message || "LSP error");
+      // Ignore LSP log messages (e.g. compile_commands.json, indexing) — don't overwrite status with "error"
       return;
     }
 

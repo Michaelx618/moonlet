@@ -17,7 +17,7 @@ def main():
         from . import agent
         state.clear_chat_session()
         try:
-            agent.reset_structural_kv_cache(reason="startup")
+            agent.agent_history.clear()
         except Exception:
             pass
         print("[Started new chat session]", file=sys.stderr)
@@ -30,6 +30,13 @@ def main():
     else:
         print(f"[Using HuggingFace model: {config.MODEL_NAME}]", file=sys.stderr)
     print(f"[Root path: {get_root()}]", file=sys.stderr)
+
+    # Build file index for agent tools (grep, symbols, list_files)
+    try:
+        from .index import rebuild_index
+        rebuild_index()
+    except Exception:
+        pass
 
     try:
         start_server()

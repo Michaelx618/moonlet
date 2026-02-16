@@ -1,5 +1,5 @@
 {
-  "ggufPath": "/Users/michael/models/qwen2.5-coder-7b-instruct-q5_k_m.gguf",
+  "ggufPath": "/Users/michael/models/codegeex4-all-9b-Q5_K_M.gguf",
   "ctxTok": 4096,
   "threads": 8,
   "gpuLayers": -1,
@@ -20,5 +20,7 @@
   "llamaServerPort": 8012,
   "preferCli": false,
   "debug": true,
-  "debugLog": "/Users/michael/moonlet/runtime-debug.log"
+  "debugLog": "/Users/michael/moonlet/runtime-debug.log",
+  "debugKv": true,
+  "debugChat": false
 }

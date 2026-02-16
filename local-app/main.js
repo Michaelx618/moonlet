@@ -190,6 +190,8 @@ async function startServer() {
       : process.env.SC2_ROOT || repoRoot,
     SC2_DEBUG: cfg.debug ? "1" : process.env.SC2_DEBUG,
     SC2_DEBUG_LOG: cfg.debugLog || process.env.SC2_DEBUG_LOG,
+    SC2_DEBUG_KV: cfg.debugKv ? "1" : process.env.SC2_DEBUG_KV,
+    SC2_DEBUG_CHAT: cfg.debugChat ? "1" : process.env.SC2_DEBUG_CHAT,
     SC2_PREFER_CLI: String(
       cfg.preferCli !== undefined
         ? cfg.preferCli
@@ -355,21 +357,19 @@ app.whenReady().then(async () => {
   ipcMain.handle("pick-files", async () => {
     const res = await dialog.showOpenDialog({
       properties: ["openFile", "openDirectory", "multiSelections"],
-      // Let users pick any files/folders. Backend still decides what is listable/editable.
       filters: [{ name: "All Files", extensions: ["*"] }],
     });
-    
+
     if (res.canceled || !res.filePaths.length) return null;
     const validPaths = res.filePaths.filter((p) => {
       try {
         const stat = fs.statSync(p);
-        // Keep selected files/folders; backend include/list filters will handle unsupported files.
         return stat.isDirectory() || stat.isFile();
       } catch {
         return false;
       }
     });
-    
+
     if (!validPaths.length) return null;
 
     const first = validPaths[0];
@@ -385,9 +385,8 @@ app.whenReady().then(async () => {
     } catch {
       // ignore
     }
-    
+
     const result = { root, paths: validPaths, hasDir };
-    
     return result;
   });
 

@@ -15,7 +15,7 @@ from typing import List, Optional, Tuple
 
 from . import config
 from .anchors import discover_target_file
-from .files import _norm_rel_path, get_root, is_allowed_file, read_single_file_for_context
+from .files import _norm_rel_path, get_include, get_root, is_allowed_file, read_single_file_for_context
 from .intents import extract_target_files
 from .tools import grep_search
 from .utils import dbg
@@ -102,7 +102,13 @@ def _extract_keywords(text: str) -> List[str]:
 
 
 def _list_editable_files(max_files: int = 80) -> List[str]:
-    """List editable files in repo (for semantic search candidates)."""
+    """List editable files in repo (for semantic search candidates).
+    When include filter is set, uses indexed files (user's imported files only)."""
+    include = get_include()
+    if include:
+        from .index import get_indexed_files
+        files = get_indexed_files()
+        return [f for f in files if _is_editable_file(f)][:max_files]
     root = get_root()
     found: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -205,23 +211,22 @@ def _tier4_todo_intent(user_text: str) -> List[str]:
 
 def _tier5_fallback(open_file: Optional[str]) -> List[str]:
     """Tier 5: Open file or first source file in project."""
+    include = get_include()
     if open_file:
         norm = _norm_rel_path(open_file)
         root = get_root()
         candidate = (root / norm).resolve()
         if candidate.exists() and candidate.is_file() and is_allowed_file(candidate):
-            return [norm]
-    # First source file in project (bounded walk)
-    root = get_root()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in config.IGNORE_DIRS and not d.startswith(".")]
-        for fname in sorted(filenames):
-            try:
-                rel = str(Path(dirpath, fname).relative_to(root))
-            except ValueError:
-                continue
-            if _is_editable_file(rel):
-                return [_norm_rel_path(rel)]
+            if include:
+                from .index import get_indexed_files
+                if norm in get_indexed_files():
+                    return [norm]
+            else:
+                return [norm]
+    # First source file: when include set, use indexed files; else walk root
+    candidates = _list_editable_files(max_files=200)
+    if candidates:
+        return [candidates[0]]
     return []
 
 
@@ -238,6 +243,8 @@ def find_relevant_files(
       4. TODO intent (grep TODO/FIXME)
       5. Fallback (open file or first source file)
     """
+    if getattr(config, "DISABLE_RELEVANCE", True):
+        return []
     text = user_text or ""
     # Tier 1
     t1 = _tier1_explicit(text)

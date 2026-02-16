@@ -58,17 +58,17 @@ def parse_unified_diff(
     _ = keep_all_hunks
 
     if not output or not focus_file:
-        return None, None
+        return None, None, False
 
     raw = output.replace("\r\n", "\n").replace("\r", "\n")
     lines0 = raw.split("\n")
     has_hunk_header = any(ln.startswith("@@") for ln in lines0)
-    has_file_headers = ("--- a/" in raw and "+++ b/" in raw)
+    has_file_headers = ("+++ b/" in raw or "+++ /dev/null" in raw) and ("--- a/" in raw or "--- /dev/null" in raw)
     prefill = (prompt_prefill or "").replace("\r\n", "\n").replace("\r", "\n")
     prefill_diff_like = bool(prefill) and ("--- a/" in prefill and "+++ b/" in prefill and "@@" in prefill)
     if not (has_hunk_header or has_file_headers or prefill_diff_like):
         dbg("parse_unified_diff: output not diff-like; aborting")
-        return None, None
+        return None, None, False
 
     if prompt_prefill:
         # Strip overlap: model may echo tail of prefill.
@@ -110,37 +110,40 @@ def parse_unified_diff(
                     raw = prefill_clean + remainder
             else:
                 raw = prefill_clean + raw
-    elif not re.search(r"^---\s+a/", raw, re.MULTILINE):
+    elif not (re.search(r"^---\s+a/", raw, re.MULTILINE) or "--- /dev/null" in raw):
         dbg("parse_unified_diff: output not diff-like; aborting")
-        return None, None
+        return None, None, False
 
     lines = raw.split("\n")
 
     minus_idx = None
     for i, line in enumerate(lines):
-        if line.startswith("--- a/"):
+        if line.startswith("--- a/") or line.startswith("--- /dev/null"):
             minus_idx = i
             break
     if minus_idx is None:
-        return None, None
+        return None, None, False
 
     plus_idx = None
-    for i in range(minus_idx + 1, min(minus_idx + 3, len(lines))):
-        if lines[i].startswith("+++ b/"):
+    for i in range(minus_idx + 1, min(minus_idx + 5, len(lines))):
+        if lines[i].startswith("+++ b/") or lines[i].startswith("+++ /dev/null"):
             plus_idx = i
             break
     if plus_idx is None:
-        return None, None
+        return None, None, False
 
-    file_a = lines[minus_idx][len("--- a/") :].strip().split("\t")[0].strip()
-    file_b = lines[plus_idx][len("+++ b/") :].strip().split("\t")[0].strip()
+    # New file: --- /dev/null; path from +++ b/. Delete: +++ /dev/null; path from --- a/
+    minus_line = lines[minus_idx]
+    plus_line = lines[plus_idx]
+    file_a = lines[minus_idx][len("--- a/") :].strip().split("\t")[0].strip() if minus_line.startswith("--- a/") else "/dev/null"
+    file_b = lines[plus_idx][len("+++ b/") :].strip().split("\t")[0].strip() if plus_line.startswith("+++ b/") else "/dev/null"
 
     if file_a != focus_file and file_b != focus_file:
         dbg(
             "parse_unified_diff: path mismatch: "
             f"a={file_a!r} b={file_b!r} focus={focus_file!r}"
         )
-        return None, None
+        return None, None, False
 
     hunks: List[DiffHunk] = []
     hunk_header_re = re.compile(r"^@@\s+-?(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@")
@@ -151,7 +154,7 @@ def parse_unified_diff(
     while i < len(lines):
         line = lines[i]
 
-        if line.startswith("--- a/") and i > plus_idx + 1:
+        if (line.startswith("--- a/") or line.startswith("--- /dev/null")) and i > plus_idx + 1:
             dbg("parse_unified_diff: multi-file diff detected, stopping")
             break
 
@@ -256,7 +259,8 @@ def parse_unified_diff(
 
     if not hunks:
         dbg("parse_unified_diff: no hunks found (or all were no-op)")
-        return None, None
+        return None, None, False
 
-    dbg(f"parse_unified_diff: parsed {len(hunks)} active hunk(s) for {focus_file}")
-    return focus_file, hunks
+    is_delete = file_b == "/dev/null"
+    dbg(f"parse_unified_diff: parsed {len(hunks)} active hunk(s) for {focus_file} (delete={is_delete})")
+    return focus_file, hunks, is_delete

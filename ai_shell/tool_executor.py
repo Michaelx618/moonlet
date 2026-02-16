@@ -39,9 +39,9 @@ TOOL_PATTERN = re.compile(
 
 TOOLS_SYSTEM_HINT = """You have access to these tools. Output a tool call on its own line when you need it; the result will be provided.
 
-Before editing: you MUST read the file first. If FILES are listed, use [[[read:path]]] for the path you will edit. If no FILES are listed, use [[[list_files]]] or [[[grep:name]]] to find the file the user mentioned, then [[[read:path]]]. Never produce a diff without reading the file content.
+CONTEXT includes the content of all FILES (see --- path --- blocks). Edit based on what you see — do NOT guess or hallucinate. If you need another file not in CONTEXT, use [[[read:path]]]. If no FILES are listed, use [[[list_files]]] or [[[grep:name]]] first, then [[[read:path]]].
 
-Output format: wrap your unified diff in ```diff ... ```. Put each diff line on its own line (--- a/path, +++ b/path, @@ hunks, -/+ content). Do NOT use ```c, ```python, or other code blocks — only unified diff format.
+Output code with a brief explanation. Indicate which file the code goes to.
 
 - [[[grep:pattern]]] — Search for text across indexed files (ripgrep). Use literal pattern.
 - [[[grep:pattern:*.ext]]] — Same, but limit to files matching glob (e.g. *.c, *.py).
@@ -52,7 +52,7 @@ Output format: wrap your unified diff in ```diff ... ```. Put each diff line on 
 # Chat mode: answer questions, use tools to read/list — do NOT instruct to produce diffs
 CHAT_TOOLS_HINT = """You have access to these tools. Output a tool call on its own line when you need it; the result will be provided.
 
-Use tools to answer the user's question. FILES lists the imported files you can access. Use [[[read:path]]], [[[list_files]]], or [[[grep:pattern]]] as needed — you choose which tools to use. Answer in plain text. Do NOT produce diffs or code edits unless the user explicitly asks you to change code.
+CONTEXT already includes the content of all imported files (see --- path --- blocks). Use that to answer. If you need to search or re-read: [[[grep:pattern]]], [[[read:path]]], [[[list_files]]]. Do NOT ask the user to provide file content — it is in CONTEXT or use the read tool. Answer in plain text. Do NOT produce diffs or code edits unless the user explicitly asks you to change code.
 
 - [[[grep:pattern]]] — Search for text across indexed files.
 - [[[read:path]]] — Read full content of a file.
@@ -67,6 +67,8 @@ def execute_tool(name: str, arg: str) -> str:
     _tool_log(f"call: {name}({arg!r})")
 
     if name == "grep":
+        if not get_include():
+            return "[grep] No files imported. Import files first to search."
         parts = arg.split(":", 1)
         pattern = (parts[0] or "").strip()
         glob = (parts[1] or "").strip() if len(parts) > 1 else ""
@@ -97,7 +99,9 @@ def execute_tool(name: str, arg: str) -> str:
         path = arg.strip()
         if not path:
             return "[symbols] Error: path required"
-        if get_include() and not _path_in_include(path):
+        if not get_include():
+            return "[symbols] No files imported. Import files first."
+        if not _path_in_include(path):
             return f"[symbols] File not in imported set: {path}"
         try:
             syms = get_symbols_for_file(path)
@@ -116,7 +120,9 @@ def execute_tool(name: str, arg: str) -> str:
         path = arg.strip()
         if not path:
             return "[read] Error: path required"
-        if get_include() and not _path_in_include(path):
+        if not get_include():
+            return "[read] No files imported. Import files first to read file content."
+        if not _path_in_include(path):
             return f"[read] File not in imported set: {path}"
         try:
             content_map = read_single_file_for_context(path)
@@ -130,6 +136,8 @@ def execute_tool(name: str, arg: str) -> str:
         return f"[read] {path}:\n{content}"
 
     if name == "list_files":
+        if not get_include():
+            return "[list_files] No files imported. Import files first."
         try:
             files = get_indexed_files()
         except Exception as e:

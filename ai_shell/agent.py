@@ -51,11 +51,6 @@ def run_chat(
 agent_history: List[Tuple[str, str]] = []
 
 
-def reset_structural_kv_cache(reason: str = "manual") -> None:
-    """No-op; structural mode removed."""
-    pass
-
-
 def _diff_stats(diff_text: str) -> Tuple[int, int]:
     adds = dels = 0
     for ln in (diff_text or "").splitlines():
