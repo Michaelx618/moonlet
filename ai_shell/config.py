@@ -1,4 +1,5 @@
 import os
+from .model_profiles import resolve_model_profile
 
 # Model/runtime knobs
 MODEL_NAME = os.getenv("SC2_MODEL", "bigcode/starcoder2-3b")
@@ -6,10 +7,12 @@ MODEL_NAME = os.getenv("SC2_MODEL", "bigcode/starcoder2-3b")
 MAX_NEW = int(os.getenv("SC2_MAX_NEW", "8000"))
 PLAN_MAX_NEW = int(os.getenv("SC2_PLAN_MAX_NEW", "4096"))
 DIFF_MAX_NEW = int(os.getenv("SC2_DIFF_MAX_NEW", "4096"))
+PATCH_MAX_NEW = int(os.getenv("SC2_PATCH_MAX_NEW", "2000"))
 CHAT_MAX_NEW = int(os.getenv("SC2_CHAT_MAX_NEW", "768"))
 CHAT_SHORT_MAX_NEW = int(os.getenv("SC2_CHAT_SHORT_MAX_NEW", "128"))
 CHAT_SHORT_INPUT_CHARS = int(os.getenv("SC2_CHAT_SHORT_INPUT_CHARS", "24"))
 TEMPERATURE = float(os.getenv("SC2_TEMP", "0.25"))
+PATCH_TEMP = float(os.getenv("SC2_PATCH_TEMP", "0.1"))  # Lower for PATCH to reduce hallucination
 TOP_P = float(os.getenv("SC2_TOP_P", "0.9"))
 DEBUG = os.getenv("SC2_DEBUG", "").lower() in ("1", "true", "yes")
 # SC2_DEBUG_KV=1: log KV cache slot, session key, and server response cache stats
@@ -24,7 +27,7 @@ DEBUG_LOG_PATH = os.getenv(
 DEBUG_DUMP_VERBOSE = os.getenv("SC2_DEBUG_DUMP_VERBOSE", "true").lower() in ("1", "true", "yes")
 DEBUG_DUMP_MAX_LINES = int(os.getenv("SC2_DEBUG_DUMP_MAX_LINES", "20"))
 DEBUG_DUMP_MAX_CHARS = int(os.getenv("SC2_DEBUG_DUMP_MAX_CHARS", "2000"))
-GEN_TIMEOUT = int(os.getenv("SC2_GEN_TIMEOUT", "120"))
+GEN_TIMEOUT = int(os.getenv("SC2_GEN_TIMEOUT", "300"))
 MAX_MODEL_CALLS = int(os.getenv("SC2_MAX_MODEL_CALLS", "2"))
 REP_WINDOW = int(os.getenv("SC2_REP_WINDOW", "40"))
 REP_MIN_CHARS = int(os.getenv("SC2_REP_MIN_CHARS", "200"))
@@ -34,9 +37,8 @@ SOFT_DIFF_POSTCHECK = os.getenv("SC2_SOFT_DIFF_POSTCHECK", "false").lower() != "
 SKIP_COMPILE_CHECKS = os.getenv("SC2_SKIP_COMPILE_CHECKS", "false").lower() != "false"
 RELAX_SEMANTIC_CHECKS = os.getenv("SC2_RELAX_SEMANTIC_CHECKS", "false").lower() != "false"
 REVERT_ON_FAILURE = os.getenv("SC2_REVERT_ON_FAILURE", "false").lower() in ("1", "true", "yes")
-# If true, do not write model edits to disk automatically.
-# Candidate content is returned for UI Accept/Reject flow.
-STAGE_EDITS = os.getenv("SC2_STAGE_EDITS", "true").lower() in ("1", "true", "yes")
+# If true, stage edits for UI Accept/Reject. If false, apply directly to disk (user can Ctrl+Z or Revert).
+STAGE_EDITS = os.getenv("SC2_STAGE_EDITS", "false").lower() in ("1", "true", "yes")
 # Analysis symbol allowlist can over-constrain edits; keep off by default.
 ENFORCE_ANALYSIS_ALLOWLIST = os.getenv("SC2_ENFORCE_ANALYSIS_ALLOWLIST", "false").lower() in ("1", "true", "yes")
 
@@ -77,6 +79,8 @@ LLAMA_SERVER_CACHE_SLOTS = int(
 )
 # Optional GGUF path for local quantized model (llama.cpp backend)
 GGUF_PATH = os.getenv("SC2_GGUF")
+MODEL_PROFILE_NAME = os.getenv("SC2_MODEL_PROFILE", "auto").strip().lower()
+MODEL_PROFILE = resolve_model_profile(MODEL_PROFILE_NAME, GGUF_PATH or "")
 GGUF_CTX = int(os.getenv("SC2_CTX_TOK", "4096"))
 GGUF_THREADS = int(os.getenv("SC2_THREADS", str(os.cpu_count() or 4)))
 GGUF_GPU_LAYERS = int(os.getenv("SC2_GPU_LAYERS", "-1"))
@@ -85,6 +89,17 @@ LLAMA_SERVER_HOST = os.getenv("SC2_LLAMA_SERVER_HOST", "127.0.0.1")
 LLAMA_SERVER_PORT = int(os.getenv("SC2_LLAMA_SERVER_PORT", "8012"))
 LLAMA_SERVER_BIN = os.getenv("SC2_LLAMA_SERVER_BIN", "")
 LLAMA_SERVER_START_TIMEOUT = int(os.getenv("SC2_LLAMA_SERVER_START_TIMEOUT", "90"))
+# Use chat completions with tools for direct tool calls (no text parsing). Requires --jinja.
+if os.getenv("SC2_USE_CHAT_TOOLS") is not None:
+    USE_CHAT_TOOLS = os.getenv("SC2_USE_CHAT_TOOLS", "false").lower() in ("1", "true", "yes")
+else:
+    USE_CHAT_TOOLS = bool(MODEL_PROFILE.use_chat_tools)
+# Wrap raw prompts in chatml tags for chat-finetuned models via /completion endpoint.
+# Default true: most GGUF models (DeepSeek-Coder, etc.) are chat-tuned and need this.
+if os.getenv("SC2_USE_CHATML_WRAP") is not None:
+    USE_CHATML_WRAP = os.getenv("SC2_USE_CHATML_WRAP", "true").lower() in ("1", "true", "yes")
+else:
+    USE_CHATML_WRAP = bool(MODEL_PROFILE.use_chatml_wrap)
 
 
 # Agent/runtime knobs
@@ -111,16 +126,70 @@ CTX_CHAR_BUDGET = int(
 MAX_PLAN_FILES = int(os.getenv("SC2_MAX_PLAN_FILES", "5"))
 MAX_MULTI_MODEL_CALLS = int(os.getenv("SC2_MAX_MULTI_CALLS", "8"))
 
-# Agent tool loop: max rounds (SC2_MAX_TOOL_ROUNDS). Default 3 allows: round 1 discover
-# (list_files/grep), round 2 read file, round 3 produce answer. Loop exits early when
-# model produces output without tool calls.
-MAX_TOOL_ROUNDS = int(os.getenv("SC2_MAX_TOOL_ROUNDS", "3"))
+# Agent tool loop: max rounds (SC2_MAX_TOOL_ROUNDS). 0 = no cap (Continue-style: run until
+# model produces output without tool calls). If > 0, loop exits after that many rounds.
+MAX_TOOL_ROUNDS = int(os.getenv("SC2_MAX_TOOL_ROUNDS", "0"))
+
+APPROVAL_MODE = os.getenv("SC2_APPROVAL_MODE", "true").lower() in ("1", "true", "yes")
+AUTO_APPLY_ON_SUCCESS = os.getenv("SC2_AUTO_APPLY_ON_SUCCESS", "true").lower() in ("1", "true", "yes")
+MAX_REPAIR_ITERATIONS = int(os.getenv("SC2_MAX_REPAIR_ITERATIONS", "5"))
+# search_replace: when True, use tool loop (feed results back to model); when False, one-shot
+USE_SEARCH_REPLACE_LOOP = os.getenv("SC2_USE_SEARCH_REPLACE_LOOP", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+MAX_EDIT_ROUNDS = int(os.getenv("SC2_MAX_EDIT_ROUNDS", "4"))
+# Add one-shot example in prompt to match training format (SC2_PIPELINE_ONE_SHOT=0 to disable)
+PIPELINE_ONE_SHOT = os.getenv("SC2_PIPELINE_ONE_SHOT", "1").lower() not in ("0", "false", "no")
+VERIFY_CMD = os.getenv("SC2_VERIFY_CMD", "").strip() or None
+VERIFY_TIMEOUT = int(os.getenv("SC2_VERIFY_TIMEOUT", "60"))
+# Max retries after verify failure (compile error -> feed error to model -> re-edit -> re-verify)
+MAX_VERIFY_RETRIES = int(os.getenv("SC2_MAX_VERIFY_RETRIES", "2"))
+# Optional override for running the built executable (e.g. "./checkpasswd < input.txt")
+RUN_CMD = os.getenv("SC2_RUN_CMD", "").strip() or None
+# Timeout for running the executable after build (seconds, 0 = no timeout)
+RUN_TIMEOUT = int(os.getenv("SC2_RUN_TIMEOUT", "0"))
 # Cap tool results fed back to model (0 = no limit, full freedom for read results)
 MAX_TOOL_RESULT_CHARS = int(os.getenv("SC2_MAX_TOOL_RESULT_CHARS", "0"))
 # Log tool calls to stderr (set SC2_DEBUG_TOOLS=0 to disable)
 DEBUG_TOOLS = os.getenv("SC2_DEBUG_TOOLS", "1").lower() not in ("0", "false", "no")
 # Disable focus file context (no file content in prompt; set SC2_DISABLE_FOCUS_FILE=1)
 DISABLE_FOCUS_FILE = os.getenv("SC2_DISABLE_FOCUS_FILE", "1").lower() in ("1", "true", "yes")
+# When true, prompt lists file paths only (model uses [[[read:path]]]).
+# When false (default), file content is always embedded in the prompt.
+USE_AGENT_READ_TOOLS = os.getenv("SC2_USE_AGENT_READ_TOOLS", "false").lower() in ("1", "true", "yes")
+# Prompt caps for complex tasks (avoid dropping important details)
+MAX_INSTRUCTION_CHARS = int(os.getenv("SC2_MAX_INSTRUCTION_CHARS", "1500"))
+MAX_FOCUS_CONTENT_CHARS = int(os.getenv("SC2_MAX_FOCUS_CONTENT_CHARS", "12000"))
+MAX_REF_CONTENT_CHARS = int(os.getenv("SC2_MAX_REF_CONTENT_CHARS", "12000"))
+MAX_READ_FILES_IN_PROMPT = int(os.getenv("SC2_MAX_READ_FILES_IN_PROMPT", "15"))
+# @Code / @Folder context (Continue-style)
+MAX_CODE_SNIPPET_LINES = int(os.getenv("SC2_MAX_CODE_SNIPPET_LINES", "40"))
+MAX_FOLDER_CONTEXT_FILES = int(os.getenv("SC2_MAX_FOLDER_CONTEXT_FILES", "25"))
+# Continue default agent system message (from core/llm/defaultSystemMessages.ts)
+_BASE_AGENT_DEFAULT = """\
+You are in agent mode.
+
+If you need to use multiple tools, you can call multiple read-only tools simultaneously.
+
+Always include the language and file name in the info string when you write code blocks.
+If you are editing "src/main.py" for example, your code block should start with ```python src/main.py
+
+For larger codeblocks (>20 lines), use brief language-appropriate placeholders for unmodified sections, e.g. '// ... existing code ...'
+
+However, only output codeblocks for suggestion and demonstration purposes, for example, when enumerating multiple hypothetical options. For implementing changes, use the edit tools.
+"""
+BASE_AGENT_SYSTEM_MESSAGE = os.getenv("SC2_BASE_AGENT_SYSTEM_MESSAGE", _BASE_AGENT_DEFAULT.strip())
+
+# RAIL v3 budgets/interlocks
+RAIL_MAX_ACTIONS = int(os.getenv("SC2_RAIL_MAX_ACTIONS", "5"))
+RAIL_MAX_PATCH_FILES = int(os.getenv("SC2_RAIL_MAX_PATCH_FILES", "3"))
+RAIL_MAX_PATCH_LINES = int(os.getenv("SC2_RAIL_MAX_PATCH_LINES", "120"))
+RAIL_SHADOW_ROOT = os.getenv("SC2_RAIL_SHADOW_ROOT", "/tmp/shadow_repo")
+RAIL_MAX_ITERATIONS = int(os.getenv("SC2_RAIL_MAX_ITERATIONS", "8"))
+RAIL_TOP_K_RELEVANT = int(os.getenv("SC2_RAIL_TOP_K_RELEVANT", "5"))
+RAIL_ACTION_MAX_NEW = int(os.getenv("SC2_RAIL_ACTION_MAX_NEW", "600"))
 
 ALLOWED_EXTS = {
     # Documents / markup
