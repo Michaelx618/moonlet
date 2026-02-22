@@ -1,0 +1,39 @@
+Complete checkpasswd.c: Use pipe, fork, dup2, execl, waitpid. You MUST use a pipe because validate reads from stdin; without a pipe validate gets EOF.
+
+validate (see validate.c) reads from stdin: first read(MAX_PASSWORD) bytes = userid, then read(MAX_PASSWORD) bytes = password. Exit codes: 0=match, 2=invalid password, 3=no user.
+
+Use search_replace. old_string = the blank lines and return 0 (exactly):
+  }
+  
+
+
+  return 0;
+
+Replace with valid C code. Use this structure (output proper C with braces and semicolons):
+  int pipefd[2];
+  pid_t pid;
+  int status;
+  if (pipe(pipefd) == -1) { perror("pipe"); exit(1); }
+  pid = fork();
+  if (pid == -1) { perror("fork"); exit(1); }
+  if (pid == 0) {
+    close(pipefd[1]);
+    dup2(pipefd[0], STDIN_FILENO);
+    close(pipefd[0]);
+    execl("./validate", "validate", (char *)NULL);
+    perror("execl");
+    exit(1);
+  }
+  close(pipefd[0]);
+  write(pipefd[1], user_id, MAX_PASSWORD);
+  write(pipefd[1], password, MAX_PASSWORD);
+  close(pipefd[1]);
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status)) {
+    int e = WEXITSTATUS(status);
+    if (e == 0) printf(SUCCESS);
+    else if (e == 2) printf(INVALID);
+    else printf(NO_USER);
+  }
+
+Do not use popen. Output valid C syntax.

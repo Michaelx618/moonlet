@@ -82,6 +82,7 @@ const params = new URLSearchParams(window.location.search);
       let activeTranscriptIndex = -1;
       const PANEL_TRANSCRIPT_LIMIT = 7;
       const PANEL_USER_TEXT_MAX_CHARS = 180;
+      const PANEL_ACTIONS_LIMIT = 24;
       const LAST_SELECTED_ROOT_KEY = "moonlet_last_selected_root_v1";
       const LAST_OPENED_FILE_BY_ROOT_KEY = "moonlet_last_opened_file_by_root_v1";
       const expandedUserTurnIds = new Set();
@@ -1141,6 +1142,53 @@ const params = new URLSearchParams(window.location.search);
         return String(row.id);
       }
 
+      function normalizeActionText(item) {
+        if (!item) return "";
+        if (typeof item === "string") return item.trim();
+        const type = String(item.type || "").trim();
+        if (type === "tool_call") {
+          const tool = String(item.tool || "tool");
+          const args = item.args && typeof item.args === "object" ? item.args : {};
+          const path = String(args.path || args.filepath || "").trim();
+          const cmd = String(args.command || "").trim();
+          const pattern = String(args.pattern || "").trim();
+          const query = String(args.query || "").trim();
+          if (tool === "read_file") return path ? `Read ${path}` : "Read file";
+          if (tool === "list_files" || tool === "view_subdirectory") return path ? `List ${path}` : "List files";
+          if (tool === "grep" || tool === "grep_search") return pattern ? `Search: ${pattern.slice(0, 50)}${pattern.length > 50 ? "…" : ""}` : "Search";
+          if (tool === "search_replace" || tool === "edit_existing_file") return path ? `Edit ${path}` : "Edit file";
+          if (tool === "write_file" || tool === "create_new_file") return path ? `Write ${path}` : "Write file";
+          if (tool === "multi_edit") return path ? `Edit ${path} (multiple)` : "Multi-edit";
+          if (tool === "run_terminal_cmd" || tool === "run_terminal_command") return cmd ? `Run: ${cmd.slice(0, 48)}${cmd.length > 48 ? "…" : ""}` : "Run command";
+          if (tool === "symbols") return path ? `Symbols: ${path}` : "Symbols";
+          if (tool === "view_diff") return path ? `Diff: ${path}` : "View diff";
+          if (tool === "glob_file_search" || tool === "glob_search") return path ? `Glob: ${path}` : "Glob search";
+          if (tool === "codebase_search" || tool === "codebase_tool") return query ? `Codebase: ${query.slice(0, 40)}${query.length > 40 ? "…" : ""}` : "Codebase search";
+          if (tool === "view_repo_map") return "Repo map";
+          return path ? `${tool}: ${path}` : tool;
+        }
+        if (type === "apply" || type === "reject") {
+          const path = String(item.path || "");
+          const reason = String(item.reason || "");
+          if (type === "apply") return path ? `Applied: ${path}` : "Applied action";
+          return reason ? `Rejected: ${path || "action"} (${reason})` : `Rejected: ${path || "action"}`;
+        }
+        return JSON.stringify(item).slice(0, 180);
+      }
+
+      function pushTurnAction(actionItem) {
+        if (activeTranscriptIndex < 0 || !panelTranscript[activeTranscriptIndex]) return;
+        const turn = panelTranscript[activeTranscriptIndex];
+        if (!Array.isArray(turn.actions)) turn.actions = [];
+        const text = normalizeActionText(actionItem);
+        if (!text) return;
+        if (turn.actions.includes(text)) return;
+        turn.actions.push(text);
+        if (turn.actions.length > PANEL_ACTIONS_LIMIT) {
+          turn.actions.splice(0, turn.actions.length - PANEL_ACTIONS_LIMIT);
+        }
+      }
+
       function renderTranscriptRows(rows, autoScroll = false) {
         const dataRows = Array.isArray(rows) ? rows.filter(Boolean).slice(-PANEL_TRANSCRIPT_LIMIT) : [];
         if (!dataRows.length) {
@@ -1165,8 +1213,12 @@ const params = new URLSearchParams(window.location.search);
             );
           }
           if (assistant) {
+            const actions = Array.isArray(row.actions) ? row.actions : [];
+            const actionHtml = actions.length
+              ? `<div class="panel-turn-actions" style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border, #333);font-size:0.9em;opacity:0.85;"><div class="panel-turn-actions-title" style="font-weight:600;margin-bottom:4px;">Tools used</div><div class="panel-turn-actions-body">${actions.map((a) => `<div class="panel-turn-action-item">${esc(String(a))}</div>`).join("")}</div></div>`
+              : "";
             html.push(
-              `<div class="panel-turn panel-turn-assistant"><div class="panel-turn-head"><span class="panel-role panel-role-assistant">Moonlet</span></div><div class="panel-turn-body">${esc(assistant)}</div></div>`
+              `<div class="panel-turn panel-turn-assistant"><div class="panel-turn-head"><span class="panel-role panel-role-assistant">Moonlet</span></div><div class="panel-turn-body">${esc(assistant)}</div>${actionHtml}</div>`
             );
           }
         }
@@ -1213,6 +1265,7 @@ const params = new URLSearchParams(window.location.search);
               id: `turn_${panelTurnSeq++}`,
               user: String((row && row.user) || ""),
               assistant: String((row && row.assistant) || ""),
+              actions: [],
             });
           }
           activeTranscriptIndex = -1;
@@ -1746,62 +1799,8 @@ const params = new URLSearchParams(window.location.search);
         return lines.join("\n");
       }
 
-      async function acceptChanges() {
-        // Formally save and clear highlights
-        const hasDiffContext = Boolean(
-          activeDiffHighlights ||
-          (window._pendingDiff && window._pendingDiff.trim()) ||
-          (window._perFileDiffs && currentFile && window._perFileDiffs[currentFile] && window._perFileDiffs[currentFile].trim())
-        );
-        const hasPerFileStaged = window._perFileStaged && Object.keys(window._perFileStaged).length > 0;
-        if (hasPerFileStaged) {
-          // Multi-file (or single-file staged): save all staged files (content=null = delete)
-          const stagedPaths = Object.keys(window._perFileStaged);
-          const deletedPaths = new Set();
-          for (const path of stagedPaths) {
-            const content = window._perFileStaged[path];
-            try {
-              await api("/file", { method: "POST", body: JSON.stringify({ path, content }) });
-              if (content === null) deletedPaths.add(path);
-            } catch (e) {
-              setStatus(`Failed to save ${path}`, "error");
-              return;
-            }
-          }
-          setStatus(`Changes accepted (${stagedPaths.length} file${stagedPaths.length !== 1 ? "s" : ""})`, "");
-          showApplySummary(currentFile);
-          window._perFileStaged = {};
-          if (window._perFileDiffs) {
-            for (const p of stagedPaths) delete window._perFileDiffs[p];
-          }
-          window._pendingDiff = null;
-          for (const p of stagedPaths) delete preChangeContentByFile[p];
-          if (deletedPaths.size > 0) {
-            renderExplorerList();
-            if (currentFile && deletedPaths.has(currentFile)) {
-              currentFile = null;
-              setViewerContent("");
-              showWelcome();
-              tabNameEl.textContent = "Welcome";
-              titleFilepath.textContent = "";
-              statusBarFileEl.textContent = "No file";
-            }
-          }
-        } else if (currentFile && hasDiffContext) {
-          await saveFile();
-          setStatus("Changes accepted", "");
-          showApplySummary(currentFile);
-          if (window._perFileDiffs) {
-            delete window._perFileDiffs[currentFile];
-          }
-          window._pendingDiff = null;
-          delete preChangeContentByFile[currentFile];
-        }
-        clearDiffHighlights();
-      }
-
-      async function rejectChanges() {
-        // Restore all staged files to pre-change state (write before clearing)
+      async function revertChanges() {
+        // Restore all edited files to pre-change state (Ctrl+Z alternative)
         const stagedPaths = window._perFileStaged ? Object.keys(window._perFileStaged) : [];
         let restored = 0;
         for (const p of stagedPaths) {
@@ -1819,7 +1818,7 @@ const params = new URLSearchParams(window.location.search);
         }
         if (restored > 0) {
           markSaved();
-          setStatus(`Changes rejected — ${restored} file${restored !== 1 ? "s" : ""} restored`, "");
+          setStatus(`Reverted — ${restored} file${restored !== 1 ? "s" : ""} restored`, "");
         }
         for (const p of stagedPaths) {
           delete window._perFileDiffs?.[p];
@@ -1827,6 +1826,7 @@ const params = new URLSearchParams(window.location.search);
         }
         if (window._perFileStaged) window._perFileStaged = {};
         window._pendingDiff = null;
+        document.getElementById("btnRepair").style.display = "none";
         clearDiffHighlights();
       }
 
@@ -1984,9 +1984,36 @@ const params = new URLSearchParams(window.location.search);
         }
       }
 
+      // ─── Repair (triggered by Repair button after verify failure) ───
+      async function requestRepair() {
+        const prompt = window._lastAgentPrompt;
+        const lastError = window._lastVerifyError;
+        const lastMeta = window._lastAgentMeta;
+        if (!prompt || !lastError || !lastMeta) {
+          setStatus("No repair context", "error");
+          return;
+        }
+        if (activeRequest) return;
+        const iteration = (lastMeta.iteration || 0) + 1;
+        window._repairPayload = {
+          text: prompt,
+          mode: "repair",
+          last_error: lastError,
+          previous_patches: lastMeta.previous_patches || [],
+          iteration,
+        };
+        promptEl.value = "[Repairing...]";
+        await sendPrompt();
+      }
+
       // ─── Send Prompt ───
       async function sendPrompt() {
-        const rawText = promptEl.value.trim();
+        let rawText = promptEl.value.trim();
+        const useRepairPayload = window._repairPayload;
+        if (useRepairPayload) {
+          rawText = useRepairPayload.text || "";
+          delete window._repairPayload;
+        }
         if (!rawText || activeRequest) return;
         if (!(await ensureServerReadyNow())) {
           setStatus("Server not ready", "error");
@@ -1995,10 +2022,10 @@ const params = new URLSearchParams(window.location.search);
           return;
         }
         const text = rawText;
-        if (!text || activeRequest) return;
         // Discard pending staged edits when user sends a new command (don't auto-apply).
-        if (activeDiffHighlights || (window._pendingDiff && window._pendingDiff.trim()) ||
-            (window._perFileStaged && Object.keys(window._perFileStaged).length > 0)) {
+        // Skip for repair — we already accepted and wrote; repair returns new patches.
+        if (!useRepairPayload && (activeDiffHighlights || (window._pendingDiff && window._pendingDiff.trim()) ||
+            (window._perFileStaged && Object.keys(window._perFileStaged).length > 0))) {
           await rejectChanges();
         }
         const preRequestFile = currentFile || "";
@@ -2012,7 +2039,7 @@ const params = new URLSearchParams(window.location.search);
         setStatus("Thinking...", "busy");
         modelRunning = true; // pause highlighting to free CPU for model
         startTimer();
-        const turn = { id: `turn_${panelTurnSeq++}`, user: text, assistant: "..." };
+        const turn = { id: `turn_${panelTurnSeq++}`, user: text, assistant: "...", actions: [] };
         panelTranscript.push(turn);
         if (panelTranscript.length > PANEL_TRANSCRIPT_LIMIT) {
           panelTranscript.splice(0, panelTranscript.length - PANEL_TRANSCRIPT_LIMIT);
@@ -2080,7 +2107,7 @@ const params = new URLSearchParams(window.location.search);
           }
           return;
         }
-        const selectedMode = modeEl.value || "agent";
+        const selectedMode = useRepairPayload ? "repair" : (modeEl.value || "agent");
         // Throttled response rendering state — declared before try so finally can access
         let firstChunk = true;
         let rawResponseBuf = "";
@@ -2102,7 +2129,9 @@ const params = new URLSearchParams(window.location.search);
           responseEl.classList.add("has-content");
         }
         try {
-          const payload = { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
+          const payload = useRepairPayload
+            ? { ...useRepairPayload, focus_file: currentFile, file_path: currentFile }
+            : { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
           const controller = new AbortController();
           activeRequest = controller;
           const res = await fetch(API_BASE + "/stream", {
@@ -2146,9 +2175,33 @@ const params = new URLSearchParams(window.location.search);
               // Final flush of response text
               if (responseThrottleTimer) { clearTimeout(responseThrottleTimer); responseThrottleTimer = null; }
               if (rawResponseBuf && !metaSummaryLocked) flushResponse();
+            } else if (event === "action") {
+              try {
+                const actionData = JSON.parse(data);
+                pushTurnAction(actionData);
+                renderPanelTranscript();
+              } catch (_) {}
             } else if (event === "meta") {
               try {
                 const d = JSON.parse(data);
+                if (Array.isArray(d.agent_actions)) {
+                  for (const act of d.agent_actions) {
+                    pushTurnAction(act);
+                  }
+                }
+                const coreActions = d.core_v2_actions || {};
+                const applied = Array.isArray(coreActions.applied) ? coreActions.applied : [];
+                const rejected = Array.isArray(coreActions.rejected) ? coreActions.rejected : [];
+                for (const item of applied) {
+                  pushTurnAction({ type: "apply", path: item && item.path ? item.path : "", reason: "" });
+                }
+                for (const item of rejected) {
+                  pushTurnAction({
+                    type: "reject",
+                    path: item && item.path ? item.path : "",
+                    reason: item && item.reason ? item.reason : "",
+                  });
+                }
                 stopTimer("done");
                 // In chat mode, never process staged/diff meta — chat does not stage files
                 const isChatMode = (selectedMode || "").toLowerCase() === "chat";
@@ -2215,7 +2268,7 @@ const params = new URLSearchParams(window.location.search);
                   } else if (stagedPath && pd[stagedPath]) {
                     window._pendingDiff = pd[stagedPath];
                   } else if (Object.keys(pd).length > 0) {
-                    // Fallback: path mismatch (e.g. checkpasswd.c vs w7/checkpasswd.c) — use first diff
+                    // Fallback: path mismatch (e.g. foo.c vs subdir/foo.c) — use first diff
                     const firstKey = Object.keys(pd).find((k) => k.split("/").pop() === (stagedPath && stagedPath.split("/").pop()) || !stagedPath);
                     window._pendingDiff = pd[firstKey || Object.keys(pd)[0]];
                   }
@@ -2320,6 +2373,12 @@ const params = new URLSearchParams(window.location.search);
                       renderPanelTranscript();
                     }
                   }
+                } else if (activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
+                  const explanation = (d.explanation || d.output || "").trim();
+                  if (explanation) {
+                    panelTranscript[activeTranscriptIndex].assistant = explanation;
+                    renderPanelTranscript();
+                  }
                 }
                 // Staged edit mode: show candidate content in editor, do not auto-write.
                 const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
@@ -2369,12 +2428,17 @@ const params = new URLSearchParams(window.location.search);
                 if (!renderedMetaSummary && (d.staged || (d.per_file_staged && Object.keys(d.per_file_staged).length > 0))) {
                   const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
                   const stagedFiles = d.per_file_staged ? Object.keys(d.per_file_staged) : (d.staged_file ? [d.staged_file] : []);
-                  const stagedMsg = stagedFiles.length > 1
-                    ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.`
-                    : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`;
+                  const appliedDirectly = d.applied_directly === true;
+                  const msg = appliedDirectly
+                    ? (stagedFiles.length > 1
+                      ? `Changes applied to ${stagedFiles.length} files. Use Ctrl+Z to undo or click Revert.`
+                      : `Changes applied. Use Ctrl+Z to undo or click Revert.`)
+                    : (stagedFiles.length > 1
+                      ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.`
+                      : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`);
                   responseEl.innerHTML = explanation
-                    ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`
-                    : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`;
+                    ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>`
+                    : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>`;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
@@ -2384,6 +2448,14 @@ const params = new URLSearchParams(window.location.search);
                 }
                 if (d.staged_content !== undefined && d.staged_file) {
                   window._perFileStaged = { ...(window._perFileStaged || {}), [d.staged_file]: d.staged_content };
+                }
+                if ((d.mode_used === "pipeline" || d.mode_used === "pipeline_repair" || d.mode_used === "continue_agent") && (d.touched?.length > 0 || d.per_file_staged)) {
+                  window._lastAgentPrompt = text;
+                  window._lastAgentMeta = d;
+                  document.getElementById("btnRepair").style.display = "none";
+                }
+                if (d.failure_kind === "max_iterations") {
+                  document.getElementById("btnRepair").style.display = "none";
                 }
               } catch {}
             } else if (event === "error") {
@@ -2525,6 +2597,7 @@ const params = new URLSearchParams(window.location.search);
           if (rawResponseBuf && firstChunk === false && !metaSummaryLocked) flushResponse();
           activeRequest = null;
           modelRunning = false;
+          document.getElementById("send").disabled = false;
         }
       }
 
@@ -2649,6 +2722,15 @@ const params = new URLSearchParams(window.location.search);
       }
 
       document.addEventListener("keydown", (e) => {
+        // Ctrl+Z / Cmd+Z: revert agent changes when available
+        if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+          const hasRevertable = window._perFileStaged && Object.keys(window._perFileStaged).length > 0;
+          if (hasRevertable) {
+            e.preventDefault();
+            revertChanges();
+            return;
+          }
+        }
         handleFallbackTerminalKeydown(e);
       });
 
@@ -2939,9 +3021,10 @@ const params = new URLSearchParams(window.location.search);
         void lspClient.stop();
       });
 
-      // ─── Accept / Reject buttons ───
-      document.getElementById("btnApply").onclick = acceptChanges;
-      document.getElementById("btnReject").onclick = rejectChanges;
+      // ─── Accept / Reject / Repair buttons ───
+      document.getElementById("btnRevert").onclick = revertChanges;
+      const btnRepair = document.getElementById("btnRepair");
+      if (btnRepair) btnRepair.onclick = () => requestRepair();
 
       // ─── Terminal resize (center panel) ───
       (function() {

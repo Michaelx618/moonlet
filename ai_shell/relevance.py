@@ -19,6 +19,7 @@ from .files import _norm_rel_path, get_include, get_root, is_allowed_file, read_
 from .intents import extract_target_files
 from .tools import grep_search
 from .utils import dbg
+from .rag_store import RagStore
 
 
 _SOURCE_EXTS = frozenset(
@@ -266,14 +267,23 @@ def find_relevant_files(
     if t2_5:
         dbg(f"relevance: tier2.5 build_intent -> {t2_5}")
         return t2_5
-    # Tier 3: keyword grep + optional semantic search
+    # Tier 3: keyword grep + optional semantic search + persistent hybrid store
     t3_keyword = _tier3_keyword_grep(text)
+    try:
+        rag = RagStore()
+        rag_hits = rag.query(text, top_k=5)
+        t3_rag = [h.path for h in rag_hits if h.path]
+    except Exception:
+        t3_rag = []
     if getattr(config, "SEMANTIC_SEARCH_ENABLED", False):
         candidates = t3_keyword if t3_keyword else _list_editable_files(max_files=50)
         t3_semantic = _tier3_semantic(text, candidates)
         if t3_semantic:
             dbg(f"relevance: tier3 semantic -> {t3_semantic}")
             return t3_semantic
+    if t3_rag:
+        dbg(f"relevance: tier3 rag -> {t3_rag}")
+        return t3_rag
     if t3_keyword:
         dbg(f"relevance: tier3 keyword -> {t3_keyword}")
         return t3_keyword

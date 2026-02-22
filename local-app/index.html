@@ -448,6 +448,7 @@
       }
       .cm-host .cm-diff-add {
         background: rgba(166, 227, 161, 0.22);
+        border-left: 3px solid rgba(166, 227, 161, 0.8);
       }
       .cm-host .cm-diff-del-anchor {
         background: rgba(243, 139, 168, 0.22);
@@ -729,7 +730,7 @@
         gap: 6px;
         margin-left: 12px;
       }
-      .btn-apply, .btn-reject {
+      .btn-apply, .btn-reject, .btn-repair {
         font-family: var(--font-ui);
         font-size: 11px;
         padding: 2px 10px;
@@ -750,6 +751,12 @@
         border-color: rgba(243, 139, 168, 0.25);
       }
       .btn-reject:hover { background: rgba(243, 139, 168, 0.22); }
+      .btn-repair {
+        background: rgba(249, 226, 175, 0.15);
+        color: var(--yellow);
+        border-color: rgba(249, 226, 175, 0.3);
+      }
+      .btn-repair:hover { background: rgba(249, 226, 175, 0.25); }
 
       /* Editor diff highlights (inline gutter + line bg) */
       .line-numbers .ln-add { color: var(--green); }
@@ -1132,8 +1139,8 @@
             <div class="panel-tab active">Assistant</div>
             <button class="btn btn-sm" id="newChatBtn" title="Start a new chat">New Chat</button>
             <div class="diff-actions" id="diffActions" style="display:none;">
-              <button class="btn-apply" id="btnApply" title="Accept changes">&#10003; Accept</button>
-              <button class="btn-reject" id="btnReject" title="Reject changes">&#10007; Reject</button>
+              <button class="btn-reject" id="btnRevert" title="Revert changes (Ctrl+Z also works)">Revert</button>
+              <button class="btn-repair" id="btnRepair" title="Repair after verify failure" style="display:none;">Repair</button>
             </div>
             <div style="flex:1;"></div>
             <div class="run-timer" id="runTimer"></div>

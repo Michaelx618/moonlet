@@ -190,7 +190,7 @@ def set_include(paths: List[str]) -> None:
     paths = paths if paths is not None else []
     if not paths:
         INCLUDE_PATHS = None
-        print("[Include filter cleared]", file=sys.stderr)
+        print("[Imported files cleared; agent may edit any file under root]", file=sys.stderr)
         return
     rels: Set[str] = set()
     for p in paths:
@@ -200,7 +200,7 @@ def set_include(paths: List[str]) -> None:
     INCLUDE_PATHS = rels if rels else None
     if INCLUDE_PATHS:
         print(
-            f"[Include filter set to {len(INCLUDE_PATHS)} file(s)]",
+            f"[Imported files (edit allow list): {len(INCLUDE_PATHS)} file(s)]",
             file=sys.stderr,
         )
     # Rebuild file index so agent tools (grep, symbols, list_files) see updated set
@@ -236,8 +236,10 @@ _EDIT_BLOCKLIST_PREFIXES = ("local-app/", "local-app\\", "ai_shell/", "tools/")
 
 
 def is_edit_allowed(rel_path: str, *, allow_new: bool = False) -> bool:
-    """True if the agent may edit this path. Blocks app source and enforces include filter.
-    When allow_new=True, new files are allowed (skip include check) so the model can create files freely."""
+    """True if the agent may edit this path.
+    Allow list = files imported by the user (INCLUDE_PATHS). When the user has imported files,
+    only those paths (or under them) are editable. When no files imported, any path under root is allowed.
+    Blocklist (local-app, ai_shell, tools) always applies. When allow_new=True, new files are allowed."""
     rel = _norm_rel_path(rel_path or "")
     if not rel:
         return False
@@ -245,7 +247,7 @@ def is_edit_allowed(rel_path: str, *, allow_new: bool = False) -> bool:
     rel_posix = rel.replace("\\", "/")
     if any(rel_posix.startswith(p) for p in _EDIT_BLOCKLIST_PREFIXES):
         return False
-    # When include filter is set, only allow paths in the include set (unless allow_new)
+    # Allow list = imported files: when user has imported files, only those (or under them) are editable
     if INCLUDE_PATHS and not allow_new:
         if rel_posix in INCLUDE_PATHS:
             return True
@@ -701,6 +703,39 @@ def _line_match(a: str, b: str) -> bool:
     return False
 
 
+def _replacement_already_in_file(
+    file_lines: List[str],
+    replacement: List[str],
+) -> bool:
+    """Check if the replacement block is already in the file (hunk is a no-op)."""
+    if not replacement or len(replacement) > len(file_lines):
+        return False
+    repl_len = len(replacement)
+    for i in range(len(file_lines) - repl_len + 1):
+        match = True
+        for j in range(repl_len):
+            if not _line_match(file_lines[i + j], replacement[j]):
+                match = False
+                break
+        if match:
+            return True
+    return False
+
+
+def _expected_content_in_file(
+    file_lines: List[str],
+    expected: List[Tuple[str, str]],
+) -> bool:
+    """True if the expected content exists as a contiguous block in the file."""
+    if not expected:
+        return True
+    try:
+        pos = _find_hunk_location(file_lines, expected, 0)
+        return pos >= 0
+    except ValueError:
+        return True  # ambiguous match, assume exists (don't filter)
+
+
 def _find_hunk_location(
     file_lines: List[str],
     expected: List[Tuple[str, str]],
@@ -1007,18 +1042,35 @@ def apply_unified_diff(
                 if pos == -1:
                     pos = _find_hunk_location(file_lines, expected, rg_hint, max_fuzz=10)
         if pos == -1:
-            # Fallback: use @@ line numbers when context match fails (model may have
-            # produced diff for slightly different file structure).
+            # Fallback: use @@ line numbers only when expected content actually exists
+            # there. Blind replacement corrupts files when model mixes hunks from
+            # different files (e.g. bar.c code into foo.c).
             old_start = int(getattr(hunk, "old_start", 0) or 0)
             n_expected = len(expected)
             if old_start > 0:
-                pos = old_start - 1  # 0-based
+                pos_candidate = old_start - 1  # 0-based
+                if pos_candidate + n_expected <= len(file_lines):
+                    expect_content = [c for _, c in expected]
+                    match_count = sum(
+                        1 for j in range(n_expected)
+                        if pos_candidate + j < len(file_lines)
+                        and _line_match(file_lines[pos_candidate + j], expect_content[j])
+                    )
+                    if match_count >= max(1, n_expected - 2):  # allow 1-2 fuzzy
+                        pos = pos_candidate
+                        dbg(
+                            f"apply_diff: context match failed, @@ fallback ok at line "
+                            f"{pos + 1} for {rel_focus} (match {match_count}/{n_expected})"
+                        )
+                        file_lines[pos : pos + n_expected] = replacement
+                        continue
+            # Skip repeated/no-op hunks: if replacement is already in file, continue
+            if _replacement_already_in_file(file_lines, replacement):
                 dbg(
-                    f"apply_diff: context match failed, using @@ line-number fallback "
-                    f"at line {pos + 1} for {rel_focus}"
+                    f"apply_diff: skipping no-op hunk for {rel_focus} "
+                    "(replacement already in file)"
                 )
-                file_lines[pos : pos + n_expected] = replacement
-                continue  # next hunk
+                continue
             expect_preview = [c for _, c in expected[:3]]
             hunk_lines = []
             for p, c in list(getattr(hunk, "lines", []) or [])[:80]:
@@ -1033,20 +1085,33 @@ def apply_unified_diff(
             )
 
         # Verify removal lines match (whitespace-flexible)
+        removal_ok = True
+        fail_j, fail_content = -1, ""
         for j, (prefix, content) in enumerate(expected):
             if prefix == "-":
                 if pos + j >= len(file_lines):
-                    raise ValueError(
-                        f"Removal line at line {pos + j + 1}: unexpected EOF"
-                    )
+                    removal_ok = False
+                    fail_j, fail_content = j, content
+                    break
                 if not _line_match(file_lines[pos + j], content):
-                    got = repr(file_lines[pos + j])
-                    ctx = _context_dump(file_lines, pos + j)
-                    raise ValueError(
-                        f"Removal line mismatch at line {pos + j + 1}: "
-                        f"expected {content!r}, got {got}\n"
-                        f"CURRENT_CONTEXT:\n{ctx}"
-                    )
+                    removal_ok = False
+                    fail_j, fail_content = j, content
+                    break
+        if not removal_ok:
+            # Removal mismatch: maybe replacement already applied (repeated hunk)
+            if _replacement_already_in_file(file_lines, replacement):
+                dbg(
+                    f"apply_diff: skipping no-op hunk for {rel_focus} "
+                    "(replacement already in file, removal mismatch)"
+                )
+                continue
+            got = repr(file_lines[pos + fail_j]) if pos + fail_j < len(file_lines) else "EOF"
+            ctx = _context_dump(file_lines, pos + fail_j)
+            raise ValueError(
+                f"Removal line mismatch at line {pos + fail_j + 1}: "
+                f"expected {fail_content!r}, got {got}\n"
+                f"CURRENT_CONTEXT:\n{ctx}"
+            )
 
         # Apply: replace the expected block with the replacement
         n_expected = len(expected)

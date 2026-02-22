@@ -1,19 +1,21 @@
 import base64
+import copy
 import json
 import sys
 import mimetypes
 import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import config
-from . import agent
-from . import prompt_buffer, state
-from .agent import run_agent_meta
+from . import state
 from .relevance import find_relevant_files
+from .verify import run_verify
+from .agent_loop import run_agent
 from .files import (
     delete_file,
     get_include,
@@ -27,17 +29,9 @@ from .files import (
     is_binary_file,
     write_file_text,
 )
-from .model import backend_name, backend_status, stream_reply_chunks, get_session_cache_key
-from .prompt_buffer import _user_asks_about_code_or_review
-from .tool_executor import (
-    CHAT_TOOLS_HINT,
-    TOOLS_SYSTEM_HINT,
-    execute_tool,
-    extract_tool_calls,
-    strip_tool_calls_from_output,
-    tool_log,
-)
-from .utils import dbg, dbg_chat
+from .model import backend_name, backend_status, clear_kv_cache
+from .tool_executor import tool_log
+from .utils import dbg
 
 import difflib
 
@@ -71,6 +65,66 @@ except ImportError:
 
     def validate_file_path(*args, **kwargs):
         raise NotImplementedError("file_utils not available")
+
+
+_PATCH_PROPOSALS: Dict[str, Dict] = {}
+_PATCH_PROPOSAL_ORDER: list[str] = []
+_LAST_APPLIED: Dict[str, Dict] = {}
+
+
+def _store_patch_proposal(meta: Dict) -> str:
+    pid = str(uuid.uuid4())[:12]
+    payload = {
+        "id": pid,
+        "ts": int(time.time()),
+        "per_file_staged": dict(meta.get("per_file_staged") or {}),
+        "per_file_before": dict(meta.get("per_file_before") or {}),
+        "per_file_diffs": dict(meta.get("per_file_diffs") or {}),
+        "touched": list(meta.get("touched") or []),
+    }
+    _PATCH_PROPOSALS[pid] = payload
+    _PATCH_PROPOSAL_ORDER.append(pid)
+    if len(_PATCH_PROPOSAL_ORDER) > 30:
+        old = _PATCH_PROPOSAL_ORDER.pop(0)
+        _PATCH_PROPOSALS.pop(old, None)
+    return pid
+
+
+def _apply_patch_proposal(pid: str) -> Dict:
+    entry = dict(_PATCH_PROPOSALS.get(pid) or {})
+    if not entry:
+        raise KeyError("proposal_not_found")
+    staged = dict(entry.get("per_file_staged") or {})
+    before = dict(entry.get("per_file_before") or {})
+    touched = list(entry.get("touched") or [])
+    applied = []
+    for fpath in touched:
+        content = staged.get(fpath)
+        if content is None:
+            continue
+        write_file_text(fpath, content)
+        applied.append(fpath)
+    _LAST_APPLIED["last"] = {
+        "id": pid,
+        "per_file_before": before,
+        "per_file_after": staged,
+        "touched": applied,
+        "ts": int(time.time()),
+    }
+    return {"proposal_id": pid, "applied": applied}
+
+
+def _undo_last_applied() -> Dict:
+    last = dict(_LAST_APPLIED.get("last") or {})
+    if not last:
+        raise KeyError("no_applied_patch")
+    before = dict(last.get("per_file_before") or {})
+    restored = []
+    for fpath, content in before.items():
+        write_file_text(fpath, content)
+        restored.append(fpath)
+    _LAST_APPLIED.clear()
+    return {"restored": restored, "proposal_id": last.get("id")}
 
 
 class APIServer(BaseHTTPRequestHandler):
@@ -145,8 +199,14 @@ class APIServer(BaseHTTPRequestHandler):
             text = data.get("text") or ""
             focus_file = data.get("focus_file")
             file_path = data.get("file_path")
-            if not text.strip():
+            last_error = data.get("last_error") or ""
+            previous_patches = data.get("previous_patches") or []
+            iteration = int(data.get("iteration") or 0)
+            if not text.strip() and mode != "repair":
                 self._json(400, {"error": "text is required"})
+                return
+            if mode == "repair" and not text.strip():
+                self._json(400, {"error": "text (original spec) is required for repair"})
                 return
             self._sse()
             sent_done = False
@@ -169,129 +229,196 @@ class APIServer(BaseHTTPRequestHandler):
                         focus_file = discovered[0]
                         dbg(f"agent: discovered focus_file from request: {focus_file}")
 
-                focus_before_disable = focus_file
                 if getattr(config, "DISABLE_FOCUS_FILE", False):
                     focus_file = None
 
-                # Chat: use focus_file for correctness/review questions even when DISABLE_FOCUS_FILE
-                chat_focus = (
-                    focus_before_disable
-                    if mode == "chat"
-                    and focus_before_disable
-                    and _user_asks_about_code_or_review(text)
-                    else focus_file
-                )
+                if mode in ("agent", "chat", "repair"):
+                    run_text = text if mode != "repair" else f"{text}\n\nRepair target:\n{last_error}"
+                    extra_read = [
+                        str(p).strip() for p in (data.get("extra_read_files") or [])
+                        if str(p).strip()
+                    ]
+                    context_folders = [
+                        str(p).strip() for p in (data.get("context_folders") or data.get("extra_folders") or [])
+                        if str(p).strip()
+                    ] or None
+                    def on_action(action: Dict) -> None:
+                        self._sse_send(json.dumps(action), event="action")
+                        if action.get("type") == "tool_call":
+                            from .utils import tool_call_log
+                            tool_call_log(action.get("tool", ""), action.get("args") or {})
 
-                if mode == "chat":
-                    chat_max_new = config.MAX_NEW
-                    # Give model access to imported files (candidate files) — it chooses which tools to use
-                    chat_context_override = ""
-                    from .index import get_indexed_files
-                    if get_include():
-                        candidate_files = get_indexed_files()
-                        if candidate_files:
-                            chat_context_override = "FILES: " + ", ".join(candidate_files)
-                    if not chat_context_override:
-                        chat_context_override = "Use [[[list_files]]] to see available files."
-                    prompt, ctx_meta = prompt_buffer.build_prompt(
-                        "chat",
-                        text,
-                        focus_file=chat_focus,
-                        full_context=False,
-                        context_override=chat_context_override,
-                        system_append=CHAT_TOOLS_HINT,
-                    )
-                    dbg_chat(
-                        f"chat prompt_len={len(prompt)} context_bytes={ctx_meta.get('context_bytes', 0)} "
-                        f"focus_file={focus_file or 'none'} mode_used={ctx_meta.get('mode_used', '?')}"
-                    )
-                    output_chunks = []
-                    start = time.time()
-                    chat_stop = ["\nUser:", "\nSYSTEM:", "\nCONTEXT:", "\nHISTORY:"]
-                    cache_key = get_session_cache_key()
-                    max_rounds = max(1, int(getattr(config, "MAX_TOOL_ROUNDS", 3)))
-                    rounds_used = 0
-                    tools_called = []
-                    for _round in range(max_rounds):
-                        rounds_used = _round + 1
-                        round_chunks = []
-                        for token in stream_reply_chunks(
-                            prompt,
-                            max_new=chat_max_new,
-                            stop_sequences=chat_stop,
-                            cache_key=cache_key,
-                        ):
-                            round_chunks.append(token)
-                        reply = "".join(round_chunks).strip()
-                        tool_calls = extract_tool_calls(reply)
-                        if not tool_calls:
-                            output_chunks = round_chunks
-                            break
-                        tools_called.extend([f"{n}({a[:30]}...)" if len(a) > 30 else f"{n}({a})" for n, a in tool_calls])
-                        self._sse_send("working", event="status")
-                        tool_log(f"chat round {_round + 1}: model requested {len(tool_calls)} tool(s)")
-                        results = []
-                        for name, arg in tool_calls:
-                            results.append(execute_tool(name, arg))
-                        combined = "\n\n".join(results)
-                        max_chars = getattr(config, "MAX_TOOL_RESULT_CHARS", 0) or 0
-                        if max_chars > 0 and len(combined) > max_chars:
-                            combined = combined[:max_chars] + "\n\n...[truncated]"
-                            tool_log(f"chat round {_round + 1} done: truncated to {max_chars} chars")
-                        else:
-                            tool_log(f"chat round {_round + 1} done: feeding {len(combined)} chars back")
-                        prompt = (
-                            f"{prompt}\n{reply}\n\nTool results:\n{combined}\n\n"
-                            "User: Continue. Use the tool results above.\nAssistant:"
-                        )
-                    output = strip_tool_calls_from_output("".join(output_chunks).strip())
-                    dbg_chat(
-                        f"chat done rounds_used={rounds_used} tools={tools_called or 'none'} "
-                        f"final_prompt_len={len(prompt)} reply_len={len(output)}"
-                    )
-                    chat_buffered = (
-                        config.BUFFER_OUTPUT
-                        and (
-                            bool(file_path)
-                            or len(prompt) >= config.CHAT_BUFFER_PROMPT_CHARS
-                            or len(text) >= config.CHAT_BUFFER_INPUT_CHARS
-                        )
-                    )
-                    self._sse_send(output, event="chunk")
-                    agent.chat_history.append((text, output))
-                    state.append_chat_turn(text, output)
-                    meta = {
-                        "backend": backend_name(),
-                        "prompt_len": len(prompt),
-                        "reply_len": len(output),
-                        "timeout": output == "[Model timeout]",
-                        "duration_ms": int((time.time() - start) * 1000),
-                        "buffer_mode": "adaptive_buffered" if chat_buffered else "direct",
-                        "truncated": False,
-                        "chat_max_new": chat_max_new,
-                    }
-                else:
-                    output, meta = run_agent_meta(
-                        text,
-                        focus_file=None if getattr(config, "DISABLE_FOCUS_FILE", False) else focus_file,
+                    output, meta = run_agent(
+                        run_text,
+                        focus_file=focus_file,
+                        mode=mode,
                         silent=True,
-                        full_context=bool(file_path),
+                        on_action=on_action,
+                        extra_read_files=extra_read or None,
+                        context_folders=context_folders,
                     )
                     meta["buffer_mode"] = "direct"
-                    meta["output"] = output  # explanation (code stripped) for agent panel
-                    meta["explanation"] = output  # explicit key for frontend
+                    meta["output"] = output
+                    meta["explanation"] = output
                     self._attach_path_debug(meta, focus_file)
                     self._sse_send(output, event="chunk")
+                    if mode != "repair":
+                        state.append_chat_turn(text, output)
+                    elif meta.get("touched"):
+                        state.append_chat_turn(text, output)
+                        state.append_change_note(f"Repair staged for: {', '.join(meta['touched'])}")
 
                 if focus_file:
                     meta["focus_file"] = focus_file
+                approval_mode = bool(getattr(config, "APPROVAL_MODE", True))
+                auto_apply = bool(getattr(config, "AUTO_APPLY_ON_SUCCESS", False))
+                if approval_mode and meta.get("per_file_staged") and not auto_apply:
+                    proposal_id = _store_patch_proposal(meta)
+                    meta["proposal_id"] = proposal_id
+                    meta["requires_approval"] = True
+                    meta["applied_directly"] = False
+                    self._sse_send(
+                        f"Patch proposal ready ({proposal_id}). Approve to apply changes.",
+                        event="chunk",
+                    )
                 self._sse_send(json.dumps(meta), event="meta")
+
+                # Write to disk AFTER sending meta so frontend gets diff highlights first.
+                # Auto-apply runs when approval mode is disabled or explicit auto-apply is enabled.
+                if (not approval_mode or auto_apply) and meta.get("per_file_staged"):
+                    touched = meta.get("touched") or meta.get("files_changed") or []
+                    for fpath, content in meta["per_file_staged"].items():
+                        if content is not None:
+                            write_file_text(fpath, content)
+                            dbg(f"server: wrote {fpath} to disk (applied_directly)")
+
+                    # Verify + retry loop: compile/test, feed errors back to model
+                    skip_checks = getattr(config, "SKIP_COMPILE_CHECKS", False)
+                    max_retries = getattr(config, "MAX_VERIFY_RETRIES", 2)
+                    if touched and not skip_checks:
+                        for retry_i in range(max_retries):
+                            self._sse_send("Verifying...", event="chunk")
+                            exit_code, _stdout, _stderr, first_error = run_verify(
+                                staged_paths=list(touched),
+                            )
+                            if exit_code == 0:
+                                dbg(f"server: verify passed (attempt {retry_i + 1})")
+                                self._sse_send("Build OK.", event="chunk")
+                                break
+                            dbg(f"server: verify failed (attempt {retry_i + 1}), error: {first_error[:200]}")
+                            self._sse_send(
+                                f"Build failed (retry {retry_i + 1}/{max_retries}):\n{first_error[:300]}",
+                                event="chunk",
+                            )
+                            # Feed error back to main agent (same entrypoint as normal requests)
+                            retry_text = (
+                                f"ERROR after your edit:\n{first_error}\n\n"
+                                f"Fix the error in the code. Original request:\n{text}"
+                            )
+                            _, retry_meta = run_agent(
+                                retry_text,
+                                focus_file=focus_file or (touched[0] if touched else None),
+                                mode="repair",
+                                silent=True,
+                                extra_read_files=list(touched),
+                            )
+                            retry_staged = retry_meta.get("per_file_staged") or {}
+                            retry_touched = retry_meta.get("touched") or []
+                            if not retry_touched:
+                                dbg("server: verify retry produced no edits, stopping")
+                                break
+                            # Write retry edits to disk
+                            for fpath, content in retry_staged.items():
+                                if content is not None:
+                                    write_file_text(fpath, content)
+                                    dbg(f"server: wrote {fpath} to disk (retry {retry_i + 1})")
+                            # Update meta with retry results for frontend
+                            meta["per_file_diffs"] = retry_meta.get("per_file_diffs", meta.get("per_file_diffs", {}))
+                            meta["per_file_staged"] = retry_staged
+                            meta["per_file_before"] = retry_meta.get("per_file_before", meta.get("per_file_before", {}))
+                            touched = retry_touched
+                            # Send updated meta so frontend refreshes diff highlights
+                            self._sse_send(json.dumps(meta), event="meta")
+                        else:
+                            # All retries exhausted, still failing
+                            dbg(f"server: verify failed after {max_retries} retries")
+                            self._sse_send(
+                                f"Build still failing after {max_retries} retries.",
+                                event="chunk",
+                            )
             except Exception as exc:
                 self._sse_send(str(exc), event="error")
             finally:
                 if not sent_done:
                     self._sse_send("[DONE]", event="done")
                     sent_done = True
+            return
+
+        if parsed.path == "/v2/execute":
+            text = (data.get("text") or "").strip()
+            focus_file = (data.get("focus_file") or "").strip()
+            if not text:
+                self._json(400, {"error": "text is required"})
+                return
+            try:
+                if getattr(config, "USE_LEGACY_PIPELINE", False):
+                    output, meta = run_pipeline(text, silent=True, focus_file=focus_file or None)
+                    meta["output"] = output
+                    self._json(200, meta)
+                else:
+                    extra_read = [
+                        str(p).strip() for p in (data.get("extra_read_files") or [])
+                        if str(p).strip()
+                    ]
+                    context_folders = [
+                        str(p).strip() for p in (data.get("context_folders") or data.get("extra_folders") or [])
+                        if str(p).strip()
+                    ] or None
+                    output, meta = run_agent(
+                        text,
+                        focus_file=focus_file or None,
+                        mode="agent",
+                        silent=True,
+                        extra_read_files=extra_read or None,
+                        context_folders=context_folders,
+                    )
+                    meta["output"] = output
+                    self._json(200, meta)
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+
+        if parsed.path == "/proposal/accept":
+            proposal_id = str(data.get("proposal_id") or "").strip()
+            if not proposal_id:
+                self._json(400, {"error": "proposal_id is required"})
+                return
+            try:
+                out = _apply_patch_proposal(proposal_id)
+                self._json(200, {"ok": True, **out})
+            except KeyError:
+                self._json(404, {"error": "proposal_not_found", "proposal_id": proposal_id})
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+
+        if parsed.path == "/proposal/reject":
+            proposal_id = str(data.get("proposal_id") or "").strip()
+            if not proposal_id:
+                self._json(400, {"error": "proposal_id is required"})
+                return
+            existed = bool(_PATCH_PROPOSALS.pop(proposal_id, None))
+            self._json(200, {"ok": True, "proposal_id": proposal_id, "rejected": existed})
+            return
+
+        if parsed.path == "/proposal/undo":
+            try:
+                out = _undo_last_applied()
+                self._json(200, {"ok": True, **out})
+            except KeyError:
+                self._json(404, {"error": "no_applied_patch"})
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
             return
 
         # /file (write/upload or delete)
@@ -376,6 +503,7 @@ class APIServer(BaseHTTPRequestHandler):
                         return
                     cwd_path = cwd_target
                 dbg(f"POST /run cmd={cmd!r} cwd={str(cwd_path)} timeout={timeout_val}s")
+                tool_log(f"run_terminal_cmd (sandbox /run): cmd={cmd!r} cwd={str(cwd_path)} timeout={timeout_val}s")
                 res = subprocess.run(
                     cmd,
                     cwd=str(cwd_path),
@@ -392,6 +520,7 @@ class APIServer(BaseHTTPRequestHandler):
                     out = out[:max_chars] + "\n...[stdout truncated]"
                 if len(err) > max_chars:
                     err = err[:max_chars] + "\n...[stderr truncated]"
+                tool_log(f"run_terminal_cmd (sandbox /run): exit={res.returncode} stdout={len(out)} chars stderr={len(err)} chars")
                 self._json(
                     200,
                     {
@@ -406,6 +535,7 @@ class APIServer(BaseHTTPRequestHandler):
             except subprocess.TimeoutExpired as exc:
                 out = exc.stdout or ""
                 err = exc.stderr or ""
+                tool_log(f"run_terminal_cmd (sandbox /run): TIMEOUT after {timeout_val}s cmd={cmd!r}")
                 self._json(
                     200,
                     {
@@ -420,6 +550,33 @@ class APIServer(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
             return
+
+        if parsed.path == "/verify":
+            try:
+                paths = data.get("paths") or []
+                exit_code, stdout, stderr, first_error = run_verify(
+                    get_root(),
+                    staged_paths=paths if isinstance(paths, list) else [],
+                )
+                max_chars = 20000
+                if len(stdout) > max_chars:
+                    stdout = stdout[:max_chars] + "\n...[stdout truncated]"
+                if len(stderr) > max_chars:
+                    stderr = stderr[:max_chars] + "\n...[stderr truncated]"
+                self._json(
+                    200,
+                    {
+                        "ok": exit_code == 0,
+                        "exit_code": exit_code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "first_error": first_error,
+                    },
+                )
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+
         if parsed.path == "/include":
             paths = data.get("paths")
             if paths is None:
@@ -444,15 +601,6 @@ class APIServer(BaseHTTPRequestHandler):
         if parsed.path == "/history/clear":
             try:
                 state.clear_chat_session()
-                # Clear in-memory chat history used by some code paths.
-                try:
-                    agent.chat_history.clear()
-                except Exception:
-                    pass
-                try:
-                    agent.agent_history.clear()
-                except Exception:
-                    pass
                 self._json(200, {"status": "ok"})
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
@@ -485,6 +633,16 @@ class APIServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/clear-cache":
+            try:
+                from . import model as _model_mod
+                model_obj = getattr(_model_mod, "model", None)
+                clear_kv_cache(model_obj)
+                self._json(200, {"status": "ok", "message": "KV cache cleared"})
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+            return
+
         if parsed.path == "/health":
             body = {"status": "ok", "backend": backend_name()}
             try:

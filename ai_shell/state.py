@@ -6,6 +6,10 @@ from typing import Dict, List, Tuple
 
 from . import config
 
+# In-memory lists cleared on session reset (used by some code paths)
+in_memory_chat_history: List[Tuple[str, str]] = []
+in_memory_agent_history: List[Tuple[str, str]] = []
+
 
 def _state_path() -> str:
     return os.path.expanduser(config.STATE_PATH)
@@ -70,9 +74,10 @@ def get_change_notes() -> List[str]:
     return list(state.get("change_notes") or [])
 
 
-MAX_CHAT_HISTORY = 12  # turns kept; prompt_buffer truncates per turn: user 450, assistant 400, notes 350 chars
+MAX_CHAT_HISTORY = 12  # turns kept in persisted chat history
 MAX_CHANGE_NOTES = 2
 MAX_FAILURE_HISTORY = 7
+MAX_TASK_CHECKPOINTS = 40
 
 def append_chat_turn(user_text: str, assistant_text: str) -> None:
     """Append a chat turn to history."""
@@ -98,12 +103,14 @@ def get_recent_chat(limit: int = MAX_CHAT_HISTORY) -> List[Tuple[str, str]]:
 
 
 def clear_chat_session() -> None:
-    """Clear persisted chat/failure/change memory for a fresh conversation."""
+    """Clear persisted chat/failure/change memory and in-memory histories for a fresh conversation."""
     state = load_state()
     state["chat_history"] = []
     state["failure_history"] = []
     state["change_notes"] = []
     save_state(state)
+    in_memory_chat_history.clear()
+    in_memory_agent_history.clear()
 
 
 def append_failure_note(
@@ -161,3 +168,42 @@ def get_recent_failures(limit: int = 2) -> List[Dict[str, str]]:
             }
         )
     return out
+
+
+def save_task_checkpoint(task_id: str, payload: Dict) -> None:
+    if not task_id:
+        return
+    state = load_state()
+    cps = dict(state.get("task_checkpoints") or {})
+    cps[str(task_id)] = {
+        "task_id": str(task_id),
+        "payload": payload or {},
+        "ts": int(time.time()),
+    }
+    # Keep newest N checkpoints by timestamp
+    ordered = sorted(cps.items(), key=lambda kv: int((kv[1] or {}).get("ts") or 0), reverse=True)
+    trimmed = dict(ordered[:MAX_TASK_CHECKPOINTS])
+    state["task_checkpoints"] = trimmed
+    save_state(state)
+
+
+def get_task_checkpoint(task_id: str) -> Dict:
+    state = load_state()
+    cps = dict(state.get("task_checkpoints") or {})
+    return dict(cps.get(str(task_id)) or {})
+
+
+def list_task_checkpoints(limit: int = 20) -> List[Dict]:
+    state = load_state()
+    cps = dict(state.get("task_checkpoints") or {})
+    out = [dict(v or {}) for v in cps.values()]
+    out.sort(key=lambda x: int(x.get("ts") or 0), reverse=True)
+    return out[: max(1, int(limit))]
+
+
+def delete_task_checkpoint(task_id: str) -> None:
+    state = load_state()
+    cps = dict(state.get("task_checkpoints") or {})
+    cps.pop(str(task_id), None)
+    state["task_checkpoints"] = cps
+    save_state(state)

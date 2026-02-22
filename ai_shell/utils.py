@@ -18,6 +18,24 @@ def dbg(message: str):
         pass
 
 
+def tool_call_log(tool: str, args: dict):
+    """Write full tool call (name + args) to the debug log file and stderr so it appears in runtime-debug.log."""
+    max_len = 200
+    def _arg_repr(v):
+        s = repr(v)
+        return (s[:max_len] + "...") if len(s) > max_len else s
+    parts = [f"{k}={_arg_repr(v)}" for k, v in sorted((args or {}).items())]
+    line = f"[MOONLET] {tool}({', '.join(parts)})"
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    full_line = f"[tool_call] [{ts} pid={os.getpid()}] {line}"
+    print(full_line, file=sys.stderr)
+    try:
+        with open(config.DEBUG_LOG_PATH, "a") as f:
+            f.write(full_line + "\n")
+    except Exception:
+        pass
+
+
 def dbg_chat(message: str):
     """Log when SC2_DEBUG_CHAT=1. Use for chat prompt/context debugging."""
     if not getattr(config, "DEBUG_CHAT", False):

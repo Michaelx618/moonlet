@@ -30586,6 +30586,7 @@ ${contents.value}`;
   var activeTranscriptIndex = -1;
   var PANEL_TRANSCRIPT_LIMIT = 7;
   var PANEL_USER_TEXT_MAX_CHARS = 180;
+  var PANEL_ACTIONS_LIMIT = 24;
   var LAST_SELECTED_ROOT_KEY = "moonlet_last_selected_root_v1";
   var LAST_OPENED_FILE_BY_ROOT_KEY = "moonlet_last_opened_file_by_root_v1";
   var expandedUserTurnIds = /* @__PURE__ */ new Set();
@@ -31597,6 +31598,51 @@ ${contents.value}`;
     }
     return String(row.id);
   }
+  function normalizeActionText(item) {
+    if (!item) return "";
+    if (typeof item === "string") return item.trim();
+    const type = String(item.type || "").trim();
+    if (type === "tool_call") {
+      const tool = String(item.tool || "tool");
+      const args = item.args && typeof item.args === "object" ? item.args : {};
+      const path = String(args.path || args.filepath || "").trim();
+      const cmd2 = String(args.command || "").trim();
+      const pattern = String(args.pattern || "").trim();
+      const query = String(args.query || "").trim();
+      if (tool === "read_file") return path ? `Read ${path}` : "Read file";
+      if (tool === "list_files" || tool === "view_subdirectory") return path ? `List ${path}` : "List files";
+      if (tool === "grep" || tool === "grep_search") return pattern ? `Search: ${pattern.slice(0, 50)}${pattern.length > 50 ? "\u2026" : ""}` : "Search";
+      if (tool === "search_replace" || tool === "edit_existing_file") return path ? `Edit ${path}` : "Edit file";
+      if (tool === "write_file" || tool === "create_new_file") return path ? `Write ${path}` : "Write file";
+      if (tool === "multi_edit") return path ? `Edit ${path} (multiple)` : "Multi-edit";
+      if (tool === "run_terminal_cmd" || tool === "run_terminal_command") return cmd2 ? `Run: ${cmd2.slice(0, 48)}${cmd2.length > 48 ? "\u2026" : ""}` : "Run command";
+      if (tool === "symbols") return path ? `Symbols: ${path}` : "Symbols";
+      if (tool === "view_diff") return path ? `Diff: ${path}` : "View diff";
+      if (tool === "glob_file_search" || tool === "glob_search") return path ? `Glob: ${path}` : "Glob search";
+      if (tool === "codebase_search" || tool === "codebase_tool") return query ? `Codebase: ${query.slice(0, 40)}${query.length > 40 ? "\u2026" : ""}` : "Codebase search";
+      if (tool === "view_repo_map") return "Repo map";
+      return path ? `${tool}: ${path}` : tool;
+    }
+    if (type === "apply" || type === "reject") {
+      const path = String(item.path || "");
+      const reason = String(item.reason || "");
+      if (type === "apply") return path ? `Applied: ${path}` : "Applied action";
+      return reason ? `Rejected: ${path || "action"} (${reason})` : `Rejected: ${path || "action"}`;
+    }
+    return JSON.stringify(item).slice(0, 180);
+  }
+  function pushTurnAction(actionItem) {
+    if (activeTranscriptIndex < 0 || !panelTranscript[activeTranscriptIndex]) return;
+    const turn = panelTranscript[activeTranscriptIndex];
+    if (!Array.isArray(turn.actions)) turn.actions = [];
+    const text = normalizeActionText(actionItem);
+    if (!text) return;
+    if (turn.actions.includes(text)) return;
+    turn.actions.push(text);
+    if (turn.actions.length > PANEL_ACTIONS_LIMIT) {
+      turn.actions.splice(0, turn.actions.length - PANEL_ACTIONS_LIMIT);
+    }
+  }
   function renderTranscriptRows(rows, autoScroll = false) {
     const dataRows = Array.isArray(rows) ? rows.filter(Boolean).slice(-PANEL_TRANSCRIPT_LIMIT) : [];
     if (!dataRows.length) {
@@ -31619,8 +31665,10 @@ ${contents.value}`;
         );
       }
       if (assistant) {
+        const actions = Array.isArray(row.actions) ? row.actions : [];
+        const actionHtml = actions.length ? `<div class="panel-turn-actions" style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border, #333);font-size:0.9em;opacity:0.85;"><div class="panel-turn-actions-title" style="font-weight:600;margin-bottom:4px;">Tools used</div><div class="panel-turn-actions-body">${actions.map((a2) => `<div class="panel-turn-action-item">${esc(String(a2))}</div>`).join("")}</div></div>` : "";
         html2.push(
-          `<div class="panel-turn panel-turn-assistant"><div class="panel-turn-head"><span class="panel-role panel-role-assistant">Moonlet</span></div><div class="panel-turn-body">${esc(assistant)}</div></div>`
+          `<div class="panel-turn panel-turn-assistant"><div class="panel-turn-head"><span class="panel-role panel-role-assistant">Moonlet</span></div><div class="panel-turn-body">${esc(assistant)}</div>${actionHtml}</div>`
         );
       }
     }
@@ -31659,7 +31707,8 @@ ${contents.value}`;
         panelTranscript.push({
           id: `turn_${panelTurnSeq++}`,
           user: String(row && row.user || ""),
-          assistant: String(row && row.assistant || "")
+          assistant: String(row && row.assistant || ""),
+          actions: []
         });
       }
       activeTranscriptIndex = -1;
@@ -32094,15 +32143,6 @@ ${contents.value}`;
   var activeDiffHighlights = null;
   var preChangeContentByFile = {};
   window._perFileDiffs = window._perFileDiffs || {};
-  function showApplySummary(filePath) {
-    const path = filePath || currentFile || "";
-    const perFile = window._perFileDiffs && path ? window._perFileDiffs[path] : "";
-    const pending = window._pendingDiff || "";
-    const diff = perFile && perFile.trim() ? perFile : pending && pending.trim() ? pending : "";
-    const summary = diff ? summarizeDiff(diff, path) : path ? `${esc(path)} &middot; changes applied` : "Changes applied";
-    responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);"><strong>Applied</strong><div style="margin-top:6px;">${summary}</div></div>`;
-    responseEl.classList.add("has-content");
-  }
   function buildUnifiedDiffFromContents(path, beforeText, afterText) {
     const before = String(beforeText ?? "");
     const after = String(afterText ?? "");
@@ -32134,56 +32174,7 @@ ${contents.value}`;
     }
     return lines.join("\n");
   }
-  async function acceptChanges() {
-    const hasDiffContext = Boolean(
-      activeDiffHighlights || window._pendingDiff && window._pendingDiff.trim() || window._perFileDiffs && currentFile && window._perFileDiffs[currentFile] && window._perFileDiffs[currentFile].trim()
-    );
-    const hasPerFileStaged = window._perFileStaged && Object.keys(window._perFileStaged).length > 0;
-    if (hasPerFileStaged) {
-      const stagedPaths = Object.keys(window._perFileStaged);
-      const deletedPaths = /* @__PURE__ */ new Set();
-      for (const path of stagedPaths) {
-        const content2 = window._perFileStaged[path];
-        try {
-          await api("/file", { method: "POST", body: JSON.stringify({ path, content: content2 }) });
-          if (content2 === null) deletedPaths.add(path);
-        } catch (e) {
-          setStatus(`Failed to save ${path}`, "error");
-          return;
-        }
-      }
-      setStatus(`Changes accepted (${stagedPaths.length} file${stagedPaths.length !== 1 ? "s" : ""})`, "");
-      showApplySummary(currentFile);
-      window._perFileStaged = {};
-      if (window._perFileDiffs) {
-        for (const p of stagedPaths) delete window._perFileDiffs[p];
-      }
-      window._pendingDiff = null;
-      for (const p of stagedPaths) delete preChangeContentByFile[p];
-      if (deletedPaths.size > 0) {
-        renderExplorerList();
-        if (currentFile && deletedPaths.has(currentFile)) {
-          currentFile = null;
-          setViewerContent("");
-          showWelcome();
-          tabNameEl.textContent = "Welcome";
-          titleFilepath.textContent = "";
-          statusBarFileEl.textContent = "No file";
-        }
-      }
-    } else if (currentFile && hasDiffContext) {
-      await saveFile();
-      setStatus("Changes accepted", "");
-      showApplySummary(currentFile);
-      if (window._perFileDiffs) {
-        delete window._perFileDiffs[currentFile];
-      }
-      window._pendingDiff = null;
-      delete preChangeContentByFile[currentFile];
-    }
-    clearDiffHighlights();
-  }
-  async function rejectChanges() {
+  async function revertChanges() {
     const stagedPaths = window._perFileStaged ? Object.keys(window._perFileStaged) : [];
     let restored = 0;
     for (const p of stagedPaths) {
@@ -32202,7 +32193,7 @@ ${contents.value}`;
     }
     if (restored > 0) {
       markSaved();
-      setStatus(`Changes rejected \u2014 ${restored} file${restored !== 1 ? "s" : ""} restored`, "");
+      setStatus(`Reverted \u2014 ${restored} file${restored !== 1 ? "s" : ""} restored`, "");
     }
     for (const p of stagedPaths) {
       delete window._perFileDiffs?.[p];
@@ -32210,6 +32201,7 @@ ${contents.value}`;
     }
     if (window._perFileStaged) window._perFileStaged = {};
     window._pendingDiff = null;
+    document.getElementById("btnRepair").style.display = "none";
     clearDiffHighlights();
   }
   function applyDiffHighlights(diffText) {
@@ -32358,8 +32350,33 @@ ${contents.value}`;
       console.error(err);
     }
   }
+  async function requestRepair() {
+    const prompt = window._lastAgentPrompt;
+    const lastError = window._lastVerifyError;
+    const lastMeta = window._lastAgentMeta;
+    if (!prompt || !lastError || !lastMeta) {
+      setStatus("No repair context", "error");
+      return;
+    }
+    if (activeRequest) return;
+    const iteration = (lastMeta.iteration || 0) + 1;
+    window._repairPayload = {
+      text: prompt,
+      mode: "repair",
+      last_error: lastError,
+      previous_patches: lastMeta.previous_patches || [],
+      iteration
+    };
+    promptEl.value = "[Repairing...]";
+    await sendPrompt();
+  }
   async function sendPrompt() {
-    const rawText = promptEl.value.trim();
+    let rawText = promptEl.value.trim();
+    const useRepairPayload = window._repairPayload;
+    if (useRepairPayload) {
+      rawText = useRepairPayload.text || "";
+      delete window._repairPayload;
+    }
     if (!rawText || activeRequest) return;
     if (!await ensureServerReadyNow()) {
       setStatus("Server not ready", "error");
@@ -32368,8 +32385,7 @@ ${contents.value}`;
       return;
     }
     const text = rawText;
-    if (!text || activeRequest) return;
-    if (activeDiffHighlights || window._pendingDiff && window._pendingDiff.trim() || window._perFileStaged && Object.keys(window._perFileStaged).length > 0) {
+    if (!useRepairPayload && (activeDiffHighlights || window._pendingDiff && window._pendingDiff.trim() || window._perFileStaged && Object.keys(window._perFileStaged).length > 0)) {
       await rejectChanges();
     }
     const preRequestFile = currentFile || "";
@@ -32382,7 +32398,7 @@ ${contents.value}`;
     setStatus("Thinking...", "busy");
     modelRunning = true;
     startTimer();
-    const turn = { id: `turn_${panelTurnSeq++}`, user: text, assistant: "..." };
+    const turn = { id: `turn_${panelTurnSeq++}`, user: text, assistant: "...", actions: [] };
     panelTranscript.push(turn);
     if (panelTranscript.length > PANEL_TRANSCRIPT_LIMIT) {
       panelTranscript.splice(0, panelTranscript.length - PANEL_TRANSCRIPT_LIMIT);
@@ -32447,7 +32463,7 @@ ${contents.value}`;
       }
       return;
     }
-    const selectedMode = modeEl.value || "agent";
+    const selectedMode = useRepairPayload ? "repair" : modeEl.value || "agent";
     let firstChunk = true;
     let rawResponseBuf = "";
     let responseThrottleTimer = null;
@@ -32468,7 +32484,7 @@ ${contents.value}`;
       responseEl.classList.add("has-content");
     }
     try {
-      const payload = { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
+      const payload = useRepairPayload ? { ...useRepairPayload, focus_file: currentFile, file_path: currentFile } : { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
       const controller = new AbortController();
       activeRequest = controller;
       const res = await fetch(API_BASE + "/stream", {
@@ -32518,9 +32534,34 @@ ${contents.value}`;
             responseThrottleTimer = null;
           }
           if (rawResponseBuf && !metaSummaryLocked) flushResponse();
+        } else if (event === "action") {
+          try {
+            const actionData = JSON.parse(data2);
+            pushTurnAction(actionData);
+            renderPanelTranscript();
+          } catch (_) {
+          }
         } else if (event === "meta") {
           try {
             const d = JSON.parse(data2);
+            if (Array.isArray(d.agent_actions)) {
+              for (const act of d.agent_actions) {
+                pushTurnAction(act);
+              }
+            }
+            const coreActions = d.core_v2_actions || {};
+            const applied = Array.isArray(coreActions.applied) ? coreActions.applied : [];
+            const rejected = Array.isArray(coreActions.rejected) ? coreActions.rejected : [];
+            for (const item of applied) {
+              pushTurnAction({ type: "apply", path: item && item.path ? item.path : "", reason: "" });
+            }
+            for (const item of rejected) {
+              pushTurnAction({
+                type: "reject",
+                path: item && item.path ? item.path : "",
+                reason: item && item.reason ? item.reason : ""
+              });
+            }
             stopTimer("done");
             const isChatMode = (selectedMode || "").toLowerCase() === "chat";
             if (isChatMode && (d.staged || d.per_file_staged && Object.keys(d.per_file_staged).length > 0)) {
@@ -32536,8 +32577,8 @@ ${contents.value}`;
             const noopRun = Boolean(d.noop) || String(d.output || "").startsWith("[No-op file_edit:");
             pendingMetaFocusFile = String(d.focus_file || currentFile || "");
             let renderedMetaSummary = false;
-            if (d.files_changed && d.files_changed.length > 0) {
-              const fc = d.files_changed;
+            const fc = d.files_changed && d.files_changed.length > 0 ? d.files_changed : d.per_file_staged && Object.keys(d.per_file_staged).length > 0 ? Object.keys(d.per_file_staged) : [];
+            if (fc.length > 0) {
               const explanation2 = (d.explanation || d.output || rawResponseBuf || "").trim();
               let html2 = "";
               if (explanation2) {
@@ -32567,12 +32608,16 @@ ${contents.value}`;
               let diffKey = currentFile && d.per_file_diffs ? Object.keys(d.per_file_diffs).find(
                 (k) => k === currentFile || k.split("/").pop() === base2
               ) : null;
-              if (diffKey && d.per_file_diffs[diffKey]) {
-                window._pendingDiff = d.per_file_diffs[diffKey];
+              const pd = d.per_file_diffs || {};
+              if (diffKey && pd[diffKey]) {
+                window._pendingDiff = pd[diffKey];
               } else if (d.diff && d.diff.trim()) {
                 window._pendingDiff = d.diff;
-              } else if (stagedPath && d.per_file_diffs && d.per_file_diffs[stagedPath]) {
-                window._pendingDiff = d.per_file_diffs[stagedPath];
+              } else if (stagedPath && pd[stagedPath]) {
+                window._pendingDiff = pd[stagedPath];
+              } else if (Object.keys(pd).length > 0) {
+                const firstKey = Object.keys(pd).find((k) => k.split("/").pop() === (stagedPath && stagedPath.split("/").pop()) || !stagedPath);
+                window._pendingDiff = pd[firstKey || Object.keys(pd)[0]];
               }
               if (window._pendingDiff) {
                 document.getElementById("diffActions").style.display = "flex";
@@ -32665,6 +32710,12 @@ ${contents.value}`;
                   renderPanelTranscript();
                 }
               }
+            } else if (activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
+              const explanation2 = (d.explanation || d.output || "").trim();
+              if (explanation2) {
+                panelTranscript[activeTranscriptIndex].assistant = explanation2;
+                renderPanelTranscript();
+              }
             }
             const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
             let stagedContent = d.per_file_staged && currentFile && d.per_file_staged[currentFile] ? d.per_file_staged[currentFile] : d.staged_content !== void 0 ? d.staged_content : void 0;
@@ -32700,8 +32751,9 @@ ${contents.value}`;
             if (!renderedMetaSummary && (d.staged || d.per_file_staged && Object.keys(d.per_file_staged).length > 0)) {
               const explanation2 = (d.explanation || d.output || rawResponseBuf || "").trim();
               const stagedFiles = d.per_file_staged ? Object.keys(d.per_file_staged) : d.staged_file ? [d.staged_file] : [];
-              const stagedMsg = stagedFiles.length > 1 ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.` : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`;
-              responseEl.innerHTML = explanation2 ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation2)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>` : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${stagedMsg}</div>`;
+              const appliedDirectly = d.applied_directly === true;
+              const msg = appliedDirectly ? stagedFiles.length > 1 ? `Changes applied to ${stagedFiles.length} files. Use Ctrl+Z to undo or click Revert.` : `Changes applied. Use Ctrl+Z to undo or click Revert.` : stagedFiles.length > 1 ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.` : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`;
+              responseEl.innerHTML = explanation2 ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation2)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>` : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>`;
               responseEl.classList.add("has-content");
               rawResponseBuf = "";
               renderedMetaSummary = true;
@@ -32711,6 +32763,14 @@ ${contents.value}`;
             }
             if (d.staged_content !== void 0 && d.staged_file) {
               window._perFileStaged = { ...window._perFileStaged || {}, [d.staged_file]: d.staged_content };
+            }
+            if ((d.mode_used === "pipeline" || d.mode_used === "pipeline_repair" || d.mode_used === "continue_agent") && (d.touched?.length > 0 || d.per_file_staged)) {
+              window._lastAgentPrompt = text;
+              window._lastAgentMeta = d;
+              document.getElementById("btnRepair").style.display = "none";
+            }
+            if (d.failure_kind === "max_iterations") {
+              document.getElementById("btnRepair").style.display = "none";
             }
           } catch {
           }
@@ -32843,6 +32903,7 @@ ${contents.value}`;
       if (rawResponseBuf && firstChunk === false && !metaSummaryLocked) flushResponse();
       activeRequest = null;
       modelRunning = false;
+      document.getElementById("send").disabled = false;
     }
   }
   promptEl.addEventListener("input", () => {
@@ -32962,6 +33023,14 @@ ${contents.value}`;
     handleTerminalInputData(data2);
   }
   document.addEventListener("keydown", (e) => {
+    if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+      const hasRevertable = window._perFileStaged && Object.keys(window._perFileStaged).length > 0;
+      if (hasRevertable) {
+        e.preventDefault();
+        revertChanges();
+        return;
+      }
+    }
     handleFallbackTerminalKeydown(e);
   });
   filesEl.addEventListener("contextmenu", (e) => {
@@ -33260,8 +33329,9 @@ ${contents.value}`;
     }
     void lspClient.stop();
   });
-  document.getElementById("btnApply").onclick = acceptChanges;
-  document.getElementById("btnReject").onclick = rejectChanges;
+  document.getElementById("btnRevert").onclick = revertChanges;
+  var btnRepair = document.getElementById("btnRepair");
+  if (btnRepair) btnRepair.onclick = () => requestRepair();
   (function() {
     const panel = document.getElementById("centerTerminal");
     if (!panel || !terminalResizeHandle) return;

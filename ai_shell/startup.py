@@ -14,12 +14,7 @@ def main():
     # Start each app launch with a fresh chat session.
     try:
         from . import state
-        from . import agent
         state.clear_chat_session()
-        try:
-            agent.agent_history.clear()
-        except Exception:
-            pass
         print("[Started new chat session]", file=sys.stderr)
     except Exception:
         pass
@@ -35,8 +30,8 @@ def main():
     try:
         from .index import rebuild_index
         rebuild_index()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[index: startup rebuild failed — {e}]", file=sys.stderr)
 
     try:
         start_server()

@@ -6,6 +6,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -14,6 +15,12 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from . import config
+from .model_roles import resolve_role_config
+from .model_providers import (
+    CliProviderAdapter,
+    PythonProviderAdapter,
+    ServerProviderAdapter,
+)
 from .utils import dbg
 
 
@@ -27,6 +34,7 @@ class _LlamaServerBackend:
         ctx: int,
         threads: int,
         gpu_layers: int,
+        use_chat_tools: bool = False,
     ):
         self.model_path = model_path
         self.server_bin = server_bin
@@ -35,10 +43,35 @@ class _LlamaServerBackend:
         self.ctx = max(512, int(ctx or 4096))
         self.threads = max(1, int(threads or 1))
         self.gpu_layers = int(gpu_layers)
+        self.use_chat_tools = bool(use_chat_tools)
         self.proc: Optional[subprocess.Popen] = None
         self._start_lock = threading.Lock()
         self.base_url = f"http://{self.host}:{self.port}"
         atexit.register(self.stop)
+
+    def clear_kv_cache(self) -> None:
+        """Clear all KV cache slots by sending a zero-length request to each."""
+        if not self._is_healthy():
+            return
+        slots_count = max(1, int(getattr(config, "LLAMA_SERVER_CACHE_SLOTS", 32)))
+        for slot_id in range(slots_count):
+            try:
+                payload = json.dumps({
+                    "prompt": "",
+                    "n_predict": 0,
+                    "cache_prompt": False,
+                    "id_slot": slot_id,
+                }).encode()
+                req = urllib_request.Request(
+                    self.base_url + "/completion",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib_request.urlopen(req, timeout=2)
+            except Exception:
+                pass
+        dbg("llama-server: KV cache cleared")
 
     def stop(self) -> None:
         proc = self.proc
@@ -124,20 +157,45 @@ class _LlamaServerBackend:
             ]
             if self.gpu_layers is not None:
                 cmd.extend(["--n-gpu-layers", str(self.gpu_layers)])
+            if self.use_chat_tools:
+                cmd.extend(["--jinja", "--chat-template", "chatml"])
             cmd.extend(["--no-warmup"])
 
             dbg(f"llama-server start: {' '.join(cmd)}")
-            self.proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=False,
-            )
+            stderr_fd = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
+            stderr_path = stderr_fd.name
+            try:
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_fd,
+                    text=True,
+                )
+            except Exception:
+                stderr_fd.close()
+                os.unlink(stderr_path)
+                raise
+            stderr_fd.close()  # parent's copy; child has its own fd
 
             deadline = time.time() + max(15, int(config.LLAMA_SERVER_START_TIMEOUT))
             while time.time() < deadline:
                 if self.proc and self.proc.poll() is not None:
-                    raise RuntimeError("llama-server exited during startup")
+                    err_msg = "(no stderr)"
+                    try:
+                        with open(stderr_path, "r") as f:
+                            err_msg = f.read().strip() or err_msg
+                    except Exception:
+                        pass
+                    try:
+                        os.unlink(stderr_path)
+                    except Exception:
+                        pass
+                    if len(err_msg) > 500:
+                        err_msg = err_msg[:500] + "..."
+                    raise RuntimeError(
+                        f"llama-server exited during startup (code={self.proc.returncode}). "
+                        f"stderr: {err_msg}"
+                    )
                 if self._is_healthy() or self._port_open():
                     # Give HTTP endpoint one more moment after port binds.
                     time.sleep(0.15)
@@ -218,6 +276,44 @@ class _LlamaServerBackend:
                         return msg.get("content", "")
         raise RuntimeError("llama-server response missing completion content")
 
+    def chat_completion_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        max_tokens: int = 2048,
+        temperature: float = 0.1,
+        top_p: float = 0.9,
+        timeout_s: int = 300,
+    ) -> Dict[str, Any]:
+        """Call /v1/chat/completions with tools. Returns full response (choices, tool_calls, etc.)."""
+        self.ensure_started()
+        payload = {
+            "model": "gpt-3.5-turbo",
+            "messages": messages,
+            "tools": tools,
+            "n_predict": max(1, int(max_tokens)),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "stream": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(
+            self.base_url + "/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=max(1, int(timeout_s))) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+            raise RuntimeError(f"llama-server HTTP {getattr(exc, 'code', '?')}: {detail[:500]}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"llama-server returned invalid JSON: {exc}")
+
 
 class _CliBackend:
     def __init__(self, model_path: str, ctx: int, threads: int, cli_bin: str):
@@ -275,6 +371,7 @@ class _CliBackend:
 
 _BACKEND_NAME = "unknown"
 _BACKEND_KIND = "unknown"
+_PROVIDER: Optional[object] = None
 
 
 def _find_llama_server_binary() -> Optional[str]:
@@ -341,7 +438,7 @@ def _find_cli_binary() -> Optional[str]:
 
 def load_model() -> Tuple[Optional[object], object]:
     """Load GGUF backend (llama-server, python binding, or CLI fallback)."""
-    global _BACKEND_NAME, _BACKEND_KIND
+    global _BACKEND_NAME, _BACKEND_KIND, _PROVIDER
     if not config.GGUF_PATH:
         raise SystemExit(
             "Set SC2_GGUF to a .gguf file path (and install llama-cpp-python)."
@@ -362,6 +459,8 @@ def load_model() -> Tuple[Optional[object], object]:
             f"[  endpoint: http://{config.LLAMA_SERVER_HOST}:{config.LLAMA_SERVER_PORT}]",
             file=sys.stderr,
         )
+        if getattr(config, "USE_CHAT_TOOLS", False):
+            print("[  use_chat_tools: true (direct tool calls, --jinja)]", file=sys.stderr)
         _BACKEND_NAME = "gguf-server"
         _BACKEND_KIND = "gguf_server"
         backend = _LlamaServerBackend(
@@ -372,10 +471,12 @@ def load_model() -> Tuple[Optional[object], object]:
             ctx=config.GGUF_CTX,
             threads=config.GGUF_THREADS,
             gpu_layers=config.GGUF_GPU_LAYERS,
+            use_chat_tools=getattr(config, "USE_CHAT_TOOLS", False),
         )
         # Start once at boot so model remains loaded and ready for requests.
         backend.ensure_started()
         print(f"[  llama-server ready: {backend.base_url}]", file=sys.stderr)
+        _PROVIDER = ServerProviderAdapter(backend)
         return None, backend
 
     if prefer_cli and cli_bin:
@@ -384,7 +485,8 @@ def load_model() -> Tuple[Optional[object], object]:
         print(f"[  cli: {cli_bin}]", file=sys.stderr)
         _BACKEND_NAME = "gguf-cli"
         _BACKEND_KIND = "gguf_cli"
-        return None, _CliBackend(config.GGUF_PATH, config.GGUF_CTX, config.GGUF_THREADS, cli_bin)
+        _PROVIDER = CliProviderAdapter(_CliBackend(config.GGUF_PATH, config.GGUF_CTX, config.GGUF_THREADS, cli_bin))
+        return None, _PROVIDER.backend
 
     try:
         from llama_cpp import Llama  # type: ignore
@@ -396,7 +498,8 @@ def load_model() -> Tuple[Optional[object], object]:
             )
             _BACKEND_NAME = "gguf-cli"
             _BACKEND_KIND = "gguf_cli"
-            return None, _CliBackend(config.GGUF_PATH, config.GGUF_CTX, config.GGUF_THREADS, cli_bin)
+            _PROVIDER = CliProviderAdapter(_CliBackend(config.GGUF_PATH, config.GGUF_CTX, config.GGUF_THREADS, cli_bin))
+            return None, _PROVIDER.backend
         raise SystemExit("Install with: pip install llama-cpp-python") from exc
 
     print(f"[Loading GGUF model: {model_name}]", file=sys.stderr)
@@ -416,6 +519,7 @@ def load_model() -> Tuple[Optional[object], object]:
     )
     _BACKEND_NAME = "gguf"
     _BACKEND_KIND = "gguf_python"
+    _PROVIDER = PythonProviderAdapter(llm)
     return None, llm
 
 
@@ -429,16 +533,44 @@ def backend_name() -> str:
     return _BACKEND_NAME
 
 
+def chat_completion_with_tools(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    max_tokens: int = 2048,
+    temperature: float = 0.1,
+    top_p: float = 0.9,
+) -> Dict[str, Any]:
+    """Call chat completions with tools. Only works with gguf_server backend."""
+    if _BACKEND_KIND != "gguf_server" or not hasattr(model, "chat_completion_with_tools"):
+        raise RuntimeError("chat_completion_with_tools requires llama-server with USE_CHAT_TOOLS")
+    with MODEL_LOCK:
+        return model.chat_completion_with_tools(
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            timeout_s=config.GEN_TIMEOUT,
+        )
+
+
+def clear_kv_cache(model: Any = None) -> None:
+    """Clear the llama-server KV cache. Call on app shutdown."""
+    if _PROVIDER and hasattr(_PROVIDER, "clear_cache"):
+        _PROVIDER.clear_cache()
+    elif _BACKEND_KIND == "gguf_server" and hasattr(model, "clear_kv_cache"):
+        model.clear_kv_cache()
+    else:
+        dbg("clear_kv_cache: not using gguf_server, nothing to clear")
+
+
 def backend_status() -> Dict[str, Any]:
     info: Dict[str, Any] = {"backend": _BACKEND_NAME, "kind": _BACKEND_KIND}
-    if _BACKEND_KIND == "gguf_server" and isinstance(model, _LlamaServerBackend):
-        proc = model.proc
-        info["llama_server"] = {
-            "base_url": model.base_url,
-            "healthy": bool(model._is_healthy(timeout=0.25)),
-            "port_open": bool(model._port_open()),
-            "pid": int(proc.pid) if (proc and proc.poll() is None) else None,
-        }
+    if _PROVIDER and hasattr(_PROVIDER, "status"):
+        try:
+            info["provider"] = _PROVIDER.status()
+        except Exception:
+            pass
     return info
 
 
@@ -469,6 +601,7 @@ def _stream_reply_cli(
     cache_key: str = "",
 ) -> str:
     _ = cache_key
+    prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
     dbg(f"stream_reply: gguf-cli prompt_len={len(prompt)}")
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
     dbg(f"stream_reply: gguf-cli max_new={capped_max_new}")
@@ -524,6 +657,30 @@ def _stream_reply_cli(
     return reply
 
 
+def _wrap_chatml(prompt: str, stop_sequences: Optional[List[str]]) -> Tuple[str, List[str]]:
+    """Wrap a raw prompt in chatml tags for chat-finetuned models.
+
+    Returns (wrapped_prompt, updated_stop_sequences).
+    """
+    if not getattr(config, "USE_CHATML_WRAP", False):
+        return prompt, list(stop_sequences or [])
+    if "<|im_start|>" in prompt:
+        return prompt, list(stop_sequences or [])
+    wrapped = (
+        "<|im_start|>system\n"
+        "You are a coding assistant. Output only the requested code or tool calls. No explanations.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        + prompt
+        + "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    stops = list(stop_sequences or [])
+    if "<|im_end|>" not in stops:
+        stops.append("<|im_end|>")
+    return wrapped, stops
+
+
 def _stream_reply_server(
     prompt: str,
     label: str,
@@ -533,6 +690,7 @@ def _stream_reply_server(
     temperature: Optional[float],
     cache_key: str = "",
 ) -> str:
+    prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
     dbg(f"stream_reply: gguf-server prompt_len={len(prompt)}")
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
     dbg(f"stream_reply: gguf-server max_new={capped_max_new}")
@@ -598,8 +756,16 @@ def stream_reply(
     stop_sequences: Optional[List[str]] = None,
     temperature: Optional[float] = None,
     cache_key: str = "",
+    role: str = "chat",
 ) -> str:
     """Stream model output while returning full text."""
+    role_cfg = resolve_role_config(role)
+    if max_new <= 0:
+        max_new = int(role_cfg.max_new)
+    if temperature is None:
+        temperature = float(role_cfg.temperature)
+    if not stop_sequences:
+        stop_sequences = list(role_cfg.stop_sequences)
     if _BACKEND_KIND == "gguf_server":
         return _stream_reply_server(
             prompt,
@@ -621,6 +787,7 @@ def stream_reply(
             cache_key,
         )
 
+    prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
     dbg(f"stream_reply: gguf prompt_len={len(prompt)}")
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
     dbg(f"stream_reply: gguf max_new={capped_max_new}")
@@ -768,8 +935,17 @@ def stream_reply_chunks(
     stop_sequences: Optional[List[str]] = None,
     temperature: Optional[float] = None,
     cache_key: str = "",
+    role: str = "chat",
 ) -> Iterator[str]:
     """Yield model output chunks for streaming to clients."""
+    role_cfg = resolve_role_config(role)
+    if max_new <= 0:
+        max_new = int(role_cfg.max_new)
+    if temperature is None:
+        temperature = float(role_cfg.temperature)
+    if not stop_sequences:
+        stop_sequences = list(role_cfg.stop_sequences)
+    prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
     temp = config.TEMPERATURE if temperature is None else temperature
 

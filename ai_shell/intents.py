@@ -182,6 +182,34 @@ def _detect_language_ext(text: str, fallback: str = ".py") -> str:
     return fallback
 
 
+def extract_identifier_tokens(text: str) -> List[str]:
+    """Extract identifier-like tokens (potential function/class names) from spec text.
+
+    Used for function-call discovery: grep for these tokens to find defining files.
+    Skips common English words and very short tokens.
+    """
+    if not text:
+        return []
+    _STOP = {
+        "the", "and", "for", "with", "from", "this", "that", "all", "you", "your",
+        "new", "class", "function", "method", "file", "code", "make", "fix", "edit",
+        "update", "implement", "complete", "add", "change", "modify", "create",
+        "task", "lab", "submit", "download", "please", "ensure", "note", "see",
+        "both", "each", "every", "them", "well", "also", "too", "start", "stop",
+    }
+    # Match camelCase, snake_case, or multi-word identifiers (3+ chars)
+    tokens = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", text or "")
+    seen: set = set()
+    out: List[str] = []
+    for t in tokens:
+        low = t.lower()
+        if low in _STOP or low in seen:
+            continue
+        seen.add(low)
+        out.append(t)
+    return out[:12]  # Cap to avoid excessive grep
+
+
 def classify_reference_files(user_text: str, files: List[str]) -> List[str]:
     """Classify which files are reference (read-only context) vs focus (to edit).
     Uses prompt semantics: read/run/try/compile -> reference; modify/edit/update -> focus.

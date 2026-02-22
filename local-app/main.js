@@ -24,6 +24,7 @@ let ptyBackendsLoaded = false;
 
 const repoRoot = path.join(__dirname, "..");
 let serverProc = null;
+let serverPort = null;
 let terminalProc = null;
 let terminalPty = null;
 let mainWindow = null;
@@ -210,6 +211,65 @@ async function startServer() {
     SC2_LLAMA_SERVER_PORT: String(
       cfg.llamaServerPort || process.env.SC2_LLAMA_SERVER_PORT || 8012
     ),
+    SC2_PIPELINE_IMPL: String(
+      cfg.pipelineImpl || process.env.SC2_PIPELINE_IMPL || "rail_v3"
+    ),
+    SC2_USE_CORE_V2: String(
+      cfg.useCoreV2 !== undefined
+        ? cfg.useCoreV2
+        : process.env.SC2_USE_CORE_V2 || 1
+    ),
+    SC2_MODEL_PROFILE: String(
+      cfg.modelProfile || process.env.SC2_MODEL_PROFILE || "auto"
+    ),
+    SC2_USE_CHATML_WRAP: String(
+      cfg.useChatmlWrap !== undefined
+        ? cfg.useChatmlWrap
+        : process.env.SC2_USE_CHATML_WRAP || 1
+    ),
+    ...(cfg.usePipeline === false ? { SC2_USE_STATE_MACHINE_PIPELINE: "false" } : {}),
+    SC2_USE_LEGACY_PIPELINE: String(
+      cfg.useLegacyPipeline !== undefined
+        ? cfg.useLegacyPipeline
+        : process.env.SC2_USE_LEGACY_PIPELINE || 0
+    ),
+    SC2_USE_CHAT_TOOLS: cfg.useChatTools ? "1" : "0",
+    SC2_APPROVAL_MODE: String(
+      cfg.approvalMode !== undefined
+        ? cfg.approvalMode
+        : process.env.SC2_APPROVAL_MODE || 1
+    ),
+    SC2_AUTO_APPLY_ON_SUCCESS: String(
+      cfg.autoApplyOnSuccess !== undefined
+        ? cfg.autoApplyOnSuccess
+        : process.env.SC2_AUTO_APPLY_ON_SUCCESS || 1
+    ),
+    SC2_USE_CONTINUE_BRIDGE: String(
+      cfg.useContinueBridge !== undefined
+        ? cfg.useContinueBridge
+        : process.env.SC2_USE_CONTINUE_BRIDGE || 0
+    ),
+    SC2_CONTINUE_CLI_CMD: String(
+      cfg.continueCliCmd || process.env.SC2_CONTINUE_CLI_CMD || ""
+    ),
+    SC2_CONTINUE_NODE_BIN: String(
+      cfg.continueNodeBin || process.env.SC2_CONTINUE_NODE_BIN || "node"
+    ),
+    SC2_CONTINUE_TIMEOUT_S: String(
+      cfg.continueTimeoutS || process.env.SC2_CONTINUE_TIMEOUT_S || 180
+    ),
+    SC2_CONTINUE_PRINT_FORMAT: String(
+      cfg.continuePrintFormat || process.env.SC2_CONTINUE_PRINT_FORMAT || ""
+    ),
+    SC2_CONTINUE_SILENT_PRINT: String(
+      cfg.continueSilentPrint !== undefined
+        ? cfg.continueSilentPrint
+        : process.env.SC2_CONTINUE_SILENT_PRINT || 0
+    ),
+    SC2_CONTINUE_GLOBAL_DIR: String(
+      cfg.continueGlobalDir || process.env.SC2_CONTINUE_GLOBAL_DIR || ""
+    ),
+    ...(cfg.verifyCommand ? { SC2_VERIFY_CMD: String(cfg.verifyCommand) } : {}),
   };
 
   const script = path.join(repoRoot, "main.py");
@@ -336,6 +396,7 @@ app.whenReady().then(async () => {
   app.setName("Moonlet");
 
   const port = await startServer();
+  serverPort = port;
   createWindow(port);
   lspMain = createClangdMain({
     sendToRenderer,
@@ -656,8 +717,24 @@ app.whenReady().then(async () => {
 });
 
 app.on("before-quit", () => {
+  // Clear llama-server KV cache before shutdown
+  if (serverPort) {
+    try {
+      const http = require("http");
+      const req = http.get(`http://127.0.0.1:${serverPort}/clear-cache`, () => {});
+      req.on("error", () => {});
+      req.end();
+    } catch (_) {}
+  }
   if (serverProc) {
     serverProc.kill();
+    // Ensure llama-server (child of Python) is killed; it can orphan when parent dies
+    try {
+      require("child_process").spawnSync("pkill", ["-f", "llama-server"], {
+        stdio: "ignore",
+        timeout: 2000,
+      });
+    } catch (_) {}
   }
   if (lspMain) {
     try { lspMain.stopAll(); } catch (_) {}

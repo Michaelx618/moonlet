@@ -1,0 +1,9 @@
+root must be an existing directory
+
+Traceback (most recent call last):
+  File "/Users/michael/moonlet/ai_shell/server.py", line 634, in do_POST
+    root = set_root(new_root)
+           ^^^^^^^^^^^^^^^^^^
+  File "/Users/michael/moonlet/ai_shell/files.py", line 273, in set_root
+    raise ValueError("root must be an existing directory")
+ValueError: root must be an existing directory

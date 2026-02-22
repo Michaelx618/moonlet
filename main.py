@@ -1,5 +1,4 @@
-from ai_shell.startup import main
-
-
 if __name__ == "__main__":
-    main()
+    from ai_shell.startup import main as server_main
+
+    server_main()

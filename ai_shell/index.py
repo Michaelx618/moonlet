@@ -5,6 +5,7 @@ Provides a stable list of files the agent can access via tools (grep, symbols, r
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -29,6 +30,8 @@ _symbol_cache_max_files: int = 50  # cap cache size
 def _list_editable_files(max_files: int = 200) -> List[str]:
     """List editable files in repo, respecting include filter."""
     root = get_root()
+    if not root.exists() or not root.is_dir():
+        return []
     include = get_include()
     files: List[str] = []
     seen: Set[str] = set()
@@ -76,10 +79,20 @@ def _list_editable_files(max_files: int = 200) -> List[str]:
 def rebuild_index() -> List[str]:
     """Rebuild the file index. Call when root or include changes."""
     global _indexed_files, _symbol_cache
-    _indexed_files = _list_editable_files()
-    _symbol_cache.clear()
-    dbg(f"index: rebuilt, {len(_indexed_files)} files")
-    return _indexed_files
+    try:
+        root = get_root()
+        include = get_include()
+        _indexed_files = _list_editable_files()
+        _symbol_cache.clear()
+        # Log so user can see why 200 vs 4: first build = full repo root; later = after set_include/set_root (e.g. task folder)
+        include_info = f" include={len(include)} path(s)" if include else " include=none (full tree)"
+        dbg(f"index: rebuilt, {len(_indexed_files)} files root={root}{include_info}")
+        return _indexed_files
+    except Exception as e:
+        _indexed_files = []
+        _symbol_cache.clear()
+        print(f"[index: rebuild failed — {e}]", file=sys.stderr)
+        return _indexed_files
 
 
 def get_indexed_files() -> List[str]:

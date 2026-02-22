@@ -1,0 +1,5 @@
+{
+  "focus_file": "checkpasswd.c",
+  "extra_read_files": ["validate.c"],
+  "success_criterion": { "stdout_contains": "Password verified" }
+}

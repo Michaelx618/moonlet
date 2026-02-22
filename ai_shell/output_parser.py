@@ -4,6 +4,7 @@ Tries in order: unified diff, [[[file: path]]] blocks, markdown code blocks.
 Returns List[Tuple[path, content]] for apply_blocks, or (path, hunks) for diff apply.
 """
 
+import json as json_mod
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -140,7 +141,7 @@ def _reformat_oneliner_code_block(block: str) -> str:
 def _infer_path_from_reply_text(
     output: str, block_start: int, block_end: int, candidate_paths: Optional[List[str]] = None
 ) -> Optional[str]:
-    """Infer target file from surrounding reply text (e.g. 'the `checkpasswd.c` file')."""
+    """Infer target file from surrounding reply text (e.g. 'the `foo.c` file')."""
     if not output or not candidate_paths:
         return None
     # Look at text before and after the code block
@@ -148,7 +149,7 @@ def _infer_path_from_reply_text(
     after = output[block_end:]
     context = f"{before} {after}"
     candidates = [_norm_rel_path(p) for p in candidate_paths]
-    # Backtick-quoted filenames: `checkpasswd.c`, `w7/checkpasswd.c`
+    # Backtick-quoted filenames: `foo.c`, `src/foo.c`
     for m in re.finditer(r"`([A-Za-z0-9_./-]+)`", context):
         mention = (m.group(1) or "").strip()
         if not mention or mention.lower() in ("c", "cpp", "py", "diff"):
@@ -162,7 +163,7 @@ def _infer_path_from_reply_text(
         for c in candidates:
             if c.endswith(mention) or c.split("/")[-1] == mention:
                 return c
-    # Bare filename in context (e.g. "checkpasswd.c" in "To complete the checkpasswd.c file")
+    # Bare filename in context (e.g. "foo.c" in "To complete the foo.c file")
     for c in candidates:
         base = c.split("/")[-1]
         if base and re.search(r"\b" + re.escape(base) + r"\b", context):
@@ -177,7 +178,7 @@ def extract_markdown_blocks(output: str) -> List[Tuple[str, str]]:
     text = (output or "").replace("\r\n", "\n").replace("\r", "\n")
     blocks: List[Tuple[str, str]] = []
 
-    # Pattern 1: ```path, ```file: path, or ```lang:path (e.g. ```c:checkpasswd.c)
+    # Pattern 1: ```path, ```file: path, or ```lang:path (e.g. ```c:foo.c)
     # Accept optional newline after fence (model may emit one-liner)
     pat1 = re.compile(
         r"```(?:file:\s*)?([A-Za-z0-9_:./-]+)\s*(?:\n)?(.*?)(?=\n```|```|\Z)",
@@ -190,10 +191,13 @@ def extract_markdown_blocks(output: str) -> List[Tuple[str, str]]:
             continue
         if body.count("\n") < 3 and ("#include" in body or "#define" in body or "def " in body):
             body = _reformat_oneliner_code_block(body)
-        # Skip "diff" — that's a unified diff block, not a filename
-        if path_part.lower() == "diff":
+        # Skip language tags that aren't filenames
+        if path_part.lower() in ("diff", "json", "yaml", "yml", "xml", "html", "css",
+                                  "bash", "sh", "shell", "text", "txt", "markdown", "md",
+                                  "makefile", "cmake", "toml", "ini", "cfg", "log",
+                                  "sql", "graphql", "proto", "csv"):
             continue
-        # Handle ```lang:path (e.g. ```c:checkpasswd.c) — use path after colon
+        # Handle ```lang:path (e.g. ```c:foo.c) — use path after colon
         if ":" in path_part:
             path_part = path_part.split(":", 1)[-1].strip()
         # Skip if path_part is a bare lang tag (c, cpp, etc.) — pattern 2 handles those
@@ -249,7 +253,7 @@ def extract_markdown_lang_only_blocks(
             body = _reformat_oneliner_code_block(body)
             dbg("output_parser: reformatted one-liner code block")
         path = _infer_path_from_code(body)
-        # Infer from surrounding reply text (e.g. "the `checkpasswd.c` file")
+        # Infer from surrounding reply text (e.g. "the `foo.c` file")
         if not path and candidate_paths:
             path = _infer_path_from_reply_text(text, m.start(), m.end(), candidate_paths)
         # Only use single candidate when no other signal — never guess from list order
@@ -314,6 +318,8 @@ def parse_flexible_output(
         blocks = extract_markdown_blocks(output)
     if not blocks:
         blocks = extract_markdown_lang_only_blocks(output, candidate_paths)
+    if not blocks:
+        blocks = _extract_json_code_blocks(output, candidate_paths)
     if blocks:
         resolved = [
             (_resolve_path_with_candidates(p, candidate_paths), c) for p, c in blocks
@@ -321,6 +327,37 @@ def parse_flexible_output(
         return "blocks", None, resolved
 
     return None, None, None
+
+
+def _extract_json_code_blocks(
+    output: str, candidate_paths: Optional[List[str]] = None
+) -> List[Tuple[str, str]]:
+    """Extract code from JSON-wrapped model output like {"code": "...", "file": "path"}.
+
+    Models sometimes wrap their code in JSON instead of a plain code block.
+    """
+    blocks: List[Tuple[str, str]] = []
+    # Find ```json blocks
+    for m in re.finditer(r"```json\s*\n?(.*?)(?:\n```|```|\Z)", output, re.DOTALL):
+        body = (m.group(1) or "").strip()
+        if not body:
+            continue
+        try:
+            data = json_mod.loads(body)
+        except (json_mod.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        code = data.get("code") or data.get("content") or data.get("source") or ""
+        path = data.get("file") or data.get("path") or data.get("filename") or ""
+        if not code or not path:
+            continue
+        path = _norm_rel_path(str(path).strip())
+        code = str(code).strip()
+        if code and path:
+            dbg(f"output_parser: extracted code from JSON block -> {path}")
+            blocks.append((path, code))
+    return blocks
 
 
 def _reformat_oneliner_diff(block: str) -> str:
