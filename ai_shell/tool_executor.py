@@ -1,11 +1,11 @@
-"""Agent-callable tools: read_file, list_files, grep, edit_existing_file, write_file, run_terminal_cmd.
+"""Agent-callable tools: read_file, list_files, grep, search_replace, edit_existing_file, write_file, run_terminal_cmd.
 
 Supports:
-1. Function-style (primary): read_file(path="..."), edit_existing_file(old_string="...", new_string="...", path="...")
-2. XML-style (Continue fallback): <tool_call>{"name":"...","arguments":{...}}</tool_call>
+1. Function-style (primary): read_file(path="..."), search_replace(path="...", old_string="...", new_string="..."), edit_existing_file(path="...", changes="...")
+2. XML-style fallback: <tool_call>{"name":"...","arguments":{...}}</tool_call>
 3. Legacy bracket: [[[read:path]]], [[[grep:pattern]]], etc.
-(search_replace is not in the schema; model uses edit_existing_file/single_find_and_replace; search_replace code path kept.)
 
+edit_existing_file = path + changes only. search_replace = find-and-replace (replaces single_find_and_replace in the prompt).
 Results are appended to the conversation so the agent can use them.
 """
 
@@ -34,7 +34,7 @@ from .search_replace import (
     _parse_python_string,
     _unescape_string,
     apply_single_multi_edit,
-    execute_search_replace,
+    apply_search_replace,
 )
 from .tools import grep_search
 from .utils import dbg
@@ -80,7 +80,7 @@ def _parse_function_kwargs(text: str, start: int, keys: Tuple[str, ...]) -> Tupl
 
 
 def _extract_xml_tool_calls(text: str) -> List[Tuple[str, Dict[str, str]]]:
-    """Extract tool calls from XML-style blocks (Continue fallback format). Returns [(name, kwargs), ...]."""
+    """Extract tool calls from XML-style blocks. Returns [(name, kwargs), ...]."""
     if not text or not isinstance(text, str):
         return []
     results: List[Tuple[str, Dict[str, str]]] = []
@@ -103,9 +103,9 @@ def _extract_xml_tool_calls(text: str) -> List[Tuple[str, Dict[str, str]]]:
             elif name == "codebase_tool":
                 canonical = "codebase_search"
             elif name == "edit_existing_file":
-                canonical = "search_replace"
+                canonical = "edit_existing_file" if kwargs.get("changes") else "search_replace"
             elif name == "create_new_file":
-                canonical = "write_file"
+                canonical = "create_new_file"
             elif name == "run_terminal_command":
                 canonical = "run_terminal_cmd"
             results.append((canonical, kwargs))
@@ -270,7 +270,7 @@ TOOL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Function-style tool names: our names + Continue aliases (all 4 edit forms)
+# Function-style tool names: our names and edit-form aliases
 FUNCTION_STYLE_TOOLS = (
     "read_file",
     "list_files",
@@ -293,12 +293,17 @@ FUNCTION_STYLE_TOOLS = (
     "run_terminal_command",
 )
 
-# Tool schema: Continue-style tool names only. search_replace is disabled for the model (not in schema)
-# but remains in code; edit_existing_file and single_find_and_replace map to it internally.
+# Tool schema: file-editing tools and mechanisms.
+# All paths are relative to the workspace root unless stated otherwise.
+# Edit tools cannot be called in parallel with any other tools.
+NO_PARALLEL_TOOL_CALLING_INSTRUCTION = (
+    "This tool CANNOT be called in parallel with any other tools, including itself."
+)
+
 TOOLS_SCHEMA = """Available tools. Call using function-style: tool_name(arg="value", ...).
 
 Read-only:
-- read_file: read_file(filepath="path to file")
+- read_file: read_file(filepath="path to file") — read file contents. Use before editing to get up-to-date content.
 - view_subdirectory / list_files: list_files(path="directory path, optional")
 - grep_search / grep: grep_search(pattern="...", path="optional scope")
 - glob_search / glob_file_search: glob_file_search(glob="*.py", path="optional dir")
@@ -306,21 +311,48 @@ Read-only:
 - view_repo_map: no args
 - view_diff: view_diff(path="file path") — diff after edits in this session
 
-Read-write (Continue names):
-- edit_existing_file: edit_existing_file(path="file", old_string="...", new_string="...") or edit_existing_file(path="file", changes="full/partial content")
-- single_find_and_replace: single_find_and_replace(path="file", old_string="...", new_string="...", replace_all=true)
-- multi_edit: multi_edit(path="file", edits=[{old_string, new_string}, ...])
-- create_new_file / write_file: write_file(path="file", content="...")
-- run_terminal_command: run_terminal_command(command="shell command")"""
+File-editing tools (use read_file first if you do not know the file contents):
+- """ + NO_PARALLEL_TOOL_CALLING_INSTRUCTION + """
+
+1) edit_existing_file(path="...", changes="...")
+   Use this tool to edit an existing file. If you don't know the contents of the file, read it first.
+   - path: The path of the file to edit, relative to the root of the workspace.
+   - changes: Any modifications to the file, showing only needed changes. Do NOT wrap this in a codeblock or write anything besides the code changes. In larger files, use brief language-appropriate placeholders for large unmodified sections, e.g. "// ... existing code ...".
+   Only use if you already know the contents of the file; otherwise use read_file first.
+   Implementation note: the entire file is replaced with the value of changes; provide the COMPLETE new file content. For targeted edits (e.g. rename, single change) use search_replace instead.
+
+2) search_replace(path="...", old_string="...", new_string="...", replace_all=true)
+   Mechanism: Exact string replacement. Replaces every occurrence of old_string with new_string in the file.
+   - path: relative path to the file.
+   - old_string: The text to replace — must match exactly including whitespace/indentation. Use read_file to get exact text.
+   - new_string: The text to replace it with (must be different from old_string).
+   - replace_all: true to replace all occurrences (e.g. renaming a variable); optional, default true.
+   Use read_file just before making edits so you have up-to-date contents.
+
+3) multi_edit(path="...", edits=[{old_string, new_string}, ...])
+   Mechanism: Multiple find-and-replace operations on one file in a single call. Edits are applied in sequence; each edit sees the result of the previous one. All edits must be valid or none are applied.
+   - path: relative path to the file.
+   - edits: Array of {old_string, new_string, replace_all?}. Same rules as search_replace for each. Plan order carefully so earlier edits do not break later old_string matches.
+   Use when making several changes to different parts of the same file. Use read_file first.
+
+4) create_new_file / write_file(path="...", content="...")
+   Mechanism: Create a new file with the given content, or overwrite an existing file.
+   - path: relative path where the file should be created or overwritten.
+   - content: Full contents of the file.
+   Only use create_new_file when the file does not exist; if it exists, use edit_existing_file or search_replace.
+
+Other:
+- run_terminal_command: run_terminal_command(command="shell command") — run from workspace root."""
 
 TOOLS_SYSTEM_HINT = """You have access to tools provided as a JSON-style schema. Use function-style calls: tool_name(arg="value", ...).
 
 """ + TOOLS_SCHEMA.strip() + """
 
 Current file (if any) may be included below as "Current file".
-- Use read-only tools (read_file, grep_search, list_files, etc.) to gather context if needed.
-- When the user asks to change, fix, or add code: you must output one or more edit_existing_file(...) or single_find_and_replace(...) or write_file(...) calls. Reading files alone does not fulfill an edit request. Output your edit tool call(s) in the same format as above.
-- For editing existing files: use old_string and new_string (edit_existing_file or single_find_and_replace). Do NOT write full-file content with placeholders like \"... existing code ...\" — that will overwrite and erase real code.
+- Use read_file (or list_files, grep_search, etc.) to gather context before editing. When making edits, use read_file just before so you have up-to-date file contents.
+- When the user asks to change, fix, or add code: output one or more file-editing tool calls (search_replace, edit_existing_file, multi_edit, or write_file). Reading files alone does not fulfill an edit request.
+- When addressing code modification requests, present a concise code snippet that emphasizes only the necessary changes; in existing files restate the function or class the snippet belongs to. Use brief placeholders for unmodified sections (e.g. "// ... existing code ...", "# ... rest of function ..."). Only provide the complete file when explicitly requested.
+- For edit_existing_file: provide the COMPLETE new file content (this implementation replaces the entire file). For targeted find-and-replace or renames use search_replace; use multi_edit for several edits in one file; use write_file only for new files.
 - After making edits, give a brief explanation of what you changed (one or two sentences)."""
 
 # Chat mode: answer questions, use tools to read/list — do NOT instruct to produce diffs
@@ -424,31 +456,30 @@ AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "edit_existing_file",
-            "description": "Edit file: use 'changes' for full/partial content, or old_string/new_string for find-and-replace.",
+            "description": "Use this tool to edit an existing file. If you don't know the contents of the file, read it first. changes = any modifications to the file, showing only needed changes; do not wrap in a codeblock. In larger files use brief language-appropriate placeholders for unmodified sections, e.g. '// ... existing code ...'. This implementation replaces the entire file with changes—provide the COMPLETE new file content. For targeted edits (rename, single change) use search_replace. " + NO_PARALLEL_TOOL_CALLING_INSTRUCTION,
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "The path of the file to edit, relative to the root of the workspace"},
                     "filepath": {"type": "string"},
-                    "changes": {"type": "string", "description": "Full or partial file content (with placeholders like // ... existing code ...)"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
+                    "changes": {"type": "string", "description": "Any modifications to the file, showing only needed changes. Do NOT wrap in a codeblock. Use placeholders for large unmodified sections, e.g. '// ... existing code ...'. Provide complete file content for this implementation."},
                 },
+                "required": ["path", "changes"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "single_find_and_replace",
-            "description": "Replace old_string with new_string in a file. Use replace_all to replace every occurrence.",
+            "name": "search_replace",
+            "description": "Exact string replacement in a file. old_string must match exactly (whitespace/indentation). Replaces all occurrences with new_string. Use read_file first for up-to-date contents. " + NO_PARALLEL_TOOL_CALLING_INSTRUCTION,
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"},
+                    "path": {"type": "string", "description": "Path relative to workspace root"},
+                    "old_string": {"type": "string", "description": "Exact text to find"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace all occurrences (default true)"},
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -458,11 +489,11 @@ AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "multi_edit",
-            "description": "Apply multiple find-and-replace edits to one file in one call.",
+            "description": "Multiple find-and-replace ops on one file in one call. edits = [{old_string, new_string, replace_all?}, ...]. Applied in order; all or nothing. Use read_file first. " + NO_PARALLEL_TOOL_CALLING_INSTRUCTION,
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "Path relative to workspace root"},
                     "filepath": {"type": "string"},
                     "edits": {
                         "type": "array",
@@ -475,6 +506,7 @@ AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
                             },
                             "required": ["old_string", "new_string"],
                         },
+                        "description": "List of {old_string, new_string, replace_all?} applied in sequence",
                     },
                 },
                 "required": ["path", "edits"],
@@ -485,12 +517,12 @@ AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_new_file",
-            "description": "Create or overwrite a file with the given content.",
+            "description": "Create a new file with full content (or overwrite). Use only when file does not exist; otherwise use edit_existing_file or search_replace.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "path": {"type": "string", "description": "Path relative to workspace root"},
+                    "content": {"type": "string", "description": "Full file contents"},
                 },
                 "required": ["path", "content"],
             },
@@ -597,6 +629,12 @@ def execute_tool(name: str, arg: str) -> str:
             _tool_log(f"  -> empty/not found")
             return f"[read] File empty or not found: {path}"
         _tool_log(f"  -> {len(content)} chars")
+        # Debug: log what read_file returns so we can verify model sees post-edit content
+        snippet = (content[:80] + "..") if len(content) > 80 else content
+        dbg(
+            f"read_file result path={path!r} len={len(content)} "
+            f"has_clamp_int={('clamp_int' in content)} snippet={snippet!r}"
+        )
         return content
 
     if name == "list_files":
@@ -791,16 +829,17 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
         _tool_log(f"  -> {len(syms)} symbols")
         return f"[symbols] {path}:\n" + "\n".join(lines)
 
-    # search_replace: disabled in schema (model uses edit_existing_file / single_find_and_replace); kept for implementation
+    # search_replace = find-and-replace (path, old_string, new_string). single_find_and_replace still accepted and mapped here.
     if name == "search_replace":
         old_str = (kwargs.get("old_string") or "").strip()
         new_str = kwargs.get("new_string", "")
         path_str = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip('"\'')
-        replace_all = kwargs.get("replace_all") in (True, "true", "1", "yes")
+        # Replace all when model omits replace_all or passes true; replace first only when model writes false
+        replace_all = kwargs.get("replace_all") not in (False, "false", "0", "no")
         if not old_str or not path_str:
             return "[search_replace] Error: old_string and path required"
         edit = {"old_string": old_str, "new_string": new_str, "path": path_str, "replace_all": replace_all}
-        ok, msg, meta = execute_search_replace(
+        ok, msg, meta = apply_search_replace(
             edit, allowed_edit_files=None, root=get_root(), stage_only=False
         )
         if ok:
@@ -847,13 +886,13 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
         return f"[multi_edit] {msg}"
 
     if name == "edit_existing_file":
-        # Continue form: filepath + changes (full or partial content)
+        # filepath + changes (full file content; partial/placeholders rejected)
         path_str = (kwargs.get("filepath") or kwargs.get("path") or "").strip().strip('"\'')
         changes = kwargs.get("changes")
         if not path_str:
             return "[edit_existing_file] Error: filepath required"
         if changes is None:
-            return "[edit_existing_file] Error: changes required (or use search_replace for old_string/new_string)"
+            return "[edit_existing_file] Error: changes required. For find-and-replace use search_replace(path=..., old_string=..., new_string=...)."
         root = get_root()
         try:
             rel_path = _norm_rel_path(path_str)
@@ -875,10 +914,19 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
                 "[edit_existing_file] Rejected: content contains placeholders like \"... existing code ...\". "
                 "Use old_string and new_string for targeted edits instead of full-file changes with placeholders."
             )
-        write_file_text(rel_path, str(changes))
+        new_content = str(changes)
+        old_content = abs_path.read_text()
+        # Reject if model sent a fragment: new content much smaller than existing (would wipe file)
+        if len(old_content) > 0 and len(new_content) < max(100, len(old_content) // 2):
+            return (
+                f"[edit_existing_file] Rejected: new content ({len(new_content)} chars) is much smaller than "
+                f"existing file ({len(old_content)} chars). For small edits use search_replace(old_string=..., new_string=..., path=...). "
+                "For full replacement, provide the complete new file content in changes=."
+            )
+        write_file_text(rel_path, new_content)
         _tool_log(f"  -> wrote {rel_path} (changes)")
         _tool_wrote_log(rel_path, content_len=len(str(changes)))
-        return f"[edit_existing_file] Applied changes to {rel_path}"
+        return f"Successfully edited {rel_path}"
 
     if name == "create_new_file":
         path = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip('"\'')
@@ -943,13 +991,13 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
         if abs_path.exists() and abs_path.is_file() and _content_has_placeholders(str(content)):
             return (
                 "[write_file] Rejected: content contains placeholders like \"... existing code ...\". "
-                "Do not overwrite an existing file with partial content. Use edit_existing_file(path=..., old_string=\"...\", new_string=\"...\") or single_find_and_replace for targeted edits."
+                "Do not overwrite an existing file with partial content. Use search_replace(path=..., old_string=\"...\", new_string=\"...\") for targeted edits."
             )
         try:
             write_file_text(rel_path, content)
             _tool_log(f"  -> wrote {rel_path}")
             _tool_wrote_log(rel_path, content_len=len(content))
-            return f"[write_file] Wrote {rel_path}"
+            return f"[write_file] Wrote {rel_path}. Proceed with the task using this content as the new baseline."
         except Exception as e:
             return f"[write_file] Error: {e}"
 

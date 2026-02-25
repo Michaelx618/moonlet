@@ -18,6 +18,7 @@ from . import config
 from .model_roles import resolve_role_config
 from .model_providers import (
     CliProviderAdapter,
+    MLXProviderAdapter,
     PythonProviderAdapter,
     ServerProviderAdapter,
 )
@@ -369,6 +370,108 @@ class _CliBackend:
         return (proc.stdout or "").strip()
 
 
+class _MLXBackend:
+    """MLX (Apple Silicon) backend using mlx_lm. Model id = HuggingFace id or local path."""
+
+    def __init__(self, model_id: str):
+        from mlx_lm import load
+        self.model_id = model_id
+        self._model, self._tokenizer = load(model_id)
+
+    def format_prompt(self, user_content: str) -> str:
+        """Format user text with the tokenizer's chat template (required for correct generation)."""
+        tokenizer = self._tokenizer
+        if getattr(tokenizer, "has_chat_template", False) or getattr(
+            getattr(tokenizer, "_tokenizer", None), "chat_template", None
+        ):
+            try:
+                messages = [{"role": "user", "content": user_content}]
+                out = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                if isinstance(out, str):
+                    return out
+                # tokenize=True returns list of ids; decode for string prompt
+                if hasattr(tokenizer, "decode"):
+                    return tokenizer.decode(out, skip_special_tokens=False)
+            except Exception:
+                pass
+        return user_content
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        timeout_s: int,
+        stop: Optional[List[str]] = None,
+    ) -> str:
+        from mlx_lm import generate as mlx_generate
+        from mlx_lm.sample_utils import make_sampler
+        sampler = make_sampler(temp=float(temperature), top_p=float(top_p))
+        kwargs = {"sampler": sampler, "verbose": False}
+        if getattr(config, "MLX_MAX_KV_SIZE", 0) > 0:
+            kwargs["max_kv_size"] = config.MLX_MAX_KV_SIZE
+        out = mlx_generate(
+            self._model,
+            self._tokenizer,
+            prompt=prompt,
+            max_tokens=max(1, int(max_tokens)),
+            **kwargs,
+        )
+        if not isinstance(out, str):
+            out = str(out or "")
+        if stop:
+            for s in stop:
+                if s and s in out:
+                    idx = out.find(s)
+                    if idx >= 0:
+                        out = out[:idx]
+        return out.strip()
+
+    def stream_generate(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: Optional[List[str]] = None,
+    ):
+        """Yield tokens as they are generated so the UI can show progress."""
+        from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.sample_utils import make_sampler
+        # mlx_lm 0.30+ generate_step() does not accept temperature/top_p; use sampler
+        sampler = make_sampler(temp=float(temperature), top_p=float(top_p))
+        kwargs = {"sampler": sampler}
+        if getattr(config, "MLX_MAX_KV_SIZE", 0) > 0:
+            kwargs["max_kv_size"] = config.MLX_MAX_KV_SIZE
+        accumulated = []
+        for resp in mlx_stream_generate(
+            self._model,
+            self._tokenizer,
+            prompt=prompt,
+            max_tokens=max(1, int(max_tokens)),
+            **kwargs,
+        ):
+            token = getattr(resp, "text", resp)
+            if not isinstance(token, str):
+                token = str(token or "")
+            accumulated.append(token)
+            # Stop on exact stop token (don't yield it)
+            if stop:
+                for s in stop:
+                    if s and (token == s or token.strip() == s):
+                        return
+                full = "".join(accumulated)
+                for s in stop:
+                    if s and s in full:
+                        return  # stop before yielding token that completed the sequence
+            yield token
+
+
 _BACKEND_NAME = "unknown"
 _BACKEND_KIND = "unknown"
 _PROVIDER: Optional[object] = None
@@ -437,8 +540,28 @@ def _find_cli_binary() -> Optional[str]:
 
 
 def load_model() -> Tuple[Optional[object], object]:
-    """Load GGUF backend (llama-server, python binding, or CLI fallback)."""
+    """Load model backend: MLX (if SC2_MLX_MODEL set), else GGUF (llama-server, python, or CLI)."""
     global _BACKEND_NAME, _BACKEND_KIND, _PROVIDER
+    if config.MLX_MODEL or getattr(config, "MLX_MODEL_PATH", None):
+        try:
+            from mlx_lm import load
+        except ImportError as exc:
+            raise RuntimeError("MLX backend requires: pip install mlx mlx-lm") from exc
+        model_id = getattr(config, "MLX_MODEL_PATH", None) or config.MLX_MODEL
+        if not model_id:
+            raise RuntimeError("Set SC2_MLX_MODEL or SC2_MLX_MODEL_PATH")
+        print(f"[Loading MLX model: {model_id}]", file=sys.stderr)
+        sys.stderr.flush()
+        print("[  Loading weights…]", file=sys.stderr)
+        sys.stderr.flush()
+        backend = _MLXBackend(model_id)
+        _BACKEND_NAME = "mlx"
+        _BACKEND_KIND = "mlx"
+        _PROVIDER = MLXProviderAdapter(backend)
+        print("[  MLX backend ready]", file=sys.stderr)
+        sys.stderr.flush()
+        return None, backend
+
     if not config.GGUF_PATH:
         raise SystemExit(
             "Set SC2_GGUF to a .gguf file path (and install llama-cpp-python)."
@@ -523,10 +646,53 @@ def load_model() -> Tuple[Optional[object], object]:
     return None, llm
 
 
-tokenizer, model = load_model()
+# Lazy load for MLX: bind port first, then load model in background.
+_model_ready = threading.Event()
+_load_lock = threading.Lock()
+_loading = False
+
+if config.MLX_MODEL or getattr(config, "MLX_MODEL_PATH", None):
+    _BACKEND_NAME = "mlx"
+    _BACKEND_KIND = "mlx"
+    _PROVIDER = None
+    tokenizer = None
+    model = None  # set by ensure_model_loaded()
+else:
+    tokenizer, model = load_model()
 
 # Model access is not thread-safe (binding or subprocess backend).
 MODEL_LOCK = threading.Lock()
+
+
+def ensure_model_loaded() -> None:
+    """Load MLX model once (no-op if already loaded or not using MLX)."""
+    global model, tokenizer, _PROVIDER, _loading
+    if _BACKEND_KIND != "mlx":
+        return
+    with _load_lock:
+        if model is not None:
+            return
+        if _loading:
+            pass  # another thread is loading; we'll wait below
+        else:
+            _loading = True
+            try:
+                _tok, _m = load_model()
+                tokenizer = _tok
+                model = _m
+            finally:
+                _loading = False
+                _model_ready.set()
+            return
+    _model_ready.wait()
+
+
+def get_model():
+    """Return the model backend; for MLX this triggers load if not yet loaded."""
+    ensure_model_loaded()
+    if _BACKEND_KIND == "mlx" and model is None:
+        raise RuntimeError("MLX model failed to load; check server logs or runtime-debug.log")
+    return model
 
 
 def backend_name() -> str:
@@ -541,10 +707,10 @@ def chat_completion_with_tools(
     top_p: float = 0.9,
 ) -> Dict[str, Any]:
     """Call chat completions with tools. Only works with gguf_server backend."""
-    if _BACKEND_KIND != "gguf_server" or not hasattr(model, "chat_completion_with_tools"):
+    if _BACKEND_KIND != "gguf_server" or not hasattr(get_model(), "chat_completion_with_tools"):
         raise RuntimeError("chat_completion_with_tools requires llama-server with USE_CHAT_TOOLS")
     with MODEL_LOCK:
-        return model.chat_completion_with_tools(
+        return get_model().chat_completion_with_tools(
             messages=messages,
             tools=tools,
             max_tokens=max_tokens,
@@ -558,7 +724,7 @@ def clear_kv_cache(model: Any = None) -> None:
     """Clear the llama-server KV cache. Call on app shutdown."""
     if _PROVIDER and hasattr(_PROVIDER, "clear_cache"):
         _PROVIDER.clear_cache()
-    elif _BACKEND_KIND == "gguf_server" and hasattr(model, "clear_kv_cache"):
+    elif _BACKEND_KIND == "gguf_server" and model is not None and hasattr(model, "clear_kv_cache"):
         model.clear_kv_cache()
     else:
         dbg("clear_kv_cache: not using gguf_server, nothing to clear")
@@ -566,6 +732,9 @@ def clear_kv_cache(model: Any = None) -> None:
 
 def backend_status() -> Dict[str, Any]:
     info: Dict[str, Any] = {"backend": _BACKEND_NAME, "kind": _BACKEND_KIND}
+    if _BACKEND_KIND == "mlx" and model is None:
+        info["status"] = "loading"
+        return info
     if _PROVIDER and hasattr(_PROVIDER, "status"):
         try:
             info["provider"] = _PROVIDER.status()
@@ -657,6 +826,49 @@ def _stream_reply_cli(
     return reply
 
 
+def _stream_reply_mlx(
+    prompt: str,
+    label: str,
+    silent: bool,
+    max_new: int,
+    stop_sequences: Optional[List[str]],
+    temperature: Optional[float],
+    cache_key: str = "",
+) -> str:
+    _ = cache_key
+    prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
+    dbg(f"stream_reply: mlx prompt_len={len(prompt)}")
+    capped_max_new = max_new if max_new > 0 else config.MAX_NEW
+    temp = config.TEMPERATURE if temperature is None else temperature
+    start_time = time.time()
+    if not silent:
+        sys.stdout.write(label)
+        sys.stdout.flush()
+    try:
+        with MODEL_LOCK:
+            reply_raw = get_model().generate(
+                prompt=prompt,
+                max_tokens=capped_max_new,
+                temperature=temp,
+                top_p=config.TOP_P,
+                timeout_s=config.GEN_TIMEOUT,
+                stop=stop_sequences,
+            )
+    except Exception as exc:
+        reply = f"[Model error: {exc}]"
+        stop_reason = "error"
+    else:
+        reply, stop_reason = _apply_stop_sequences(reply_raw, stop_sequences)
+        reply = reply.strip()
+    if not silent:
+        sys.stdout.write(reply)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    gen_ms = int((time.time() - start_time) * 1000)
+    dbg(f"stream_reply: mlx reply_len={len(reply)} gen_ms={gen_ms} stop_reason={stop_reason}")
+    return reply
+
+
 def _wrap_chatml(prompt: str, stop_sequences: Optional[List[str]]) -> Tuple[str, List[str]]:
     """Wrap a raw prompt in chatml tags for chat-finetuned models.
 
@@ -678,6 +890,9 @@ def _wrap_chatml(prompt: str, stop_sequences: Optional[List[str]]) -> Tuple[str,
     stops = list(stop_sequences or [])
     if "<|im_end|>" not in stops:
         stops.append("<|im_end|>")
+    # Prevent model from repeating assistant turn header (infinite loop)
+    if "<|im_start|>" not in stops:
+        stops.append("<|im_start|>")
     return wrapped, stops
 
 
@@ -778,6 +993,16 @@ def stream_reply(
         )
     if _BACKEND_KIND == "gguf_cli":
         return _stream_reply_cli(
+            prompt,
+            label,
+            silent,
+            max_new,
+            stop_sequences,
+            temperature,
+            cache_key,
+        )
+    if _BACKEND_KIND == "mlx":
+        return _stream_reply_mlx(
             prompt,
             label,
             silent,
@@ -923,7 +1148,8 @@ def get_session_cache_key() -> str:
         key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
         if getattr(config, "DEBUG_KV_CACHE", False):
             slot = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16) % max(1, int(getattr(config, "LLAMA_SERVER_CACHE_SLOTS", 32)))
-            dbg(f"kv_cache: session_key={key} slot={slot} root={root[:40]}... include={len(include)} files")
+            inc_label = "disabled" if getattr(config, "DISABLE_INDEX", False) else f"{len(include)} files"
+            dbg(f"kv_cache: session_key={key} slot={slot} root={root[:40]}... include={inc_label}")
         return key
     except Exception:
         return ""
@@ -945,9 +1171,24 @@ def stream_reply_chunks(
         temperature = float(role_cfg.temperature)
     if not stop_sequences:
         stop_sequences = list(role_cfg.stop_sequences)
-    prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
     capped_max_new = max_new if max_new > 0 else config.MAX_NEW
     temp = config.TEMPERATURE if temperature is None else temperature
+
+    if _BACKEND_KIND == "mlx":
+        # Use same ChatML wrap as GGUF when disabled, so prompt structure matches and model is less likely to hallucinate edits.
+        if getattr(config, "MLX_USE_CHAT_TEMPLATE", False):
+            backend = get_model()
+            prompt = backend.format_prompt(prompt)
+            stops = list(stop_sequences or [])
+            if "<|im_end|>" not in stops:
+                stops.append("<|im_end|>")
+            if "<|im_start|>" not in stops:
+                stops.append("<|im_start|>")
+            stop_sequences = stops
+        else:
+            prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
+    else:
+        prompt, stop_sequences = _wrap_chatml(prompt, stop_sequences)
 
     if _BACKEND_KIND == "gguf_server":
         try:
@@ -992,6 +1233,31 @@ def stream_reply_chunks(
         chunk_size = 96
         for i in range(0, len(text), chunk_size):
             yield text[i:i + chunk_size]
+        return
+
+    if _BACKEND_KIND == "mlx":
+        try:
+            print(f"[model] MLX stream_generate starting prompt_len={len(prompt)} max_tokens={capped_max_new}", file=sys.stderr)
+            sys.stderr.flush()
+            first = True
+            with MODEL_LOCK:
+                for token in get_model().stream_generate(
+                    prompt=prompt,
+                    max_tokens=capped_max_new,
+                    temperature=temp,
+                    top_p=config.TOP_P,
+                    stop=stop_sequences,
+                ):
+                    # Yield every token including "" - MLX often yields "" for partial segments
+                    if first and token:
+                        print(f"[model] MLX first token: {repr(token[:80])}{'...' if len(token) > 80 else ''}", file=sys.stderr)
+                        sys.stderr.flush()
+                        first = False
+                    yield token
+        except Exception as exc:
+            print(f"[model] MLX error: {exc}", file=sys.stderr)
+            sys.stderr.flush()
+            yield f"[Model error: {exc}]"
         return
 
     start_time = time.time()

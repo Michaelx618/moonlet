@@ -218,8 +218,8 @@ def get_include() -> List[str]:
 
 
 def _path_in_include(rel_path: str) -> bool:
-    """True if path is in include set (or under an include dir). When include not set, returns True."""
-    if not INCLUDE_PATHS:
+    """True if path is in include set (or under an include dir). When include not set or indexing disabled, returns True."""
+    if not INCLUDE_PATHS or getattr(config, "DISABLE_INDEX", False):
         return True
     rel = _norm_rel_path(rel_path or "").replace("\\", "/")
     if rel in INCLUDE_PATHS:
@@ -248,6 +248,8 @@ def is_edit_allowed(rel_path: str, *, allow_new: bool = False) -> bool:
     if any(rel_posix.startswith(p) for p in _EDIT_BLOCKLIST_PREFIXES):
         return False
     # Allow list = imported files: when user has imported files, only those (or under them) are editable
+    if getattr(config, "DISABLE_INDEX", False):
+        return True
     if INCLUDE_PATHS and not allow_new:
         if rel_posix in INCLUDE_PATHS:
             return True

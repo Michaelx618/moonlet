@@ -1,2 +1,4 @@
 # Core dependencies for moonlet pipeline (YAML patch format)
 pyyaml>=6.0
+mlx
+mlx-lm

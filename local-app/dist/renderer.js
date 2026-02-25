@@ -30542,7 +30542,9 @@ ${contents.value}`;
 
   // src/renderer.js
   var params = new URLSearchParams(window.location.search);
-  var API_BASE = params.get("api_base") || "http://127.0.0.1:8000";
+  var API_BASE_FROM_QUERY = (params.get("api_base") || "").trim();
+  var API_BASE_PINNED = Boolean(API_BASE_FROM_QUERY);
+  var API_BASE = API_BASE_FROM_QUERY || "http://127.0.0.1:8000";
   var filesEl = document.getElementById("files");
   var cmHostEl = document.getElementById("cmHost");
   var imagePreviewWrap = document.getElementById("imagePreviewWrap");
@@ -31789,6 +31791,10 @@ ${contents.value}`;
     }
   }
   async function discoverApiBase() {
+    if (API_BASE_PINNED) {
+      const ok = await probeHealthAt(API_BASE, 900);
+      return ok ? API_BASE : null;
+    }
     const seen = /* @__PURE__ */ new Set();
     const candidates = [];
     const add2 = (base2) => {
@@ -32471,6 +32477,7 @@ ${contents.value}`;
     let pendingNoopRun = false;
     let pendingNoopBody = "No code changes were applied. Target is already up to date.";
     let pendingMetaFocusFile = "";
+    let waitingMsgTimer = null;
     function flushResponse() {
       if (metaSummaryLocked) return;
       responseThrottleTimer = null;
@@ -32487,6 +32494,7 @@ ${contents.value}`;
       const payload = useRepairPayload ? { ...useRepairPayload, focus_file: currentFile, file_path: currentFile } : { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
       const controller = new AbortController();
       activeRequest = controller;
+      console.log("[Moonlet] POST /stream sending text length=" + (payload.text ? payload.text.length : 0) + " mode=" + (payload.mode || ""));
       const res = await fetch(API_BASE + "/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -32495,13 +32503,21 @@ ${contents.value}`;
       });
       if (!res.ok) {
         const t2 = await res.text();
+        console.error("[Moonlet] /stream error", res.status, t2);
         throw new Error(`HTTP ${res.status}: ${t2}`);
       }
+      console.log("[Moonlet] /stream response ok, reading body");
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let doneReceived = false;
       let stagedContentApplied = false;
+      waitingMsgTimer = setTimeout(() => {
+        if (rawResponseBuf.length === 0 && activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
+          panelTranscript[activeTranscriptIndex].assistant = "Waiting for model...";
+          renderPanelTranscript();
+        }
+      }, 2500);
       const handleEvent = (block) => {
         const lines = block.split("\n").filter(Boolean);
         let event = "chunk";
@@ -32512,18 +32528,26 @@ ${contents.value}`;
         }
         const data2 = dataLines.join("\n");
         if (event === "chunk") {
-          if (!data2.trim()) return;
           if (metaSummaryLocked) return;
           if (data2.includes("[Retrying with strict file block format]")) return;
           if (firstChunk) {
+            clearTimeout(waitingMsgTimer);
+            console.log("[Moonlet] stream first chunk received, len=" + data2.length);
             responseEl.textContent = "";
             firstChunk = false;
           }
           rawResponseBuf += data2;
-          if (!responseThrottleTimer) {
+          if (rawResponseBuf.length > 0 && rawResponseBuf.length <= 200) {
+            if (responseThrottleTimer) {
+              clearTimeout(responseThrottleTimer);
+              responseThrottleTimer = null;
+            }
+            flushResponse();
+          } else if (!responseThrottleTimer) {
             responseThrottleTimer = setTimeout(flushResponse, 200);
           }
         } else if (event === "done") {
+          console.log("[Moonlet] stream done, response length=" + (rawResponseBuf ? rawResponseBuf.length : 0));
           doneReceived = true;
           const isChat = (selectedMode || "").toLowerCase() === "chat";
           if (isChat && /^Staged for:/.test(String(rawResponseBuf || "").trim())) {
@@ -32896,6 +32920,7 @@ ${contents.value}`;
       }
     } finally {
       clearTimeout(slowTimer);
+      if (waitingMsgTimer) clearTimeout(waitingMsgTimer);
       if (responseThrottleTimer) {
         clearTimeout(responseThrottleTimer);
         responseThrottleTimer = null;

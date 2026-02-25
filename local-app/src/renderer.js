@@ -38,7 +38,11 @@ import {
 } from "./lsp/codemirror-plugins.js";
 
 const params = new URLSearchParams(window.location.search);
-      let API_BASE = params.get("api_base") || "http://127.0.0.1:8000";
+      const API_BASE_FROM_QUERY = (params.get("api_base") || "").trim();
+      // If the main process passes an explicit API base, keep it pinned.
+      // During MLX startup the server may come up late; probing other ports can attach to stale servers.
+      const API_BASE_PINNED = Boolean(API_BASE_FROM_QUERY);
+      let API_BASE = API_BASE_FROM_QUERY || "http://127.0.0.1:8000";
       const filesEl = document.getElementById("files");
       const cmHostEl = document.getElementById("cmHost");
       const imagePreviewWrap = document.getElementById("imagePreviewWrap");
@@ -1366,6 +1370,10 @@ const params = new URLSearchParams(window.location.search);
       }
 
       async function discoverApiBase() {
+        if (API_BASE_PINNED) {
+          const ok = await probeHealthAt(API_BASE, 900);
+          return ok ? API_BASE : null;
+        }
         const seen = new Set();
         const candidates = [];
         const add = (base) => {
@@ -2116,6 +2124,7 @@ const params = new URLSearchParams(window.location.search);
         let pendingNoopRun = false;
         let pendingNoopBody = "No code changes were applied. Target is already up to date.";
         let pendingMetaFocusFile = "";
+        let waitingMsgTimer = null;
         function flushResponse() {
           if (metaSummaryLocked) return;
           responseThrottleTimer = null;
@@ -2134,18 +2143,26 @@ const params = new URLSearchParams(window.location.search);
             : { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
           const controller = new AbortController();
           activeRequest = controller;
+          console.log("[Moonlet] POST /stream sending text length=" + (payload.text ? payload.text.length : 0) + " mode=" + (payload.mode || ""));
           const res = await fetch(API_BASE + "/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
             signal: controller.signal,
           });
-          if (!res.ok) { const t = await res.text(); throw new Error(`HTTP ${res.status}: ${t}`); }
+          if (!res.ok) { const t = await res.text(); console.error("[Moonlet] /stream error", res.status, t); throw new Error(`HTTP ${res.status}: ${t}`); }
+          console.log("[Moonlet] /stream response ok, reading body");
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
           let doneReceived = false;
           let stagedContentApplied = false;
+          waitingMsgTimer = setTimeout(() => {
+            if (rawResponseBuf.length === 0 && activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
+              panelTranscript[activeTranscriptIndex].assistant = "Waiting for model...";
+              renderPanelTranscript();
+            }
+          }, 2500);
           const handleEvent = (block) => {
             const lines = block.split("\n").filter(Boolean);
             let event = "chunk";
@@ -2156,16 +2173,24 @@ const params = new URLSearchParams(window.location.search);
             }
             const data = dataLines.join("\n");
             if (event === "chunk") {
-              if (!data.trim()) return;
               if (metaSummaryLocked) return;
               if (data.includes("[Retrying with strict file block format]")) return;
-              if (firstChunk) { responseEl.textContent = ""; firstChunk = false; }
+              if (firstChunk) {
+                clearTimeout(waitingMsgTimer);
+                console.log("[Moonlet] stream first chunk received, len=" + data.length);
+                responseEl.textContent = "";
+                firstChunk = false;
+              }
               rawResponseBuf += data;
-              // Throttle: render at most once per 200ms
-              if (!responseThrottleTimer) {
+              // First chunk: flush immediately so user sees response right away
+              if (rawResponseBuf.length > 0 && rawResponseBuf.length <= 200) {
+                if (responseThrottleTimer) { clearTimeout(responseThrottleTimer); responseThrottleTimer = null; }
+                flushResponse();
+              } else if (!responseThrottleTimer) {
                 responseThrottleTimer = setTimeout(flushResponse, 200);
               }
             } else if (event === "done") {
+              console.log("[Moonlet] stream done, response length=" + (rawResponseBuf ? rawResponseBuf.length : 0));
               doneReceived = true;
               // In chat mode, never show "Staged for" — that's agent-only; treat as server bug
               const isChat = (selectedMode || "").toLowerCase() === "chat";
@@ -2592,6 +2617,7 @@ const params = new URLSearchParams(window.location.search);
           }
         } finally {
           clearTimeout(slowTimer);
+          if (waitingMsgTimer) clearTimeout(waitingMsgTimer);
           if (responseThrottleTimer) { clearTimeout(responseThrottleTimer); responseThrottleTimer = null; }
           // Final flush if any remaining buffered response
           if (rawResponseBuf && firstChunk === false && !metaSummaryLocked) flushResponse();

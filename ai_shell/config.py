@@ -79,6 +79,18 @@ LLAMA_SERVER_CACHE_SLOTS = int(
 )
 # Optional GGUF path for local quantized model (llama.cpp backend)
 GGUF_PATH = os.getenv("SC2_GGUF")
+# Optional MLX model (HuggingFace id or local path). When set, use mlx_lm instead of GGUF.
+# Example: SC2_MLX_MODEL=mlx-community/Llama-3.2-3B-Instruct-4bit
+# For faster load (skip hub), set SC2_MLX_MODEL_PATH to the cache snapshot dir, e.g.:
+#   ~/.cache/huggingface/hub/models--mlx-community--Qwen2.5-Coder-14B-Instruct-4bit/snapshots/<commit_hash>
+MLX_MODEL = os.getenv("SC2_MLX_MODEL", "").strip() or None
+MLX_MODEL_PATH = os.getenv("SC2_MLX_MODEL_PATH", "").strip() or None
+# KV cache size for MLX (max prompt tokens to cache; improves throughput). 0 = use mlx_lm default.
+MLX_MAX_KV_SIZE = int(os.getenv("SC2_MLX_MAX_KV_SIZE", "16384"))
+# Hard cap on agent prompt length when using MLX (reduce hallucination from oversized context).
+MLX_AGENT_PROMPT_MAX_CHARS = int(os.getenv("SC2_MLX_AGENT_PROMPT_MAX_CHARS", "32000"))
+# When False, MLX uses same ChatML wrap as GGUF (no tokenizer chat template). Can reduce edit hallucination.
+MLX_USE_CHAT_TEMPLATE = os.getenv("SC2_MLX_USE_CHAT_TEMPLATE", "false").lower() in ("1", "true", "yes")
 MODEL_PROFILE_NAME = os.getenv("SC2_MODEL_PROFILE", "auto").strip().lower()
 MODEL_PROFILE = resolve_model_profile(MODEL_PROFILE_NAME, GGUF_PATH or "")
 GGUF_CTX = int(os.getenv("SC2_CTX_TOK", "4096"))
@@ -129,6 +141,28 @@ MAX_MULTI_MODEL_CALLS = int(os.getenv("SC2_MAX_MULTI_CALLS", "8"))
 # Agent tool loop: max rounds (SC2_MAX_TOOL_ROUNDS). 0 = no cap (Continue-style: run until
 # model produces output without tool calls). If > 0, loop exits after that many rounds.
 MAX_TOOL_ROUNDS = int(os.getenv("SC2_MAX_TOOL_ROUNDS", "0"))
+# When True, do not restrict read/edit to imported files; allow any path under root (index/include filter disabled).
+# Default True for now; set SC2_DISABLE_INDEX=0 to re-enable the include filter.
+DISABLE_INDEX = os.getenv("SC2_DISABLE_INDEX", "true").lower() in ("1", "true", "yes")
+# Index gate: when true, keep index empty until user imports/selects files.
+INDEX_REQUIRES_IMPORT = os.getenv("SC2_INDEX_REQUIRES_IMPORT", "true").lower() in ("1", "true", "yes")
+# Content-addressed indexing: SQLite catalog, incremental refresh, code snippets, chunks, FTS, embeddings.
+# When True, rebuild_index() also runs the indexer refresh. Off by default for now; set SC2_CONTINUE_INDEX=1 to enable.
+CONTINUE_INDEX_ENABLED = False  # os.getenv("SC2_CONTINUE_INDEX", "false").lower() in ("1", "true", "yes")
+# Which index artifacts to build (all default true except embeddings, which requires SEMANTIC_SEARCH_ENABLED).
+INDEX_ENABLE_CODE_SNIPPETS = os.getenv("SC2_INDEX_CODE_SNIPPETS", "true").lower() in ("1", "true", "yes")
+INDEX_ENABLE_FTS = os.getenv("SC2_INDEX_FTS", "true").lower() in ("1", "true", "yes")
+INDEX_ENABLE_CHUNKS = os.getenv("SC2_INDEX_CHUNKS", "true").lower() in ("1", "true", "yes")
+# Embeddings index: explicit SC2_INDEX_EMBEDDINGS, or default to SEMANTIC_SEARCH_ENABLED (embed model available).
+_index_emb_env = os.getenv("SC2_INDEX_EMBEDDINGS", "").strip().lower()
+if _index_emb_env in ("0", "false", "no"):
+    INDEX_ENABLE_EMBEDDINGS = False
+elif _index_emb_env in ("1", "true", "yes"):
+    INDEX_ENABLE_EMBEDDINGS = True
+else:
+    INDEX_ENABLE_EMBEDDINGS = os.getenv("SC2_SEMANTIC_SEARCH", "").lower() in ("1", "true", "yes")
+# Chunk size (lines per chunk) for chunk index.
+INDEX_CHUNK_MAX_LINES = int(os.getenv("SC2_INDEX_CHUNK_MAX_LINES", "300"))
 
 APPROVAL_MODE = os.getenv("SC2_APPROVAL_MODE", "true").lower() in ("1", "true", "yes")
 AUTO_APPLY_ON_SUCCESS = os.getenv("SC2_AUTO_APPLY_ON_SUCCESS", "true").lower() in ("1", "true", "yes")
@@ -167,8 +201,9 @@ MAX_READ_FILES_IN_PROMPT = int(os.getenv("SC2_MAX_READ_FILES_IN_PROMPT", "15"))
 # @Code / @Folder context (Continue-style)
 MAX_CODE_SNIPPET_LINES = int(os.getenv("SC2_MAX_CODE_SNIPPET_LINES", "40"))
 MAX_FOLDER_CONTEXT_FILES = int(os.getenv("SC2_MAX_FOLDER_CONTEXT_FILES", "25"))
-# Continue default agent system message (from core/llm/defaultSystemMessages.ts)
+# Continue default agent system message (aligned with core/llm/defaultSystemMessages.ts DEFAULT_AGENT_SYSTEM_MESSAGE)
 _BASE_AGENT_DEFAULT = """\
+<important_rules>
 You are in agent mode.
 
 If you need to use multiple tools, you can call multiple read-only tools simultaneously.
@@ -179,7 +214,8 @@ If you are editing "src/main.py" for example, your code block should start with 
 For larger codeblocks (>20 lines), use brief language-appropriate placeholders for unmodified sections, e.g. '// ... existing code ...'
 
 However, only output codeblocks for suggestion and demonstration purposes, for example, when enumerating multiple hypothetical options. For implementing changes, use the edit tools.
-"""
+
+</important_rules>"""
 BASE_AGENT_SYSTEM_MESSAGE = os.getenv("SC2_BASE_AGENT_SYSTEM_MESSAGE", _BASE_AGENT_DEFAULT.strip())
 
 # RAIL v3 budgets/interlocks

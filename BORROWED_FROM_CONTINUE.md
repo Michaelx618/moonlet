@@ -39,6 +39,16 @@ Everything below is implemented in this repo and derived from or aligned with Co
 - `AGENT_TOOLS_JSON`: full JSON schema for API tool calls (/v1/chat/completions with tools). Used when `USE_CHAT_TOOLS` is true.
 - XML tool-call fallback: we parse `<tool_call>{"name":"...","arguments":{...}}</tool_call>` so we accept the same format Continue uses when native tools aren't available.
 
+**Indexing** (`ai_shell/indexing/`)
+- **SQLite catalog**: `tag_catalog` (path, cacheKey, lastUpdated per dir/branch/artifactId), `global_cache` (content-addressable reuse across branches). See `refresh_index.py`.
+- **Incremental refresh**: compare file mtimes to catalog → add/remove/update; use `global_cache` to decide compute vs addTag/removeTag.
+- **Code snippets index**: tree-sitter symbols per file in SQLite; uses `extract_symbols_treesitter`. Enable with `SC2_CONTINUE_INDEX=1`; `rebuild_index()` then runs the indexer refresh.
+- **Full-text search index**: SQLite FTS5 (trigram) over file contents. Use `retrieve_fts()` for FTS-backed codebase search.
+- **Chunk index**: structural chunking by line range (`chunks` + `chunk_tags` tables); feeds embeddings index. Config: `SC2_INDEX_CHUNKS`, `SC2_INDEX_CHUNK_MAX_LINES`.
+- **Embeddings index**: embed chunks via sentence-transformers, store in LanceDB for semantic codebase search. Optional when `SEMANTIC_SEARCH_ENABLED` or `SC2_INDEX_EMBEDDINGS=1`. Use `query_embeddings()` for semantic search.
+- **Single-file refresh**: `refresh_index_file(rel_path)` re-indexes one file (e.g. on save) without full-dir refresh.
+- **Config-driven index selection**: `get_indexes_to_build()` reads `INDEX_ENABLE_CODE_SNIPPETS`, `INDEX_ENABLE_FTS`, `INDEX_ENABLE_CHUNKS`, `INDEX_ENABLE_EMBEDDINGS` (and `INDEX_CHUNK_MAX_LINES`) so only enabled artifacts are built.
+
 **Context (Continue-style context providers)**
 - **@File / Reference files**: `extra_read_files` → we inject file content under "Reference files" with explicit path and "(Use path \"…\" in tool calls.)".
 - **@CurrentFile**: `focus_file` → we inject content under "Current file (path for tools: \"…\")" and tell the model not to create new directories.
@@ -108,3 +118,29 @@ To get closer to Continue's behavior: use a backend with **native tool calling**
 - MCP server integration; we only have built-in tools.
 
 Continue repo: https://github.com/continuedev/continue
+
+---
+
+## Context management worth borrowing next
+
+After porting their **indexing** (catalog, code snippets, FTS) in `ai_shell/indexing/`, these parts of Continue’s context handling are the most useful to consider:
+
+1. **@Git Diff**  
+   Inject the current diff (unstaged or staged) into the user message so the model sees what’s changed and can reason about follow-up edits or revert. Cheap: run `git diff` (and optionally `git diff --staged`) and add a block to the prompt.
+
+2. **@Terminal**  
+   Inject recent terminal output (or “currently running command” + tail of output) so the model doesn’t suggest commands that are already running or repeat failed commands blindly. Requires the client (or a small daemon) to send terminal buffer/session content; then add a “Terminal output: …” section to the user message.
+
+3. **Truncation by total token budget**  
+   Continue doesn’t cap each file in the provider; they truncate when assembling the prompt (total token count). We cap per file (e.g. `MAX_FOCUS_CONTENT_CHARS`). Adding a single “trim to fit N tokens” pass over the assembled prompt would let us include more files or more context without blowing the context window.
+
+4. **Chunk + embeddings index (LanceDB)**  
+   We now have the catalog and FTS; adding **ChunkCodebaseIndex** (structural chunks) and **LanceDbIndex** (embeddings) would give semantic codebase search (e.g. “where do we handle auth?”) backed by the same incremental refresh. Optional and more work (embed model, chunking strategy).
+
+5. **read_currently_open_file as a tool**  
+   We already inject the current file in the prompt; exposing it as a tool makes the model’s behavior consistent with other tools and lets it “re-read” the current file after edits without relying on the client resending focus_file.
+
+6. **search_web / fetch_url_content**  
+   Useful for “look up the latest docs” or “what does this error mean”; medium value and requires safe URL fetching and optional search API.
+
+Lower priority for now: **@Docs** (doc index), **@Web**/ **@Url** (overlap with fetch_url_content), **@Clipboard** (niche). **MCP** is a larger integration; worth it if you want arbitrary tools.

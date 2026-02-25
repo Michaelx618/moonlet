@@ -163,8 +163,10 @@ async function startServer() {
   const venvPython = path.join(repoRoot, ".venv", "bin", "python3");
   const python = fs.existsSync(venvPython) ? venvPython : "python3";
   const gguf = cfg.ggufPath || process.env.SC2_GGUF;
-  if (!gguf) {
-    console.warn("SC2_GGUF not set; cannot start server automatically.");
+  const mlxModel = cfg.mlxModel || process.env.SC2_MLX_MODEL;
+  const mlxModelPath = cfg.mlxModelPath || process.env.SC2_MLX_MODEL_PATH;
+  if (!gguf && !mlxModel && !mlxModelPath) {
+    console.warn("Set ggufPath or mlxModel in config (or SC2_GGUF / SC2_MLX_MODEL); cannot start server.");
     return null;
   }
   const desiredPort = Number(cfg.port || process.env.SC2_PORT || 8000);
@@ -174,7 +176,11 @@ async function startServer() {
     ...process.env,
     PATH: buildServerPathEnv(process.env.PATH),
     PYTHONDONTWRITEBYTECODE: "1",
-    SC2_GGUF: gguf,
+    HF_HUB_DISABLE_PROGRESS_BARS: "1",
+    HF_HUB_DISABLE_TELEMETRY: "1",
+    ...(gguf ? { SC2_GGUF: gguf } : {}),
+    ...(mlxModel ? { SC2_MLX_MODEL: mlxModel } : {}),
+    ...(mlxModelPath ? { SC2_MLX_MODEL_PATH: mlxModelPath } : {}),
     SC2_CTX_TOK: String(cfg.ctxTok || process.env.SC2_CTX_TOK || 8192),
     SC2_THREADS: String(cfg.threads || process.env.SC2_THREADS || 4),
     SC2_GPU_LAYERS: String(
@@ -228,11 +234,6 @@ async function startServer() {
         : process.env.SC2_USE_CHATML_WRAP || 1
     ),
     ...(cfg.usePipeline === false ? { SC2_USE_STATE_MACHINE_PIPELINE: "false" } : {}),
-    SC2_USE_LEGACY_PIPELINE: String(
-      cfg.useLegacyPipeline !== undefined
-        ? cfg.useLegacyPipeline
-        : process.env.SC2_USE_LEGACY_PIPELINE || 0
-    ),
     SC2_USE_CHAT_TOOLS: cfg.useChatTools ? "1" : "0",
     SC2_APPROVAL_MODE: String(
       cfg.approvalMode !== undefined

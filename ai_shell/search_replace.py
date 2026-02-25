@@ -1,16 +1,17 @@
 """Parse and execute search_replace(old_string, new_string, path) from model output.
 
-Continue parity: replace_all, multi_edit, validate_single_edit, match strategies (edit_match).
+Simple algorithm: literal find old_string in file, replace with new_string (all occurrences).
+Continue parity: replace_all, multi_edit, validate_single_edit.
 """
 
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .edit_match import find_search_matches
 from .files import (
     _norm_rel_path,
     generate_diff,
+    get_include,
     get_root,
     is_edit_allowed,
     resolve_path,
@@ -436,29 +437,35 @@ def _resolve_edit_path(path_str: str, root: Path) -> Tuple[str, Path]:
     return rel, abs_path
 
 
-def execute_find_and_replace(
+def _norm_line_endings(s: str) -> str:
+    """Normalize line endings to \\n so file (e.g. \\r\\n) and model string (\\n) match."""
+    if not s:
+        return s
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def execute_search_replace(
     file_content: str,
     old_string: str,
     new_string: str,
     replace_all: bool = False,
     edit_index: int = 0,
 ) -> str:
-    """Apply one or all replacements (Continue performReplace.executeFindAndReplace).
+    """Replace every occurrence of old_string with new_string in file_content.
 
-    Uses edit_match.find_search_matches for multiple strategies.
-    Replaces every occurrence found (same as replace_all); only fails when old_string
-    cannot be located in the file (e.g. already applied or incomplete string).
+    Simple literal replace. Line endings are normalized so \\r\\n and \\n match.
+    Fails when old_string does not appear in the file (e.g. already applied).
     """
-    matches = find_search_matches(file_content, old_string)
-    if not matches:
+    content_norm = _norm_line_endings(file_content)
+    old_norm = _norm_line_endings(old_string)
+    new_norm = _norm_line_endings(new_string)
+    if old_norm not in content_norm:
         raise SearchReplaceError(
             f"Edit at index {edit_index}: string not found in file: {repr(old_string[:80])}..."
         )
-    # Apply all occurrences (reverse order to preserve positions)
-    result = file_content
-    for (start, end) in reversed(matches):
-        result = result[:start] + new_string + result[end:]
-    return result
+    if replace_all:
+        return content_norm.replace(old_norm, new_norm)
+    return content_norm.replace(old_norm, new_norm, 1)
 
 
 def execute_multi_find_and_replace(
@@ -471,7 +478,7 @@ def execute_multi_find_and_replace(
         old_s = edit.get("old_string") or ""
         new_s = edit.get("new_string", "")
         replace_all = edit.get("replace_all") is True
-        result = execute_find_and_replace(result, old_s, new_s, replace_all=replace_all, edit_index=i)
+        result = execute_search_replace(result, old_s, new_s, replace_all=replace_all, edit_index=i)
     return result
 
 
@@ -521,7 +528,7 @@ def apply_single_multi_edit(
     if not stage_only:
         write_file_text(rel_path, new_content)
         dbg(f"multi_edit: wrote {rel_path}")
-    return True, f"Applied {len(edits)} edit(s) to {rel_path}", {
+    return True, f"Successfully edited {rel_path}", {
         "path": rel_path,
         "old_content": content,
         "new_content": new_content,
@@ -529,7 +536,7 @@ def apply_single_multi_edit(
     }
 
 
-def execute_search_replace(
+def apply_search_replace(
     edit: Dict[str, Any],
     allowed_edit_files: Optional[List[str]] = None,
     root: Optional[Path] = None,
@@ -538,14 +545,26 @@ def execute_search_replace(
     """Execute one search_replace edit. Returns (success, message, meta_or_none).
 
     meta contains: path, old_content, new_content, diff (for staging).
-    Supports replace_all (Continue single_find_and_replace).
     """
+    import json as _json
+    import time as _time
+    # #region agent log
+    def _dlog(loc: str, msg: str, data: dict, hid: str) -> None:
+        try:
+            with open("/Users/michael/moonlet/.cursor/debug-c7e239.log", "a") as _f:
+                _f.write(_json.dumps({"sessionId": "c7e239", "hypothesisId": hid, "location": loc, "message": msg, "data": data, "timestamp": int(_time.time() * 1000)}) + "\n")
+        except Exception:
+            pass
+    # #endregion
     root = root or get_root()
     root = Path(root).resolve()
     old_str = edit.get("old_string") or ""
     new_str = edit.get("new_string", "")
     path_str = edit.get("path") or ""
     replace_all = edit.get("replace_all") is True
+    # #region agent log
+    _dlog("search_replace.apply_search_replace:entry", "entry", {"path_str": path_str, "root": str(root), "stage_only": stage_only}, "H1")
+    # #endregion
 
     if not old_str:
         return False, "search_replace: old_string is empty", None
@@ -559,7 +578,14 @@ def execute_search_replace(
     try:
         rel_path, abs_path = _resolve_edit_path(path_str, root)
     except ValueError as e:
+        # #region agent log
+        _dlog("search_replace.apply_search_replace:resolve_fail", "resolve_fail", {"path_str": path_str, "error": str(e)}, "H1")
+        # #endregion
         return False, f"search_replace: {e}", None
+
+    # #region agent log
+    _dlog("search_replace.apply_search_replace:resolved", "resolved", {"rel_path": rel_path, "abs_path": str(abs_path), "exists": abs_path.exists() and abs_path.is_file()}, "H1")
+    # #endregion
 
     if allowed_edit_files:
         allowed_set = {_norm_rel_path(p) for p in allowed_edit_files}
@@ -574,7 +600,11 @@ def execute_search_replace(
             return False, f"search_replace: path {rel_path} not in allowed files", None
 
     allow_new = not (abs_path.exists() and abs_path.is_file())
-    if not is_edit_allowed(rel_path, allow_new=allow_new):
+    edit_allowed = is_edit_allowed(rel_path, allow_new=allow_new)
+    # #region agent log
+    _dlog("search_replace.apply_search_replace:edit_allowed", "edit_allowed", {"rel_path": rel_path, "allow_new": allow_new, "edit_allowed": edit_allowed, "include_paths": get_include() or None}, "H2")
+    # #endregion
+    if not edit_allowed:
         return False, (
             f"search_replace: edit not allowed for {rel_path} "
             "(file not in imported/allow list; add this file to imported files to edit it)"
@@ -587,41 +617,51 @@ def execute_search_replace(
         return False, f"search_replace: file not found: {rel_path}", None
 
     content = abs_path.read_text()
+    old_in_content = old_str in content
+    new_in_content = new_str in content
+    # #region agent log
+    _dlog("search_replace.apply_search_replace:before_replace", "before_replace", {"rel_path": rel_path, "old_in_content": old_in_content, "new_in_content": new_in_content, "content_len": len(content)}, "H3")
+    # #endregion
     try:
-        new_content = execute_find_and_replace(
+        new_content = execute_search_replace(
             content, old_str, new_str, replace_all=replace_all, edit_index=0
         )
     except SearchReplaceError as e:
         err_msg = str(e)
-        # If "string not found" but new_string is already in the file, treat as already applied
-        # so the model stops retrying the same edit (e.g. clamp( -> clamp_int( already done).
-        if "string not found" in err_msg.lower() and old_str not in content and new_str in content:
-            return True, f"Already applied to {rel_path}; no change needed.", {
-                "path": rel_path,
-                "old_content": content,
-                "new_content": content,
-                "diff": "",
-            }
-        # Include a short snippet of the file so the model can see what's actually there and retry
+        # #region agent log
+        _dlog("search_replace.apply_search_replace:string_not_found", "string_not_found", {"rel_path": rel_path, "err_msg": err_msg[:200]}, "H3")
+        # #endregion
+        # Continue-style failure message: tell model to read file again for up-to-date contents
         snippet_len = 600
         snippet = (content[:snippet_len] + "..." if len(content) > snippet_len else content)
         if snippet.strip():
             snippet = "\nCurrent file content (snippet):\n" + snippet.replace("\r\n", "\n")
         else:
             snippet = "\n(File is empty.)"
-        return False, f"search_replace: {e}{snippet}", None
+        fail_msg = (
+            f"Failed to edit {rel_path}. To continue working with the file, read it again to see the most up-to-date contents. "
+            "If this edit was already applied in a previous round, do not retry it; move on."
+            + snippet
+        )
+        return False, fail_msg, None
 
     diff = generate_diff(content, new_content, str(abs_path))
 
     if stage_only:
-        return True, f"Applied to {rel_path}", {
+        # #region agent log
+        _dlog("search_replace.apply_search_replace:return_ok_stage", "return_ok", {"rel_path": rel_path, "stage_only": True}, "H4")
+        # #endregion
+        return True, f"Successfully edited {rel_path}", {
             "path": rel_path,
             "old_content": content,
             "new_content": new_content,
             "diff": diff,
         }
     abs_path.write_text(new_content)
-    return True, f"Applied to {rel_path}", {
+    # #region agent log
+    _dlog("search_replace.apply_search_replace:return_ok_write", "return_ok", {"rel_path": rel_path, "stage_only": False}, "H4")
+    # #endregion
+    return True, f"Successfully edited {rel_path}", {
         "path": rel_path,
         "old_content": content,
         "new_content": new_content,

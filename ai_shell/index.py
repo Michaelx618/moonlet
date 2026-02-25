@@ -33,6 +33,9 @@ def _list_editable_files(max_files: int = 200) -> List[str]:
     if not root.exists() or not root.is_dir():
         return []
     include = get_include()
+    # Default-safe behavior: do not index the whole workspace until files are explicitly imported.
+    if getattr(config, "INDEX_REQUIRES_IMPORT", True) and not include:
+        return []
     files: List[str] = []
     seen: Set[str] = set()
 
@@ -52,7 +55,7 @@ def _list_editable_files(max_files: int = 200) -> List[str]:
                 continue
             if not is_allowed_file(rel):
                 continue
-            if include:
+            if include and not getattr(config, "DISABLE_INDEX", False):
                 # Match exact path or path under an included directory
                 matched = rel in include
                 if not matched:
@@ -85,8 +88,23 @@ def rebuild_index() -> List[str]:
         _indexed_files = _list_editable_files()
         _symbol_cache.clear()
         # Log so user can see why 200 vs 4: first build = full repo root; later = after set_include/set_root (e.g. task folder)
-        include_info = f" include={len(include)} path(s)" if include else " include=none (full tree)"
-        dbg(f"index: rebuilt, {len(_indexed_files)} files root={root}{include_info}")
+        if getattr(config, "INDEX_REQUIRES_IMPORT", True) and not include:
+            include_info = " include=none (index idle until import)"
+        elif getattr(config, "DISABLE_INDEX", False):
+            include_info = " include=disabled"
+        else:
+            include_info = f" include={len(include)} path(s)"
+        dbg(f"index: rebuilt, {len(_indexed_files)} files (cap=200) root={root}{include_info}")
+        # Content-addressed indexing: update SQLite catalog + code snippets + FTS when enabled
+        if getattr(config, "CONTINUE_INDEX_ENABLED", False):
+            try:
+                from .indexing import refresh_codebase_index
+                include_list = list(include) if include else None
+                for _ in refresh_codebase_index(str(root), include_paths=include_list):
+                    pass
+                dbg("index: indexing refresh done")
+            except Exception as ce:
+                dbg(f"index: indexing refresh failed: {ce}")
         return _indexed_files
     except Exception as e:
         _indexed_files = []

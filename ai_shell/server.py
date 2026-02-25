@@ -208,8 +208,12 @@ class APIServer(BaseHTTPRequestHandler):
             if mode == "repair" and not text.strip():
                 self._json(400, {"error": "text (original spec) is required for repair"})
                 return
+            print(f"[stream] POST received text_len={len(text)} mode={mode} focus_file={focus_file or file_path or '(none)'}", file=sys.stderr)
+            sys.stderr.flush()
             self._sse()
             sent_done = False
+            # Send one chunk immediately so client knows connection is live (use ZWSP so UI stays clean)
+            self._sse_send("\u200b", event="chunk")
             try:
                 if file_path:
                     target = validate_file_path(
@@ -247,13 +251,24 @@ class APIServer(BaseHTTPRequestHandler):
                         if action.get("type") == "tool_call":
                             from .utils import tool_call_log
                             tool_call_log(action.get("tool", ""), action.get("args") or {})
+                            # Ensure debugger sees every tool call: append to debug log (tool_call_log already does stderr + log)
+                            try:
+                                _line = f"[stream action] {action.get('tool', '')} {action.get('args') or {}}"
+                                with open(config.DEBUG_LOG_PATH, "a") as _f:
+                                    _f.write(f"[tool_call] {time.strftime('%Y-%m-%d %H:%M:%S')} {_line}\n")
+                            except Exception:
+                                pass
 
+                    # Do not stream token-by-token; only send final summary (if any) after run_agent
+                    print("[stream] calling run_agent ...", file=sys.stderr)
+                    sys.stderr.flush()
                     output, meta = run_agent(
                         run_text,
                         focus_file=focus_file,
                         mode=mode,
                         silent=True,
                         on_action=on_action,
+                        on_chunk=None,
                         extra_read_files=extra_read or None,
                         context_folders=context_folders,
                     )
@@ -261,7 +276,14 @@ class APIServer(BaseHTTPRequestHandler):
                     meta["output"] = output
                     meta["explanation"] = output
                     self._attach_path_debug(meta, focus_file)
-                    self._sse_send(output, event="chunk")
+                    print(f"[stream] run_agent done output_len={len(output)}", file=sys.stderr)
+                    sys.stderr.flush()
+                    if not output:
+                        print("[stream] No response from the model (may still be loading). Try again in a moment.", file=sys.stderr)
+                        sys.stderr.flush()
+                    # Stream only the final summary to the client (one chunk), not token-by-token
+                    if output and output.strip():
+                        self._sse_send(output.strip(), event="chunk")
                     if mode != "repair":
                         state.append_chat_turn(text, output)
                     elif meta.get("touched"):
@@ -277,10 +299,8 @@ class APIServer(BaseHTTPRequestHandler):
                     meta["proposal_id"] = proposal_id
                     meta["requires_approval"] = True
                     meta["applied_directly"] = False
-                    self._sse_send(
-                        f"Patch proposal ready ({proposal_id}). Approve to apply changes.",
-                        event="chunk",
-                    )
+                    print(f"[stream] Patch proposal ready ({proposal_id}). Approve to apply changes.", file=sys.stderr)
+                    sys.stderr.flush()
                 self._sse_send(json.dumps(meta), event="meta")
 
                 # Write to disk AFTER sending meta so frontend gets diff highlights first.
@@ -297,19 +317,19 @@ class APIServer(BaseHTTPRequestHandler):
                     max_retries = getattr(config, "MAX_VERIFY_RETRIES", 2)
                     if touched and not skip_checks:
                         for retry_i in range(max_retries):
-                            self._sse_send("Verifying...", event="chunk")
+                            print("[stream] Verifying...", file=sys.stderr)
+                            sys.stderr.flush()
                             exit_code, _stdout, _stderr, first_error = run_verify(
                                 staged_paths=list(touched),
                             )
                             if exit_code == 0:
                                 dbg(f"server: verify passed (attempt {retry_i + 1})")
-                                self._sse_send("Build OK.", event="chunk")
+                                print("[stream] Build OK.", file=sys.stderr)
+                                sys.stderr.flush()
                                 break
                             dbg(f"server: verify failed (attempt {retry_i + 1}), error: {first_error[:200]}")
-                            self._sse_send(
-                                f"Build failed (retry {retry_i + 1}/{max_retries}):\n{first_error[:300]}",
-                                event="chunk",
-                            )
+                            print(f"[stream] Build failed (retry {retry_i + 1}/{max_retries}):\n{first_error[:300]}", file=sys.stderr)
+                            sys.stderr.flush()
                             # Feed error back to main agent (same entrypoint as normal requests)
                             retry_text = (
                                 f"ERROR after your edit:\n{first_error}\n\n"
@@ -342,10 +362,8 @@ class APIServer(BaseHTTPRequestHandler):
                         else:
                             # All retries exhausted, still failing
                             dbg(f"server: verify failed after {max_retries} retries")
-                            self._sse_send(
-                                f"Build still failing after {max_retries} retries.",
-                                event="chunk",
-                            )
+                            print(f"[stream] Build still failing after {max_retries} retries.", file=sys.stderr)
+                            sys.stderr.flush()
             except Exception as exc:
                 self._sse_send(str(exc), event="error")
             finally:
@@ -361,29 +379,24 @@ class APIServer(BaseHTTPRequestHandler):
                 self._json(400, {"error": "text is required"})
                 return
             try:
-                if getattr(config, "USE_LEGACY_PIPELINE", False):
-                    output, meta = run_pipeline(text, silent=True, focus_file=focus_file or None)
-                    meta["output"] = output
-                    self._json(200, meta)
-                else:
-                    extra_read = [
-                        str(p).strip() for p in (data.get("extra_read_files") or [])
-                        if str(p).strip()
-                    ]
-                    context_folders = [
-                        str(p).strip() for p in (data.get("context_folders") or data.get("extra_folders") or [])
-                        if str(p).strip()
-                    ] or None
-                    output, meta = run_agent(
-                        text,
-                        focus_file=focus_file or None,
-                        mode="agent",
-                        silent=True,
-                        extra_read_files=extra_read or None,
-                        context_folders=context_folders,
-                    )
-                    meta["output"] = output
-                    self._json(200, meta)
+                extra_read = [
+                    str(p).strip() for p in (data.get("extra_read_files") or [])
+                    if str(p).strip()
+                ]
+                context_folders = [
+                    str(p).strip() for p in (data.get("context_folders") or data.get("extra_folders") or [])
+                    if str(p).strip()
+                ] or None
+                output, meta = run_agent(
+                    text,
+                    focus_file=focus_file or None,
+                    mode="agent",
+                    silent=True,
+                    extra_read_files=extra_read or None,
+                    context_folders=context_folders,
+                )
+                meta["output"] = output
+                self._json(200, meta)
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
             return
@@ -649,8 +662,11 @@ class APIServer(BaseHTTPRequestHandler):
                 extra = backend_status()
                 if isinstance(extra, dict):
                     body.update(extra)
+                    if extra.get("status") == "loading":
+                        body["model_loading"] = True
             except Exception:
                 pass
+            body["status"] = "ok"
             self._json(200, body)
             return
         if parsed.path == "/files":
