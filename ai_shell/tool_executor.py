@@ -226,6 +226,46 @@ def _content_has_placeholders(content: str) -> bool:
     return False
 
 
+def _resolve_placeholders_in_edit(changes: str, old_content: str) -> Optional[str]:
+    """Resolve first placeholder in changes by filling from old_content (Continue-style partial edit).
+    Returns resolved full content, or None if context cannot be found in file."""
+    if not changes or not old_content:
+        return None
+    for pat in _PLACEHOLDER_PATTERNS:
+        m = pat.search(changes)
+        if not m:
+            continue
+        before = changes[: m.start()]
+        after = changes[m.end() :]
+        # Find before and after in old_content to extract the middle segment
+        idx_before = old_content.find(before) if before else 0
+        if idx_before < 0:
+            # Try without leading/trailing whitespace
+            before_stripped = before.strip()
+            if before_stripped:
+                idx_before = old_content.find(before_stripped)
+            if idx_before < 0:
+                return None
+        start_middle = idx_before + len(before)
+        if not after:
+            # Placeholder at end: middle is rest of file
+            return before + old_content[start_middle:]
+        idx_after = old_content.find(after, start_middle)
+        if idx_after < 0:
+            after_stripped = after.strip()
+            if after_stripped:
+                idx_after = old_content.find(after_stripped, start_middle)
+            if idx_after < 0:
+                return None
+        middle = old_content[start_middle:idx_after]
+        resolved = before + middle + after
+        # If resolved still contains placeholders, recurse once (e.g. two placeholders)
+        if _content_has_placeholders(resolved):
+            return _resolve_placeholders_in_edit(resolved, old_content)
+        return resolved
+    return changes
+
+
 def _tool_log(msg: str) -> None:
     """Log tool activity to stderr and debug log."""
     if getattr(config, "DEBUG_TOOLS", True):
@@ -317,9 +357,8 @@ File-editing tools (use read_file first if you do not know the file contents):
 1) edit_existing_file(path="...", changes="...")
    Use this tool to edit an existing file. If you don't know the contents of the file, read it first.
    - path: The path of the file to edit, relative to the root of the workspace.
-   - changes: Any modifications to the file, showing only needed changes. Do NOT wrap this in a codeblock or write anything besides the code changes. In larger files, use brief language-appropriate placeholders for large unmodified sections, e.g. "// ... existing code ...".
-   Only use if you already know the contents of the file; otherwise use read_file first.
-   Implementation note: the entire file is replaced with the value of changes; provide the COMPLETE new file content. For targeted edits (e.g. rename, single change) use search_replace instead.
+   - changes: Full new file content, OR partial content with placeholders for unmodified sections. Placeholders like "... existing code ...", "// ... existing ...", "# ... existing ..." are filled from the current file so you can show only the changed parts. Do NOT wrap in a codeblock.
+   For targeted edits (e.g. rename, single change) use search_replace instead.
 
 2) search_replace(path="...", old_string="...", new_string="...", replace_all=true)
    Mechanism: Exact string replacement. Replaces every occurrence of old_string with new_string in the file.
@@ -352,8 +391,9 @@ Current file (if any) may be included below as "Current file".
 - Use read_file (or list_files, grep_search, etc.) to gather context before editing. When making edits, use read_file just before so you have up-to-date file contents.
 - When the user asks to change, fix, or add code: output one or more file-editing tool calls (search_replace, edit_existing_file, multi_edit, or write_file). Reading files alone does not fulfill an edit request.
 - When addressing code modification requests, present a concise code snippet that emphasizes only the necessary changes; in existing files restate the function or class the snippet belongs to. Use brief placeholders for unmodified sections (e.g. "// ... existing code ...", "# ... rest of function ..."). Only provide the complete file when explicitly requested.
-- For edit_existing_file: provide the COMPLETE new file content (this implementation replaces the entire file). For targeted find-and-replace or renames use search_replace; use multi_edit for several edits in one file; use write_file only for new files.
-- After making edits, give a brief explanation of what you changed (one or two sentences)."""
+- For edit_existing_file: provide full file content or partial content with placeholders (e.g. "... existing code ...") which are filled from the file. For targeted find-and-replace or renames use search_replace; use multi_edit for several edits in one file; use write_file only for new files.
+- After making edits, give a brief explanation of what you changed (one or two sentences).
+- When the whole task is complete (all requested changes applied everywhere needed), respond with a brief summary and no further tool calls. After each tool result, decide the next step from the result; do not repeat the same edit."""
 
 # Chat mode: answer questions, use tools to read/list — do NOT instruct to produce diffs
 CHAT_TOOLS_HINT = """You have access to these tools. Use the function-style format when you need them:
@@ -456,13 +496,13 @@ AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "edit_existing_file",
-            "description": "Use this tool to edit an existing file. If you don't know the contents of the file, read it first. changes = any modifications to the file, showing only needed changes; do not wrap in a codeblock. In larger files use brief language-appropriate placeholders for unmodified sections, e.g. '// ... existing code ...'. This implementation replaces the entire file with changes—provide the COMPLETE new file content. For targeted edits (rename, single change) use search_replace. " + NO_PARALLEL_TOOL_CALLING_INSTRUCTION,
+            "description": "Edit an existing file. changes = full new file content, or partial content with placeholders (e.g. '... existing code ...', '// ... existing ...') which are filled from the current file. Do not wrap in a codeblock. For targeted edits (rename, single change) use search_replace. " + NO_PARALLEL_TOOL_CALLING_INSTRUCTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "The path of the file to edit, relative to the root of the workspace"},
                     "filepath": {"type": "string"},
-                    "changes": {"type": "string", "description": "Any modifications to the file, showing only needed changes. Do NOT wrap in a codeblock. Use placeholders for large unmodified sections, e.g. '// ... existing code ...'. Provide complete file content for this implementation."},
+                    "changes": {"type": "string", "description": "Full file content, or partial content with placeholders like '... existing code ...' (filled from the file). Do not wrap in a codeblock."},
                 },
                 "required": ["path", "changes"],
             },
@@ -845,9 +885,9 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
         if ok:
             _tool_log(f"  -> {msg}")
             _tool_wrote_log(path_str, edits_count=1)
-            return f"[search_replace] {msg}"
+            return msg
         _tool_log(f"  -> FAILED: {msg}")
-        return f"[search_replace] {msg}"
+        return msg
 
     if name == "multi_edit":
         path_str = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip('"\'')
@@ -886,7 +926,7 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
         return f"[multi_edit] {msg}"
 
     if name == "edit_existing_file":
-        # filepath + changes (full file content; partial/placeholders rejected)
+        # filepath + changes (full or partial with placeholders; Continue-style)
         path_str = (kwargs.get("filepath") or kwargs.get("path") or "").strip().strip('"\'')
         changes = kwargs.get("changes")
         if not path_str:
@@ -909,23 +949,27 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
             return f"[edit_existing_file] Security concern for {rel_path}"
         if not abs_path.exists() or not abs_path.is_file():
             return f"[edit_existing_file] File not found: {rel_path}"
-        if _content_has_placeholders(str(changes)):
-            return (
-                "[edit_existing_file] Rejected: content contains placeholders like \"... existing code ...\". "
-                "Use old_string and new_string for targeted edits instead of full-file changes with placeholders."
-            )
-        new_content = str(changes)
         old_content = abs_path.read_text()
-        # Reject if model sent a fragment: new content much smaller than existing (would wipe file)
-        if len(old_content) > 0 and len(new_content) < max(100, len(old_content) // 2):
-            return (
-                f"[edit_existing_file] Rejected: new content ({len(new_content)} chars) is much smaller than "
-                f"existing file ({len(old_content)} chars). For small edits use search_replace(old_string=..., new_string=..., path=...). "
-                "For full replacement, provide the complete new file content in changes=."
-            )
+        changes_str = str(changes)
+        if _content_has_placeholders(changes_str):
+            new_content = _resolve_placeholders_in_edit(changes_str, old_content)
+            if new_content is None:
+                return (
+                    "[edit_existing_file] Could not resolve placeholder (context not found in file). "
+                    "Use search_replace(old_string=..., new_string=..., path=...) for targeted edits."
+                )
+        else:
+            new_content = changes_str
+            # Reject plain fragment (no placeholders): would wipe file
+            if len(old_content) > 0 and len(new_content) < max(100, len(old_content) // 2):
+                return (
+                    f"[edit_existing_file] Rejected: new content ({len(new_content)} chars) is much smaller than "
+                    f"existing file ({len(old_content)} chars). For small edits use search_replace(old_string=..., new_string=..., path=...). "
+                    "For full replacement provide complete content; for partial edits use placeholders like \"... existing code ...\" in changes=."
+                )
         write_file_text(rel_path, new_content)
         _tool_log(f"  -> wrote {rel_path} (changes)")
-        _tool_wrote_log(rel_path, content_len=len(str(changes)))
+        _tool_wrote_log(rel_path, content_len=len(new_content))
         return f"Successfully edited {rel_path}"
 
     if name == "create_new_file":

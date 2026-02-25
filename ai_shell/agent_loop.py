@@ -53,6 +53,7 @@ from .index import get_indexed_files, get_symbols_for_file
 from .model import get_session_cache_key, stream_reply_chunks
 from .model import chat_completion_with_tools
 from .search_replace import apply_search_replace
+from .tool_repetition_detector import ToolRepetitionDetector
 from .tool_executor import (
     AGENT_TOOLS_JSON,
     TOOLS_SYSTEM_HINT,
@@ -284,9 +285,11 @@ def _run_one_tool(
         old_str = (kwargs.get("old_string") or "").strip()
         new_str = kwargs.get("new_string", "")
         path_str = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip("'\"")
+        # Replace all when model omits replace_all or passes true; replace first only when model writes false
+        replace_all = kwargs.get("replace_all") not in (False, "false", "0", "no")
         if not old_str or not path_str:
             return "[search_replace] Error: old_string and path required"
-        edit = {"old_string": old_str, "new_string": new_str, "path": path_str}
+        edit = {"old_string": old_str, "new_string": new_str, "path": path_str, "replace_all": replace_all}
         # #region agent log
         import json as _json
         import time as _time
@@ -321,6 +324,10 @@ def _run_one_tool(
         # #region agent log
         _dlog("agent_loop._run_one_tool:search_replace_touched", "touched_after", {"touched_after": len(touched)}, "H4")
         # #endregion
+        dbg(
+            f"agent_loop search_replace result path={path_str!r} replace_all={replace_all} "
+            f"ok={ok} msg={msg!r}"
+        )
         # Continue-style: return exact success/fail message (no prefix)
         return msg
 
@@ -368,6 +375,22 @@ _API_TOOL_NAME_MAP = {
     "run_terminal_command": "run_terminal_cmd",
 }
 
+_MUTATING_TOOLS = frozenset({
+    "search_replace",
+    "edit_existing_file",
+    "multi_edit",
+    "write_file",
+    "create_new_file",
+})
+
+
+def _tool_call_signature(name: str, args: Dict[str, Any]) -> str:
+    payload = {
+        "name": (name or "").strip().lower(),
+        "args": args or {},
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
 
 def _run_agent_api_tools(
     spec: str,
@@ -400,6 +423,8 @@ def _run_agent_api_tools(
     per_file_staged: Dict[str, str] = {}
     per_file_before: Dict[str, str] = {}
     touched: List[str] = []
+    applied_edits: set[str] = set()
+    repetition_detector = ToolRepetitionDetector(getattr(config, "TOOL_REPETITION_LIMIT", 3))
     action_feed: List[Dict[str, Any]] = []
     final_content = ""
     start = time.time()
@@ -479,13 +504,35 @@ def _run_agent_api_tools(
                     on_action(action)
                 except Exception:
                     pass
-            result = _run_one_tool(
-                internal_name,
-                args,
-                per_file_staged=per_file_staged,
-                per_file_before=per_file_before,
-                touched=touched,
-            )
+            sig = _tool_call_signature(internal_name, args)
+            repetition_check = repetition_detector.check(internal_name, args)
+            if not repetition_check.allow_execution:
+                result = repetition_check.message or (
+                    f"Tool call repetition limit reached for {internal_name}. Please try a different approach."
+                )
+                dbg(f"agent_loop api_tools: repetition guard blocked tool={internal_name} sig={sig[:120]}")
+            elif internal_name in _MUTATING_TOOLS and sig in applied_edits:
+                result = "Already applied. Do not call this edit again; do the next task or respond with a brief summary and no further tool calls."
+                dbg(f"agent_loop api_tools: duplicate edit blocked tool={internal_name}")
+            else:
+                result = _run_one_tool(
+                    internal_name,
+                    args,
+                    per_file_staged=per_file_staged,
+                    per_file_before=per_file_before,
+                    touched=touched,
+                )
+                if internal_name in _MUTATING_TOOLS and isinstance(result, str):
+                    if internal_name == "search_replace" and result.startswith("Successfully edited "):
+                        applied_edits.add(sig)
+                    elif internal_name == "write_file" and "Wrote" in result and "Error" not in result[:30]:
+                        applied_edits.add(sig)
+                    elif internal_name == "multi_edit" and not result.startswith("[multi_edit] Error"):
+                        applied_edits.add(sig)
+                    elif internal_name == "edit_existing_file" and "Error" not in result[:80]:
+                        applied_edits.add(sig)
+                    elif internal_name == "create_new_file" and "Created" in result:
+                        applied_edits.add(sig)
             # Debug: log read_file result so we can verify model sees post-edit content
             if internal_name == "read_file" and result and not result.strip().startswith("["):
                 path_for_log = (args.get("filepath") or args.get("path") or "").strip().strip("'\"")
@@ -493,6 +540,11 @@ def _run_agent_api_tools(
                     f"read_file round={round_num} path={path_for_log!r} len={len(result)} "
                     f"has_clamp_int={('clamp_int' in result)}"
                 )
+            preview = (result[:220] + "...") if isinstance(result, str) and len(result) > 220 else result
+            dbg(
+                f"agent_loop api_tools tool_result round={round_num} tool={internal_name} "
+                f"len={len(result) if isinstance(result, str) else 0} preview={preview!r}"
+            )
             tc_id = tc.get("id") or ""
             tool_results.append({"role": "tool", "tool_call_id": tc_id, "content": result})
 
@@ -592,6 +644,8 @@ def run_agent(
     per_file_staged: Dict[str, str] = {}
     per_file_before: Dict[str, str] = {}
     touched: List[str] = []
+    applied_edits: set[str] = set()
+    repetition_detector = ToolRepetitionDetector(getattr(config, "TOOL_REPETITION_LIMIT", 3))
     action_feed: List[Dict[str, Any]] = []
     final_reply = ""
     start = time.time()
@@ -662,12 +716,40 @@ def run_agent(
                     on_action(action)
                 except Exception:
                     pass
-            result = _run_one_tool(
-                internal_name,
-                kw,
-                per_file_staged=per_file_staged,
-                per_file_before=per_file_before,
-                touched=touched,
+            tool_args = kw or {}
+            sig = _tool_call_signature(internal_name, tool_args)
+            repetition_check = repetition_detector.check(internal_name, tool_args)
+            if not repetition_check.allow_execution:
+                result = repetition_check.message or (
+                    f"Tool call repetition limit reached for {internal_name}. Please try a different approach."
+                )
+                dbg(f"agent_loop: repetition guard blocked tool={internal_name} sig={sig[:120]}")
+            elif internal_name in _MUTATING_TOOLS and sig in applied_edits:
+                result = "Already applied. Do not call this edit again; do the next task or respond with a brief summary and no further tool calls."
+                dbg(f"agent_loop: duplicate edit blocked tool={internal_name}")
+            else:
+                result = _run_one_tool(
+                    internal_name,
+                    tool_args,
+                    per_file_staged=per_file_staged,
+                    per_file_before=per_file_before,
+                    touched=touched,
+                )
+                if internal_name in _MUTATING_TOOLS and isinstance(result, str):
+                    if internal_name == "search_replace" and result.startswith("Successfully edited "):
+                        applied_edits.add(sig)
+                    elif internal_name == "write_file" and "Wrote" in result and "Error" not in result[:30]:
+                        applied_edits.add(sig)
+                    elif internal_name == "multi_edit" and not result.startswith("[multi_edit] Error"):
+                        applied_edits.add(sig)
+                    elif internal_name == "edit_existing_file" and "Error" not in result[:80]:
+                        applied_edits.add(sig)
+                    elif internal_name == "create_new_file" and "Created" in result:
+                        applied_edits.add(sig)
+            preview = (result[:220] + "...") if isinstance(result, str) and len(result) > 220 else result
+            dbg(
+                f"agent_loop tool_result round={round_num} tool={internal_name} "
+                f"len={len(result) if isinstance(result, str) else 0} preview={preview!r}"
             )
             results.append(result)
 

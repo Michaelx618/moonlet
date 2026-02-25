@@ -631,17 +631,9 @@ def apply_search_replace(
         # #region agent log
         _dlog("search_replace.apply_search_replace:string_not_found", "string_not_found", {"rel_path": rel_path, "err_msg": err_msg[:200]}, "H3")
         # #endregion
-        # Continue-style failure message: tell model to read file again for up-to-date contents
-        snippet_len = 600
-        snippet = (content[:snippet_len] + "..." if len(content) > snippet_len else content)
-        if snippet.strip():
-            snippet = "\nCurrent file content (snippet):\n" + snippet.replace("\r\n", "\n")
-        else:
-            snippet = "\n(File is empty.)"
+        # Continue-style: short failure message only (no file snippet)
         fail_msg = (
-            f"Failed to edit {rel_path}. To continue working with the file, read it again to see the most up-to-date contents. "
-            "If this edit was already applied in a previous round, do not retry it; move on."
-            + snippet
+            f"Failed to edit {rel_path}. To continue working with the file, read it again to see the most up-to-date contents."
         )
         return False, fail_msg, None
 
