@@ -27,22 +27,24 @@ _symbol_cache: Dict[str, List[dict]] = {}
 _symbol_cache_max_files: int = 50  # cap cache size
 
 
-def _list_editable_files(max_files: int = 200) -> List[str]:
-    """List editable files in repo, respecting include filter."""
-    root = get_root()
+def walk_editable_files(
+    root: Path,
+    include: Optional[List[str]],
+    max_files: int,
+    *,
+    require_include: bool = True,
+) -> List[str]:
+    """Canonical walk: list relative paths under root, respecting include filter.
+    Used by index, relevance, and indexing/codebase_indexer."""
     if not root.exists() or not root.is_dir():
         return []
-    include = get_include()
-    # Default-safe behavior: do not index the whole workspace until files are explicitly imported.
-    if getattr(config, "INDEX_REQUIRES_IMPORT", True) and not include:
+    if require_include and not include:
         return []
     files: List[str] = []
     seen: Set[str] = set()
-
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
-            d
-            for d in dirnames
+            d for d in dirnames
             if d not in config.IGNORE_DIRS and not d.startswith(".")
         ]
         for fname in sorted(filenames):
@@ -56,11 +58,10 @@ def _list_editable_files(max_files: int = 200) -> List[str]:
             if not is_allowed_file(rel):
                 continue
             if include and not getattr(config, "DISABLE_INDEX", False):
-                # Match exact path or path under an included directory
                 matched = rel in include
                 if not matched:
                     for p in include:
-                        prefix = p.rstrip("/")
+                        prefix = (p or "").rstrip("/")
                         if prefix and (rel == prefix or rel.startswith(prefix + "/")):
                             matched = True
                             break
@@ -72,11 +73,19 @@ def _list_editable_files(max_files: int = 200) -> List[str]:
             seen.add(norm)
             files.append(norm)
             if len(files) >= max_files:
-                break
+                return sorted(files)
         if len(files) >= max_files:
             break
-
     return sorted(files)
+
+
+def _list_editable_files(max_files: int = 200) -> List[str]:
+    """List editable files in repo, respecting include filter."""
+    root = get_root()
+    include = get_include()
+    if getattr(config, "INDEX_REQUIRES_IMPORT", True) and not include:
+        return []
+    return walk_editable_files(root, include, max_files, require_include=False)
 
 
 def rebuild_index() -> List[str]:
@@ -119,13 +128,6 @@ def get_indexed_files() -> List[str]:
     if not _indexed_files:
         rebuild_index()
     return list(_indexed_files)
-
-
-def invalidate_index() -> None:
-    """Invalidate the index (e.g. before root/include change)."""
-    global _indexed_files, _symbol_cache
-    _indexed_files = []
-    _symbol_cache.clear()
 
 
 def get_symbols_for_file(rel_path: str) -> List[dict]:

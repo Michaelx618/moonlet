@@ -75,6 +75,8 @@ const params = new URLSearchParams(window.location.search);
       const runFileBtn = document.getElementById("runFileBtn");
       const openTerminalBtn = document.getElementById("openTerminalBtn");
       const newChatBtn = document.getElementById("newChatBtn");
+      const copyResponseBtn = document.getElementById("copyResponseBtn");
+      const exportTranscriptBtn = document.getElementById("exportTranscriptBtn");
       const terminalOutputEl = document.getElementById("terminalOutput");
       const terminalCloseBtn = document.getElementById("terminalCloseBtn");
       const explorerMenuEl = document.getElementById("explorerMenu");
@@ -494,14 +496,16 @@ const params = new URLSearchParams(window.location.search);
       }
 
       function applyModeUI(mode) {
-        const next = mode === "chat" ? "chat" : "agent";
+        // Migrate legacy "chat" to "ask"
+        const next = (mode === "chat" ? "ask" : (mode === "ask" || mode === "plan" || mode === "agent" ? mode : "agent"));
         modeEl.value = next;
         localStorage.setItem("moonlet_mode", next);
-        promptEl.placeholder = next === "chat"
-          ? "Chat with Moonlet..."
-          : "Ask the agent... or /run <command>";
+        if (next === "ask") promptEl.placeholder = "Ask Moonlet...";
+        else if (next === "plan") promptEl.placeholder = "Explore codebase and plan changes...";
+        else promptEl.placeholder = "Ask the agent... or /run <command>";
       }
-      const savedMode = localStorage.getItem("moonlet_mode") || "agent";
+      let savedMode = localStorage.getItem("moonlet_mode") || "agent";
+      if (savedMode === "chat") savedMode = "ask";
       applyModeUI(savedMode);
       modeEl.addEventListener("change", () => applyModeUI(modeEl.value));
       createEditor();
@@ -1130,6 +1134,19 @@ const params = new URLSearchParams(window.location.search);
       }
       function esc(s) {
         return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      }
+
+      /** Strip or collapse tool-call blocks so the user sees natural language + short "Running: X" cues. */
+      function stripToolCallsForDisplay(text) {
+        if (!text || typeof text !== "string") return text;
+        const toolNames = "read_file|list_files|view_subdirectory|grep|grep_search|glob_file_search|glob_search|codebase_search|codebase_tool|view_repo_map|view_diff|search_replace|edit_existing_file|single_find_and_replace|multi_edit|write_file|create_new_file|run_terminal_cmd|run_terminal_command";
+        let out = text;
+        out = out.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, content) => {
+          if (new RegExp(`\\b(${toolNames})\\s*\\(`, "i").test(content)) return "\n\n";
+          return m;
+        });
+        out = out.replace(new RegExp(`\\b(${toolNames})\\s*\\([^)]*\\)`, "gi"), "Running: $1 …");
+        return out.trim();
       }
 
       function truncatePanelUserText(text) {
@@ -1763,7 +1780,7 @@ const params = new URLSearchParams(window.location.search);
         const pending = window._pendingDiff || "";
         const diff = (perFile && perFile.trim()) ? perFile : ((pending && pending.trim()) ? pending : "");
         const summary = diff ? summarizeDiff(diff, path) : (path ? `${esc(path)} &middot; changes applied` : "Changes applied");
-        responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);"><strong>Applied</strong><div style="margin-top:6px;">${summary}</div></div>`;
+        responseEl.innerHTML = `<div class="response-card"><strong>Applied</strong><div class="response-section">${summary}</div></div>`;
         responseEl.classList.add("has-content");
       }
 
@@ -2014,13 +2031,20 @@ const params = new URLSearchParams(window.location.search);
         await sendPrompt();
       }
 
+      // Execute plan (from Plan mode): set by Execute button; when meta completes, switch to agent
+      let lastSendWasExecute = false;
+
       // ─── Send Prompt ───
       async function sendPrompt() {
         let rawText = promptEl.value.trim();
         const useRepairPayload = window._repairPayload;
+        const useExecutePayload = window._executePayload;
         if (useRepairPayload) {
           rawText = useRepairPayload.text || "";
           delete window._repairPayload;
+        } else if (useExecutePayload) {
+          rawText = useExecutePayload.text || "Implement the following plan.";
+          lastSendWasExecute = true;
         }
         if (!rawText || activeRequest) return;
         if (!(await ensureServerReadyNow())) {
@@ -2115,7 +2139,7 @@ const params = new URLSearchParams(window.location.search);
           }
           return;
         }
-        const selectedMode = useRepairPayload ? "repair" : (modeEl.value || "agent");
+        const selectedMode = useRepairPayload ? "repair" : (useExecutePayload ? "agent" : (modeEl.value || "agent"));
         // Throttled response rendering state — declared before try so finally can access
         let firstChunk = true;
         let rawResponseBuf = "";
@@ -2128,19 +2152,31 @@ const params = new URLSearchParams(window.location.search);
         function flushResponse() {
           if (metaSummaryLocked) return;
           responseThrottleTimer = null;
-          const rendered = rawResponseBuf;
+          const rendered = stripToolCallsForDisplay(rawResponseBuf);
           if (activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
             panelTranscript[activeTranscriptIndex].assistant = rendered || "...";
             renderPanelTranscript();
             return;
           }
-          responseEl.textContent = rawResponseBuf;
+          responseEl.textContent = rendered;
           responseEl.classList.add("has-content");
         }
         try {
-          const payload = useRepairPayload
-            ? { ...useRepairPayload, focus_file: currentFile, file_path: currentFile }
-            : { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
+          let payload;
+          if (useExecutePayload) {
+            payload = {
+              mode: "agent",
+              text: useExecutePayload.text || "Implement the following plan.",
+              plan_context: useExecutePayload.plan_context || "",
+              focus_file: currentFile,
+              file_path: currentFile,
+            };
+            delete window._executePayload;
+          } else if (useRepairPayload) {
+            payload = { ...useRepairPayload, focus_file: currentFile, file_path: currentFile };
+          } else {
+            payload = { text, mode: selectedMode, focus_file: currentFile, file_path: currentFile };
+          }
           const controller = new AbortController();
           activeRequest = controller;
           console.log("[Moonlet] POST /stream sending text length=" + (payload.text ? payload.text.length : 0) + " mode=" + (payload.mode || ""));
@@ -2192,10 +2228,12 @@ const params = new URLSearchParams(window.location.search);
             } else if (event === "done") {
               console.log("[Moonlet] stream done, response length=" + (rawResponseBuf ? rawResponseBuf.length : 0));
               doneReceived = true;
-              // In chat mode, never show "Staged for" — that's agent-only; treat as server bug
-              const isChat = (selectedMode || "").toLowerCase() === "chat";
-              if (isChat && /^Staged for:/.test(String(rawResponseBuf || "").trim())) {
-                rawResponseBuf = "Chat mode: no file changes are made. Use agent mode to edit files.";
+              // In ask/plan mode, never show "Staged for" — that's agent-only
+              const isAskOrPlan = /^(ask|plan)$/.test((selectedMode || "").toLowerCase());
+              if (isAskOrPlan && /^Staged for:/.test(String(rawResponseBuf || "").trim())) {
+                rawResponseBuf = (selectedMode || "").toLowerCase() === "plan"
+                  ? "Plan mode: no file changes. Use Agent mode or Execute to apply."
+                  : "Ask mode: no file changes are made. Use Agent mode to edit files.";
               }
               // Final flush of response text
               if (responseThrottleTimer) { clearTimeout(responseThrottleTimer); responseThrottleTimer = null; }
@@ -2228,14 +2266,52 @@ const params = new URLSearchParams(window.location.search);
                   });
                 }
                 stopTimer("done");
-                // In chat mode, never process staged/diff meta — chat does not stage files
-                const isChatMode = (selectedMode || "").toLowerCase() === "chat";
-                if (isChatMode && (d.staged || (d.per_file_staged && Object.keys(d.per_file_staged).length > 0))) {
-                  // Ignore staged content; show only explanation/text
+                // After execute run completes, switch to agent mode
+                if (lastSendWasExecute) {
+                  applyModeUI("agent");
+                  lastSendWasExecute = false;
+                }
+                // In ask/plan mode, never process staged/diff meta — no file edits
+                const isAskOrPlanMode = /^(ask|plan)$/.test((selectedMode || "").toLowerCase());
+                if (isAskOrPlanMode && (d.staged || (d.per_file_staged && Object.keys(d.per_file_staged).length > 0))) {
                   d.staged = false;
                   d.per_file_staged = {};
                   d.per_file_before = {};
                   d.files_changed = [];
+                }
+                // When Plan mode produces a plan, show Execute button
+                if (d.mode_used === "plan") {
+                  const planText = (d.explanation || d.output || rawResponseBuf || "").trim();
+                  if (planText) {
+                    window._lastPlanText = planText;
+                    let wrap = document.getElementById("executePlanWrap");
+                    if (!wrap) {
+                      wrap = document.createElement("div");
+                      wrap.id = "executePlanWrap";
+                      wrap.style.marginTop = "8px";
+                      const btn = document.createElement("button");
+                      btn.className = "btn btn-sm";
+                      btn.textContent = "Execute";
+                      btn.title = "Run this plan in Agent mode";
+                      btn.onclick = () => {
+                        if (window._lastPlanText) {
+                          window._executePayload = {
+                            mode: "agent",
+                            text: "Implement the following plan.",
+                            plan_context: window._lastPlanText,
+                          };
+                          sendPrompt();
+                        }
+                        wrap.style.display = "none";
+                      };
+                      wrap.appendChild(btn);
+                      responseEl.parentNode && responseEl.parentNode.appendChild(wrap);
+                    }
+                    wrap.style.display = "block";
+                  }
+                } else {
+                  const wrap = document.getElementById("executePlanWrap");
+                  if (wrap) wrap.style.display = "none";
                 }
                 const dur = d.duration_ms ? `${(d.duration_ms/1000).toFixed(1)}s` : '';
                 setStatus(`Done ${dur}`, "");
@@ -2255,13 +2331,13 @@ const params = new URLSearchParams(window.location.search);
                   const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
                   let html = "";
                   if (explanation) {
-                    html += `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div>`;
+                    html += `<div class="response-explanation">${esc(explanation)}</div>`;
                   }
                   html += `<strong>Changed ${fc.length} file${fc.length !== 1 ? 's' : ''}</strong><br>`;
                   for (const f of fc) {
                     const fdiff = (d.per_file_diffs || {})[f] || "";
                     const fsum = fdiff ? summarizeDiff(fdiff, f) : esc(f);
-                    html += `<div style="margin:4px 0;padding:2px 0;border-bottom:1px solid var(--border);">${fsum}</div>`;
+                    html += `<div class="response-files">${fsum}</div>`;
                   }
                   responseEl.innerHTML = html;
                   responseEl.classList.add("has-content");
@@ -2364,7 +2440,7 @@ const params = new URLSearchParams(window.location.search);
                   const explanation = (d.explanation || d.output || rawResponseBuf || "").trim();
                   const summary = summarizeDiff(d.diff, d.focus_file || "");
                   responseEl.innerHTML = explanation
-                    ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div>${summary}`
+                    ? `<div class="response-explanation">${esc(explanation)}</div>${summary}`
                     : summary;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
@@ -2380,11 +2456,11 @@ const params = new URLSearchParams(window.location.search);
                   const attemptInfo = (d.attempt_index && d.attempt_total)
                     ? ` &middot; attempt ${Number(d.attempt_index)}/${Number(d.attempt_total)}`
                     : "";
-                  let body = `<div><strong style="color:var(--red);">${tag}</strong>${attemptInfo}</div><div style="margin-top:4px;">${reason}</div>`;
+                  let body = `<div><strong class="response-error">${tag}</strong>${attemptInfo}</div><div class="response-section">${reason}</div>`;
                   if (d.diff && d.diff.trim()) {
-                    body += `<div style="margin-top:6px;">${summarizeDiff(d.diff, d.focus_file || "")}</div>`;
+                    body += `<div class="response-section">${summarizeDiff(d.diff, d.focus_file || "")}</div>`;
                   }
-                  responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${body}</div>`;
+                  responseEl.innerHTML = `<div class="response-card">${body}</div>`;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
@@ -2462,8 +2538,8 @@ const params = new URLSearchParams(window.location.search);
                       ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.`
                       : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`);
                   responseEl.innerHTML = explanation
-                    ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>`
-                    : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>`;
+                    ? `<div class="response-explanation">${esc(explanation)}</div><div class="response-card">${msg}</div>`
+                    : `<div class="response-card">${msg}</div>`;
                   responseEl.classList.add("has-content");
                   rawResponseBuf = "";
                   renderedMetaSummary = true;
@@ -2474,7 +2550,7 @@ const params = new URLSearchParams(window.location.search);
                 if (d.staged_content !== undefined && d.staged_file) {
                   window._perFileStaged = { ...(window._perFileStaged || {}), [d.staged_file]: d.staged_content };
                 }
-                if ((d.mode_used === "pipeline" || d.mode_used === "pipeline_repair" || d.mode_used === "continue_agent") && (d.touched?.length > 0 || d.per_file_staged)) {
+                if ((d.mode_used === "pipeline" || d.mode_used === "pipeline_repair" || d.mode_used === "agent") && (d.touched?.length > 0 || d.per_file_staged)) {
                   window._lastAgentPrompt = text;
                   window._lastAgentMeta = d;
                   document.getElementById("btnRepair").style.display = "none";
@@ -2575,7 +2651,7 @@ const params = new URLSearchParams(window.location.search);
                 window._pendingDiff = null;
               }
               if (!finalHasDiff && pendingNoopRun) {
-                responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${pendingNoopBody}</div>`;
+                responseEl.innerHTML = `<div class="response-card">${pendingNoopBody}</div>`;
                 responseEl.classList.add("has-content");
                 rawResponseBuf = "";
                 clearDiffHighlights();
@@ -2630,11 +2706,14 @@ const params = new URLSearchParams(window.location.search);
       // ─── Auto-resize prompt input ───
       promptEl.addEventListener("input", () => {
         promptEl.style.height = "auto";
-        promptEl.style.height = Math.min(promptEl.scrollHeight, 80) + "px";
+        promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + "px";
       });
 
       promptEl.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+        if (e.key === "Enter" && (!e.shiftKey || e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          sendPrompt();
+        }
       });
 
       // ─── Save ───
@@ -3023,6 +3102,42 @@ const params = new URLSearchParams(window.location.search);
       pickRootBtn.onclick = () => handlePick(true);
       if (newChatBtn) {
         newChatBtn.onclick = () => startNewChat();
+      }
+      if (copyResponseBtn) {
+        copyResponseBtn.onclick = async () => {
+          const text = (responseEl.innerText || responseEl.textContent || "").trim();
+          if (!text) {
+            setStatus("Nothing to copy", "");
+            return;
+          }
+          try {
+            await navigator.clipboard.writeText(text);
+            setStatus("Copied to clipboard", "");
+          } catch (_) {
+            setStatus("Copy failed", "error");
+          }
+        };
+      }
+      if (exportTranscriptBtn) {
+        exportTranscriptBtn.onclick = () => {
+          const lines = [];
+          const current = (responseEl.innerText || responseEl.textContent || "").trim();
+          for (const t of panelTranscript) {
+            if (t.user) lines.push("## You\n\n" + (t.user || "").trim() + "\n");
+            if (t.assistant) lines.push("## Assistant\n\n" + (t.assistant || "").trim() + "\n");
+          }
+          if (current && !lines.some(l => l.includes(current.slice(0, 50)))) {
+            lines.push("## Assistant\n\n" + current + "\n");
+          }
+          const markdown = lines.length ? lines.join("\n") : (current || "No conversation to export.");
+          const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "moonlet-transcript.md";
+          a.click();
+          URL.revokeObjectURL(a.href);
+          setStatus("Exported transcript", "");
+        };
       }
       if (clearRootBtn) {
         clearRootBtn.onclick = () => unselectDirectory();

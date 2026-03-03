@@ -1,4 +1,4 @@
-"""File editing utilities ported from Continue codebase."""
+"""File editing utilities."""
 import difflib
 from pathlib import Path
 from typing import List, Tuple, Optional

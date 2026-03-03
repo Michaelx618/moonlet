@@ -19,6 +19,8 @@ DEBUG = os.getenv("SC2_DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_KV_CACHE = os.getenv("SC2_DEBUG_KV", "").lower() in ("1", "true", "yes")
 # SC2_DEBUG_CHAT=1: log chat prompt, context size, rounds, tools used (for debugging "no context")
 DEBUG_CHAT = os.getenv("SC2_DEBUG_CHAT", "").lower() in ("1", "true", "yes")
+# SC2_DEBUG_AGENT_LOG=1: write agent/tool debug entries to .cursor/debug-*.log (off by default)
+DEBUG_AGENT_LOG = os.getenv("SC2_DEBUG_AGENT_LOG", "").lower() in ("1", "true", "yes")
 DEBUG_LOG_PATH = os.getenv(
     "SC2_DEBUG_LOG", "/Users/michael/moonlet/runtime-debug.log"
 )
@@ -74,12 +76,7 @@ PATCH_TINY_SINGLE_HUNK_MAX_LINES = int(
 )
 # Freedom mode: cap total context chars to avoid bloated prompts (default 5000)
 FREEDOM_CONTEXT_MAX_CHARS = int(os.getenv("SC2_FREEDOM_CONTEXT_MAX_CHARS", "5000"))
-LLAMA_SERVER_CACHE_SLOTS = int(
-    os.getenv("SC2_LLAMA_SERVER_CACHE_SLOTS", "32")
-)
-# Optional GGUF path for local quantized model (llama.cpp backend)
-GGUF_PATH = os.getenv("SC2_GGUF")
-# Optional MLX model (HuggingFace id or local path). When set, use mlx_lm instead of GGUF.
+# MLX model (HuggingFace id or local path). Required (GGUF/llama.cpp backends removed).
 # Example: SC2_MLX_MODEL=mlx-community/Llama-3.2-3B-Instruct-4bit
 # For faster load (skip hub), set SC2_MLX_MODEL_PATH to the cache snapshot dir, e.g.:
 #   ~/.cache/huggingface/hub/models--mlx-community--Qwen2.5-Coder-14B-Instruct-4bit/snapshots/<commit_hash>
@@ -92,20 +89,12 @@ MLX_AGENT_PROMPT_MAX_CHARS = int(os.getenv("SC2_MLX_AGENT_PROMPT_MAX_CHARS", "32
 # When False, MLX uses same ChatML wrap as GGUF (no tokenizer chat template). Can reduce edit hallucination.
 MLX_USE_CHAT_TEMPLATE = os.getenv("SC2_MLX_USE_CHAT_TEMPLATE", "false").lower() in ("1", "true", "yes")
 MODEL_PROFILE_NAME = os.getenv("SC2_MODEL_PROFILE", "auto").strip().lower()
-MODEL_PROFILE = resolve_model_profile(MODEL_PROFILE_NAME, GGUF_PATH or "")
-GGUF_CTX = int(os.getenv("SC2_CTX_TOK", "4096"))
-GGUF_THREADS = int(os.getenv("SC2_THREADS", str(os.cpu_count() or 4)))
-GGUF_GPU_LAYERS = int(os.getenv("SC2_GPU_LAYERS", "-1"))
-LLAMA_SERVER_ENABLED = os.getenv("SC2_USE_LLAMA_SERVER", "true").lower() in ("1", "true", "yes")
-LLAMA_SERVER_HOST = os.getenv("SC2_LLAMA_SERVER_HOST", "127.0.0.1")
-LLAMA_SERVER_PORT = int(os.getenv("SC2_LLAMA_SERVER_PORT", "8012"))
-LLAMA_SERVER_BIN = os.getenv("SC2_LLAMA_SERVER_BIN", "")
-LLAMA_SERVER_START_TIMEOUT = int(os.getenv("SC2_LLAMA_SERVER_START_TIMEOUT", "90"))
-# Use chat completions with tools for direct tool calls (no text parsing). Requires --jinja.
+MODEL_PROFILE = resolve_model_profile(MODEL_PROFILE_NAME, "")
+# Use chat completions with tools (not supported with MLX; use completion path).
 if os.getenv("SC2_USE_CHAT_TOOLS") is not None:
     USE_CHAT_TOOLS = os.getenv("SC2_USE_CHAT_TOOLS", "false").lower() in ("1", "true", "yes")
 else:
-    USE_CHAT_TOOLS = bool(MODEL_PROFILE.use_chat_tools)
+    USE_CHAT_TOOLS = False  # MLX backend uses completion path only (no native tool_calls).
 # Wrap raw prompts in chatml tags for chat-finetuned models via /completion endpoint.
 # Default true: most GGUF models (DeepSeek-Coder, etc.) are chat-tuned and need this.
 if os.getenv("SC2_USE_CHATML_WRAP") is not None:
@@ -138,9 +127,11 @@ CTX_CHAR_BUDGET = int(
 MAX_PLAN_FILES = int(os.getenv("SC2_MAX_PLAN_FILES", "5"))
 MAX_MULTI_MODEL_CALLS = int(os.getenv("SC2_MAX_MULTI_CALLS", "8"))
 
-# Agent tool loop: max rounds (SC2_MAX_TOOL_ROUNDS). 0 = no cap (Continue-style: run until
+# Agent tool loop: max rounds (SC2_MAX_TOOL_ROUNDS). 0 = no cap (run until
 # model produces output without tool calls). If > 0, loop exits after that many rounds.
 MAX_TOOL_ROUNDS = int(os.getenv("SC2_MAX_TOOL_ROUNDS", "0"))
+# Roo-style guard: consecutive identical tool calls allowed before blocking (0 = disabled).
+TOOL_REPETITION_LIMIT = int(os.getenv("SC2_TOOL_REPETITION_LIMIT", "3"))
 # When True, do not restrict read/edit to imported files; allow any path under root (index/include filter disabled).
 # Default True for now; set SC2_DISABLE_INDEX=0 to re-enable the include filter.
 DISABLE_INDEX = os.getenv("SC2_DISABLE_INDEX", "true").lower() in ("1", "true", "yes")
@@ -198,10 +189,10 @@ MAX_INSTRUCTION_CHARS = int(os.getenv("SC2_MAX_INSTRUCTION_CHARS", "1500"))
 MAX_FOCUS_CONTENT_CHARS = int(os.getenv("SC2_MAX_FOCUS_CONTENT_CHARS", "12000"))
 MAX_REF_CONTENT_CHARS = int(os.getenv("SC2_MAX_REF_CONTENT_CHARS", "12000"))
 MAX_READ_FILES_IN_PROMPT = int(os.getenv("SC2_MAX_READ_FILES_IN_PROMPT", "15"))
-# @Code / @Folder context (Continue-style)
+# @Code / @Folder context
 MAX_CODE_SNIPPET_LINES = int(os.getenv("SC2_MAX_CODE_SNIPPET_LINES", "40"))
 MAX_FOLDER_CONTEXT_FILES = int(os.getenv("SC2_MAX_FOLDER_CONTEXT_FILES", "25"))
-# Continue default agent system message (aligned with core/llm/defaultSystemMessages.ts DEFAULT_AGENT_SYSTEM_MESSAGE)
+# Default agent system message
 _BASE_AGENT_DEFAULT = """\
 <important_rules>
 You are in agent mode.

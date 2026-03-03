@@ -4,13 +4,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-
-#define MAXLINE 256
-#define MAX_PASSWORD 10
-
-#define SUCCESS "Password verified\n"
-#define INVALID "Invalid password\n"
-#define NO_USER "No such user\n"
+#include "common.h"
 
 int main(void) {
   char user_id[MAXLINE];
@@ -24,8 +18,7 @@ int main(void) {
       perror("fgets");
       exit(1);
   }
-  
-
+  // TODO
 
   return 0;
 }

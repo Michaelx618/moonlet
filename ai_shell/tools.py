@@ -1,6 +1,6 @@
 """External tool wrappers: ripgrep and tree-sitter.
 
-These run deterministic tools BEFORE model reasoning (like Continue's tool system).
+These run deterministic tools BEFORE model reasoning.
 Each returns structured data — no AI calls.
 """
 

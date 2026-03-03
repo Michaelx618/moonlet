@@ -25,10 +25,8 @@ def main():
         print(f"[Using MLX model: {config.MLX_MODEL}]", file=sys.stderr)
     elif getattr(config, "MLX_MODEL_PATH", None):
         print(f"[Using MLX model path: {config.MLX_MODEL_PATH}]", file=sys.stderr)
-    elif config.GGUF_PATH:
-        print(f"[Using GGUF model: {config.GGUF_PATH}]", file=sys.stderr)
     else:
-        print(f"[Using HuggingFace model: {config.MODEL_NAME}]", file=sys.stderr)
+        print("[No MLX model configured; set SC2_MLX_MODEL or SC2_MLX_MODEL_PATH]", file=sys.stderr)
     print(f"[Root path: {get_root()}]", file=sys.stderr)
 
     # Build file index for agent tools (grep, symbols, list_files)

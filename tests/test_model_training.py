@@ -9,7 +9,7 @@ Runs a few coding tasks similar to training and checks:
 
 Usage:
   cd /Users/michael/moonlet
-  SC2_GGUF=/path/to/ds67b.gguf SC2_USE_CHAT_TOOLS=1 python tests/test_model_training.py
+  SC2_MLX_MODEL=mlx-community/Some-Model-4bit python tests/test_model_training.py
 
 Or: python -m tests.test_model_training
 """

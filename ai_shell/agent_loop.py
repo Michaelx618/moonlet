@@ -1,35 +1,20 @@
-"""Agent loop: tool-in-the-loop flow (design borrowed from Continue; see BORROWED_FROM_CONTINUE.md).
+"""Agent loop: tool-in-the-loop flow. See BORROWED_FROM_CONTINUE.md for design attribution.
 
 Flow:
 
   1. Tools are sent with the user request (we inject TOOLS_SYSTEM_HINT + optional context).
   2. Model may include tool call(s) in its response.
   3. We execute each tool (built-in: read_file, grep, search_replace, write_file, etc.).
-  4. We send tool results back to the model as context (same as Continue: "fed back into the model").
+  4. We send tool results back to the model as context ("fed back into the model").
   5. Model responds again (possibly with more tool calls) → repeat from step 3 until the model
      responds with no tool calls (then that reply is the final answer).
 
-How the model sees files (us vs Continue):
-- Continue: the model discovers files by calling tools. It gets tool schemas + user message;
-  it has no built-in list of workspace paths. It calls view_subdirectory / list_dir / read_file
-  to see what exists and then edit_existing_file / create_new_file with the paths it found.
-- Us: we inject a workspace path list into the prompt (_workspace_paths_section from the index)
-  so the model sees real paths (e.g. checkpasswd.c, validate.c) up front and is told not to
-  create new top-level dirs. It can still call list_files(path=".") to see more. We also
-  inject optional Reference files (extra_read_files) and Current file (focus_file) content.
-  So we give path list + optional file contents; Continue relies on the model calling tools
-  to discover paths. If we didn't inject paths and the model never called list_files, it
-  could "guess" a path (e.g. w7/checkpasswd.c) and create a new folder by mistake.
+How the model sees files:
+- We inject workspace path list and optional current/reference file paths only (no full file content).
+  The agent is expected to use read_file (and list_files, grep, etc.) to read contents.
 
-Why it works in Continue but not always here:
-- Continue uses either (a) native tool calling (OpenAI/Anthropic/etc. return structured
-  tool_calls in the API response, no free-text parsing) or (b) "system message tools":
-  tools described in XML in the system message, model returns XML tool calls, they parse XML.
-- We use a completion-style API (single prompt → text reply) and parse function-style
-  text like search_replace(old_string="...", path="..."). If the model outputs a different
-  format (e.g. code block, XML, or prose), we don't detect tool calls. For full parity,
-  use a backend with native tool support (USE_CHAT_TOOLS + /v1/chat/completions with tools)
-  or add XML tool parsing to match Continue's fallback path.
+Tool calling: we use a completion-style API (single prompt → text reply) and parse function-style
+text. For native tool_calls use a backend with USE_CHAT_TOOLS + /v1/chat/completions with tools.
 """
 
 from __future__ import annotations
@@ -38,6 +23,7 @@ import difflib
 import json
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -46,7 +32,6 @@ from .files import (
     _norm_rel_path,
     get_root,
     is_edit_allowed,
-    read_single_file_for_context,
     write_file_text,
 )
 from .index import get_indexed_files, get_symbols_for_file
@@ -65,21 +50,137 @@ from .tool_executor import (
 )
 from .utils import dbg
 
-try:
-    from file_utils import generate_diff, is_security_concern
-except ImportError:
-    generate_diff = None
-
-    def is_security_concern(*args, **kwargs):
-        return False
-
+from .file_utils_adapter import generate_diff, is_security_concern
 
 # Junk paths to exclude from context
 _REFERENCE_SKIP = (".dsym/", "contents/info.plist", "/spec.txt", "/task.json", "node_modules/", "__pycache__/")
 
 
+# --- Conversation state (single representation for both completion and API backends) ---
+
+@dataclass
+class Turn:
+    """One round: model reply + tool calls + tool results."""
+    assistant_content: str
+    tool_calls: List[Tuple[str, Dict[str, Any]]]
+    tool_results: List[str]
+    # API path only: raw tool_calls from chat API (with id, function) for message building
+    api_tool_calls: Optional[List[Dict[str, Any]]] = None
+
+
+@dataclass
+class ConversationState:
+    """Everything the model has seen: initial prompt content + list of turns."""
+    initial_content: str
+    turns: List[Turn] = field(default_factory=list)
+    # For API path: system and user content (derived from same build as initial_content)
+    initial_system: str = ""
+    initial_user: str = ""
+
+
+def state_to_prompt(state: ConversationState, next_user_msg: str) -> str:
+    """Serialize conversation state to the exact prompt string used by the completion backend.
+    Must match the previous inline concatenation so model input is byte-for-byte unchanged.
+    """
+    out = state.initial_content
+    for turn in state.turns:
+        combined = "\n\n".join(turn.tool_results)
+        out += f"\nAssistant:\n{turn.assistant_content}\n\nTool results:\n{combined}\n\n"
+    out += next_user_msg
+    return out
+
+
+def state_to_messages(state: ConversationState) -> List[Dict[str, Any]]:
+    """Build chat API message list from conversation state (same structure as API path used before unification)."""
+    system = state.initial_system or ""
+    user = state.initial_user or ""
+    if not system and not user and state.initial_content:
+        # Derive from initial_content: system = first paragraph + TOOLS_SYSTEM_HINT, user = rest
+        system_msg = getattr(
+            config,
+            "BASE_AGENT_SYSTEM_MESSAGE",
+            "You are a systematic coding agent. Break down problems methodically.",
+        )
+        prefix = system_msg + "\n\n" + TOOLS_SYSTEM_HINT.strip()
+        if state.initial_content.startswith(prefix):
+            system = prefix
+            user = state.initial_content[len(prefix):]
+        else:
+            user = state.initial_content
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system or "(none)"},
+        {"role": "user", "content": user or "(none)"},
+    ]
+    for turn in state.turns:
+        if turn.api_tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": turn.assistant_content or "",
+                "tool_calls": turn.api_tool_calls,
+            })
+        else:
+            messages.append({"role": "assistant", "content": turn.assistant_content or ""})
+        for i, content in enumerate(turn.tool_results):
+            tc_id = ""
+            if turn.api_tool_calls and i < len(turn.api_tool_calls):
+                tc_id = (turn.api_tool_calls[i].get("id") or "")
+            messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
+    return messages
+
+
+def get_reply_completion(
+    state: ConversationState,
+    next_user_msg: str,
+    cache_key: Optional[str],
+    max_new: int,
+    stop_sequences: List[str],
+    on_chunk: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Completion backend: build prompt from state, stream reply, return full text."""
+    if not state.turns:
+        prompt = state.initial_content
+    else:
+        prompt = state_to_prompt(state, next_user_msg)
+    round_chunks: List[str] = []
+    for token in stream_reply_chunks(
+        prompt,
+        max_new=max_new,
+        stop_sequences=stop_sequences,
+        cache_key=cache_key,
+    ):
+        round_chunks.append(token)
+        if on_chunk:
+            try:
+                on_chunk(token)
+            except Exception:
+                pass
+    return "".join(round_chunks).strip()
+
+
+def get_reply_api(
+    state: ConversationState,
+    max_new: int,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """API backend: build messages from state, call chat_completion_with_tools, return (content, tool_calls)."""
+    messages = state_to_messages(state)
+    resp = chat_completion_with_tools(
+        messages=messages,
+        tools=AGENT_TOOLS_JSON,
+        max_tokens=max_new,
+        temperature=getattr(config, "TEMPERATURE", 0.1),
+        top_p=getattr(config, "TOP_P", 0.9),
+    )
+    choices = resp.get("choices") or []
+    if not choices:
+        return "", []
+    msg = choices[0].get("message") or {}
+    content = (msg.get("content") or "").strip()
+    tool_calls = msg.get("tool_calls") or []
+    return content, tool_calls
+
+
 def _reference_files_section(extra_read_files: Optional[List[str]]) -> str:
-    """Build Reference files block from extra_read_files. No truncation (same policy as llama.cpp)."""
+    """Reference file paths only. Agent should use read_file to read contents."""
     if not extra_read_files:
         return ""
     root = get_root()
@@ -90,7 +191,7 @@ def _reference_files_section(extra_read_files: Optional[List[str]]) -> str:
     ][:max_files]
     if not filtered:
         return ""
-    parts: List[str] = []
+    paths_only: List[str] = []
     for rel in filtered:
         try:
             norm = _norm_rel_path(rel)
@@ -98,14 +199,12 @@ def _reference_files_section(extra_read_files: Optional[List[str]]) -> str:
             path.relative_to(root.resolve())
             if not path.exists() or not path.is_file():
                 continue
-            content_map = read_single_file_for_context(norm)
-            content = content_map.get(norm) or ""
-            parts.append(f"--- {norm} ---\n{content}\n(Use path \"{norm}\" in tool calls.)")
+            paths_only.append(norm)
         except Exception:
             continue
-    if not parts:
+    if not paths_only:
         return ""
-    return "\n\nReference files (priority context):\n" + "\n\n".join(parts)
+    return "\n\nReference file paths (use read_file to read): " + ", ".join(f'"{p}"' for p in paths_only) + "\n"
 
 
 def _workspace_paths_section() -> str:
@@ -125,7 +224,7 @@ def _workspace_paths_section() -> str:
 
 
 def _focus_file_section(focus_file: Optional[str]) -> str:
-    """Current file content. No truncation (same policy as llama.cpp)."""
+    """Current file path only. Agent should use read_file to read contents."""
     if not focus_file:
         return ""
     root = get_root()
@@ -135,10 +234,8 @@ def _focus_file_section(focus_file: Optional[str]) -> str:
         path.relative_to(root.resolve())
         if not path.exists() or not path.is_file():
             return ""
-        content = path.read_text()
         return (
-            f"\n\nCurrent file (path for tools: \"{rel}\"):\n---\n{content}\n---\n"
-            f"(Use path \"{rel}\" in edit_existing_file/write_file; do not create a new directory.)"
+            f"\n\nCurrent file path (use in tools): \"{rel}\". Use read_file to read its contents.\n"
         )
     except Exception:
         return ""
@@ -179,7 +276,7 @@ def _code_context_section(
                 line2 = max(line1, int(s.get("end_line", line1)))
                 snippet_lines = lines[line1 - 1 : line2] if line1 <= len(lines) else []
                 snippet = "".join(snippet_lines).strip()
-                # No truncation (match Continue)
+                # No truncation
                 block.append(f"  {kind} {name} (L{line1}-{line2}):\n{snippet}")
             parts.append("\n".join(block))
         except Exception:
@@ -208,17 +305,8 @@ def _folder_context_section(context_folders: Optional[List[str]]) -> str:
         if not in_folder:
             parts.append(f"@Folder ({folder_norm or '.'}): (no indexed files)")
             continue
-        lines = [f"@Folder ({folder_norm or '.'}):"] + [f"  {f}" for f in in_folder]
-        # Optionally add full content of first few files (no truncation, same policy as llama.cpp)
-        for f in in_folder[:3]:
-            try:
-                path = (root / f).resolve()
-                if path.exists() and path.is_file():
-                    content = path.read_text()
-                    lines.append(f"\n--- {f} ---\n{content}")
-            except Exception:
-                pass
-        parts.append("\n".join(lines))
+        # List filenames only; agent should use read_file for contents
+        parts.append(f"@Folder ({folder_norm or '.'}): " + ", ".join(in_folder))
     if not parts:
         return ""
     return "\n\n" + "\n\n".join(parts)
@@ -237,7 +325,7 @@ def _build_prompt(
         "BASE_AGENT_SYSTEM_MESSAGE",
         "You are a systematic coding agent. Break down problems methodically.",
     )
-    # Continue: "Agent mode: All tools available for making changes"; tools sent with user request
+    # Agent mode: all tools available; tools sent with user request
     return (
         f"{system_msg}\n\n"
         f"{TOOLS_SYSTEM_HINT.strip()}\n\n"
@@ -290,24 +378,20 @@ def _run_one_tool(
         if not old_str or not path_str:
             return "[search_replace] Error: old_string and path required"
         edit = {"old_string": old_str, "new_string": new_str, "path": path_str, "replace_all": replace_all}
-        # #region agent log
-        import json as _json
-        import time as _time
-        def _dlog(loc: str, msg: str, data: dict, hid: str) -> None:
-            try:
-                with open("/Users/michael/moonlet/.cursor/debug-c7e239.log", "a") as _f:
-                    _f.write(_json.dumps({"sessionId": "c7e239", "hypothesisId": hid, "location": loc, "message": msg, "data": data, "timestamp": int(_time.time() * 1000)}) + "\n")
-            except Exception:
-                pass
+        if config.DEBUG_AGENT_LOG:
+            def _dlog(loc: str, msg: str, data: dict, hid: str) -> None:
+                try:
+                    with open(config.DEBUG_LOG_PATH, "a") as _f:
+                        _f.write(json.dumps({"location": loc, "message": msg, "data": data, "timestamp": int(time.time() * 1000)}) + "\n")
+                except Exception:
+                    pass
+        else:
+            _dlog = lambda _loc, _msg, _data, _hid: None
         _touched_before = len(touched)
-        # #endregion
         ok, msg, meta = apply_search_replace(
             edit, allowed_edit_files=None, root=get_root(), stage_only=False
         )
-        # #region agent log
-        _meta_path = meta.get("path", "").strip() if meta else ""
-        _dlog("agent_loop._run_one_tool:search_replace_after", "after", {"ok": ok, "msg_preview": (msg or "")[:120], "meta_path": _meta_path, "touched_before": _touched_before}, "H4")
-        # #endregion
+        _dlog("agent_loop._run_one_tool:search_replace_after", "after", {"ok": ok, "msg_preview": (msg or "")[:120], "meta_path": (meta.get("path", "").strip() if meta else ""), "touched_before": _touched_before}, "H4")
         if ok and meta:
             path = meta.get("path", "").strip()
             if path and path not in touched:
@@ -321,14 +405,12 @@ def _run_one_tool(
                     per_file_before[path] = old_c
                     per_file_staged[path] = new_c
             tool_log(f"search_replace -> {path or path_str}")
-        # #region agent log
         _dlog("agent_loop._run_one_tool:search_replace_touched", "touched_after", {"touched_after": len(touched)}, "H4")
-        # #endregion
         dbg(
             f"agent_loop search_replace result path={path_str!r} replace_all={replace_all} "
             f"ok={ok} msg={msg!r}"
         )
-        # Continue-style: return exact success/fail message (no prefix)
+        # Return exact success/fail message (no prefix)
         return msg
 
     if name == "write_file":
@@ -361,14 +443,33 @@ def _run_one_tool(
         tool_log(f"write_file -> {rel_path}")
         return f"[write_file] Wrote {rel_path}"
 
+    if name == "create_new_file":
+        result = execute_tool_from_kwargs(name, kwargs)
+        if isinstance(result, str) and "Created" in result and "Error" not in result[:30]:
+            path_str = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip("'\"")
+            if path_str:
+                try:
+                    rel_path = _norm_rel_path(path_str)
+                    if rel_path not in touched:
+                        touched.append(rel_path)
+                    content = kwargs.get("content") or kwargs.get("contents") or ""
+                    per_file_before[rel_path] = ""
+                    per_file_staged[rel_path] = str(content)
+                    tool_log(f"create_new_file -> {rel_path}")
+                except Exception:
+                    pass
+        return result
+
     return execute_tool_from_kwargs(name, kwargs)
 
 
-# Map API tool names to internal executor names. edit_existing_file = path+changes only; search_replace = find-and-replace.
+# Map API tool names to internal executor names.
+# edit_existing_file has its own route (path + changes). search_replace = find-and-replace.
+# single_find_and_replace is a deprecated alias for search_replace.
 _API_TOOL_NAME_MAP = {
     "view_subdirectory": "list_files",
     "grep_search": "grep",
-    "edit_existing_file": "search_replace",  # overridden when args has "changes" -> edit_existing_file
+    "edit_existing_file": "edit_existing_file",
     "search_replace": "search_replace",
     "single_find_and_replace": "search_replace",
     "create_new_file": "create_new_file",
@@ -392,174 +493,103 @@ def _tool_call_signature(name: str, args: Dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def _run_agent_api_tools(
-    spec: str,
-    focus_file: Optional[str],
-    mode: str,
-    extra_read_files: Optional[List[str]],
-    context_folders: Optional[List[str]],
-    max_rounds: int,  # 0 = no cap (Continue-style)
-    on_action: Optional[Callable[[Dict[str, Any]], None]],
-) -> Tuple[str, Dict[str, Any]]:
-    """Run agent using chat_completion_with_tools (native API tool calls)."""
-    system_msg = getattr(
-        config,
-        "BASE_AGENT_SYSTEM_MESSAGE",
-        "You are a systematic coding agent. Break down problems methodically.",
-    )
-    user_content = (
-        f"{_workspace_paths_section()}"
-        f"{_code_context_section(focus_file, extra_read_files)}"
-        f"{_folder_context_section(context_folders)}"
-        f"{_reference_files_section(extra_read_files)}"
-        f"User request:\n{(spec or '').strip()}"
-        f"{_focus_file_section(focus_file)}"
-    )
-    # System message aligned with Continue (no extra append; tool descriptions carry edit guidance)
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_content},
-    ]
-    per_file_staged: Dict[str, str] = {}
-    per_file_before: Dict[str, str] = {}
-    touched: List[str] = []
-    applied_edits: set[str] = set()
-    repetition_detector = ToolRepetitionDetector(getattr(config, "TOOL_REPETITION_LIMIT", 3))
-    action_feed: List[Dict[str, Any]] = []
-    final_content = ""
-    start = time.time()
-    max_new = int(getattr(config, "MAX_NEW", 2048))
-    READ_ONLY = frozenset({"read_file", "list_files", "grep", "view_subdirectory", "grep_search", "glob_search", "codebase_search", "view_repo_map", "view_diff", "symbols"})
-
-    round_num = 0
-    while True:
-        round_num += 1
-        if max_rounds > 0 and round_num > max_rounds:
-            dbg(f"agent_loop api_tools: reached cap max_rounds={max_rounds}, stopping")
-            break
+def _parse_api_tool_calls(tool_calls_api: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    """Convert API tool_calls to list of (name, args) for shared execute path."""
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for tc in tool_calls_api or []:
+        name = (tc.get("function", {}).get("name") or "").strip().lower()
+        args_str = tc.get("function", {}).get("arguments") or "{}"
         try:
-            resp = chat_completion_with_tools(
-                messages=messages,
-                tools=AGENT_TOOLS_JSON,
-                max_tokens=max_new,
-                temperature=getattr(config, "TEMPERATURE", 0.1),
-                top_p=getattr(config, "TOP_P", 0.9),
-            )
-        except Exception as e:
-            dbg(f"agent_loop api_tools round {round_num} error: {e}")
-            output = (final_content or str(e)).strip()
-            meta = {
-                "mode_used": "agent_api_tools",
-                "ok": False,
-                "summary": str(e),
-                "touched": touched,
-                "files_changed": touched,
-                "per_file_diffs": {},
-                "per_file_before": per_file_before,
-                "per_file_staged": per_file_staged,
-                "per_file_after": dict(per_file_staged),
-                "staged": bool(per_file_staged),
-                "applied_directly": True,
-                "agent_actions": action_feed,
-                "duration_ms": int((time.time() - start) * 1000),
-                "output": output[:2000],
-            }
-            return output, meta
+            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+        except Exception:
+            args = {}
+        args = {str(k).lower(): (v if isinstance(v, str) else str(v) if v is not None else "") for k, v in args.items()}
+        if name == "read_file" and "filepath" in args and "path" not in args:
+            args["path"] = args["filepath"]
+        if name == "edit_existing_file" and "filepath" in args and "path" not in args:
+            args["path"] = args["filepath"]
+        out.append((name, args))
+    return out
 
-        choices = resp.get("choices") or []
-        if not choices:
-            break
-        msg = choices[0].get("message") or {}
-        content = (msg.get("content") or "").strip()
-        final_content = content
-        tool_calls = msg.get("tool_calls") or []
 
-        if not tool_calls:
-            break
-
-        tool_results: List[Dict[str, Any]] = []
-        for tc in tool_calls:
-            name = (tc.get("function", {}).get("name") or "").strip().lower()
-            args_str = tc.get("function", {}).get("arguments") or "{}"
+def _execute_tool_calls(
+    func_calls: List[Tuple[str, Dict[str, Any]]],
+    round_num: int,
+    per_file_staged: Dict[str, str],
+    per_file_before: Dict[str, str],
+    touched: List[str],
+    applied_edits: set[str],
+    repetition_detector: ToolRepetitionDetector,
+    action_feed: List[Dict[str, Any]],
+    on_action: Optional[Callable[[Dict[str, Any]], None]],
+) -> Tuple[List[str], List[str]]:
+    """Execute all tool calls; return (results, results_for_turn). Caller may truncate and prepend 'Already edited'."""
+    results: List[str] = []
+    for tool_name, kw in func_calls:
+        internal_name = _API_TOOL_NAME_MAP.get(tool_name, tool_name)
+        action = {
+            "type": "tool_call",
+            "tool": tool_name,
+            "args": dict(kw or {}),
+            "round": round_num,
+        }
+        action_feed.append(action)
+        if on_action:
             try:
-                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                on_action(action)
             except Exception:
-                args = {}
-            args = {str(k).lower(): (v if isinstance(v, str) else str(v) if v is not None else "") for k, v in args.items()}
-            if name == "read_file" and "filepath" in args and "path" not in args:
-                args["path"] = args["filepath"]
-            if name == "edit_existing_file":
-                if "filepath" in args and "path" not in args:
-                    args["path"] = args["filepath"]
-                if args.get("changes") not in (None, ""):
-                    internal_name = "edit_existing_file"
-                else:
-                    internal_name = _API_TOOL_NAME_MAP.get(name, name)
-            else:
-                internal_name = _API_TOOL_NAME_MAP.get(name, name)
-            action = {"type": "tool_call", "tool": name, "args": args, "round": round_num}
-            action_feed.append(action)
-            if on_action:
-                try:
-                    on_action(action)
-                except Exception:
-                    pass
-            sig = _tool_call_signature(internal_name, args)
-            repetition_check = repetition_detector.check(internal_name, args)
-            if not repetition_check.allow_execution:
-                result = repetition_check.message or (
-                    f"Tool call repetition limit reached for {internal_name}. Please try a different approach."
-                )
-                dbg(f"agent_loop api_tools: repetition guard blocked tool={internal_name} sig={sig[:120]}")
-            elif internal_name in _MUTATING_TOOLS and sig in applied_edits:
-                result = "Already applied. Do not call this edit again; do the next task or respond with a brief summary and no further tool calls."
-                dbg(f"agent_loop api_tools: duplicate edit blocked tool={internal_name}")
-            else:
-                result = _run_one_tool(
-                    internal_name,
-                    args,
-                    per_file_staged=per_file_staged,
-                    per_file_before=per_file_before,
-                    touched=touched,
-                )
-                if internal_name in _MUTATING_TOOLS and isinstance(result, str):
-                    if internal_name == "search_replace" and result.startswith("Successfully edited "):
-                        applied_edits.add(sig)
-                    elif internal_name == "write_file" and "Wrote" in result and "Error" not in result[:30]:
-                        applied_edits.add(sig)
-                    elif internal_name == "multi_edit" and not result.startswith("[multi_edit] Error"):
-                        applied_edits.add(sig)
-                    elif internal_name == "edit_existing_file" and "Error" not in result[:80]:
-                        applied_edits.add(sig)
-                    elif internal_name == "create_new_file" and "Created" in result:
-                        applied_edits.add(sig)
-            # Debug: log read_file result so we can verify model sees post-edit content
-            if internal_name == "read_file" and result and not result.strip().startswith("["):
-                path_for_log = (args.get("filepath") or args.get("path") or "").strip().strip("'\"")
-                dbg(
-                    f"read_file round={round_num} path={path_for_log!r} len={len(result)} "
-                    f"has_clamp_int={('clamp_int' in result)}"
-                )
-            preview = (result[:220] + "...") if isinstance(result, str) and len(result) > 220 else result
-            dbg(
-                f"agent_loop api_tools tool_result round={round_num} tool={internal_name} "
-                f"len={len(result) if isinstance(result, str) else 0} preview={preview!r}"
+                pass
+        tool_args = kw or {}
+        sig = _tool_call_signature(internal_name, tool_args)
+        repetition_check = repetition_detector.check(internal_name, tool_args)
+        if not repetition_check.allow_execution:
+            result = repetition_check.message or (
+                f"Tool call repetition limit reached for {internal_name}. Please try a different approach."
             )
-            tc_id = tc.get("id") or ""
-            tool_results.append({"role": "tool", "tool_call_id": tc_id, "content": result})
-
-        if touched and tool_results:
-            tool_results[0]["content"] = (
-                f"[Already edited this session: {', '.join(touched)}. Do not repeat.]\n\n" + tool_results[0]["content"]
+            dbg(f"agent_loop: repetition guard blocked tool={internal_name} sig={sig[:120]}")
+        elif internal_name in _MUTATING_TOOLS and sig in applied_edits:
+            result = "Already applied. Do not call this edit again; do the next task or respond with a brief summary and no further tool calls."
+            dbg(f"agent_loop: duplicate edit blocked tool={internal_name}")
+        else:
+            result = _run_one_tool(
+                internal_name,
+                tool_args,
+                per_file_staged=per_file_staged,
+                per_file_before=per_file_before,
+                touched=touched,
             )
-        messages.append({"role": "assistant", "content": content or "", "tool_calls": tool_calls})
-        for tr in tool_results:
-            messages.append(tr)
-        dbg(f"agent_loop api_tools round={round_num} tools={len(tool_calls)} touched={len(touched)}")
+            if internal_name in _MUTATING_TOOLS and isinstance(result, str):
+                if internal_name == "search_replace" and result.startswith("Successfully edited "):
+                    applied_edits.add(sig)
+                elif internal_name == "write_file" and "Wrote" in result and "Error" not in result[:30]:
+                    applied_edits.add(sig)
+                elif internal_name == "multi_edit" and not result.startswith("[multi_edit] Error"):
+                    applied_edits.add(sig)
+                elif internal_name == "edit_existing_file" and "Error" not in result[:80]:
+                    applied_edits.add(sig)
+                elif internal_name == "create_new_file" and "Created" in result:
+                    applied_edits.add(sig)
+        preview = (result[:220] + "...") if isinstance(result, str) and len(result) > 220 else result
+        dbg(
+            f"agent_loop tool_result round={round_num} tool={internal_name} "
+            f"len={len(result) if isinstance(result, str) else 0} preview={preview!r}"
+        )
+        results.append(result)
+    return results, list(results)
 
-    output = final_content.strip()
-    output = strip_tool_call_code_blocks(output).strip()
-    duration_ms = int((time.time() - start) * 1000)
+
+def _build_meta(
+    touched: List[str],
+    per_file_before: Dict[str, str],
+    per_file_staged: Dict[str, str],
+    action_feed: List[Dict[str, Any]],
+    duration_ms: int,
+    output: str,
+    mode_used: str = "agent",
+    ok: bool = True,
+    summary: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build meta dict shared by completion and API paths."""
     per_file_diffs: Dict[str, str] = {}
     for path in touched:
         old_c = per_file_before.get(path, "")
@@ -569,10 +599,11 @@ def _run_agent_api_tools(
         per_file_diffs[path] = "".join(
             difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=path, lineterm="", n=3)
         )
-    summary = f"Applied edits for: {', '.join(touched)}" if touched else (output or "No tool calls.")
-    meta: Dict[str, Any] = {
-        "mode_used": "agent_api_tools",
-        "ok": True,
+    if summary is None:
+        summary = f"Applied edits for: {', '.join(touched)}" if touched else (output or "No tool calls.")
+    return {
+        "mode_used": mode_used,
+        "ok": ok,
         "summary": summary,
         "touched": touched,
         "files_changed": touched,
@@ -586,8 +617,6 @@ def _run_agent_api_tools(
         "duration_ms": duration_ms,
         "output": output[:2000],
     }
-    # Prefer model's explanation (Continue-style) when present; fall back to summary
-    return (output.strip() or summary), meta
 
 
 def run_agent(
@@ -606,39 +635,57 @@ def run_agent(
     on_action: optional callback called for each tool invocation with
       {"type": "tool_call", "tool": name, "args": kwargs, "round": n}.
     on_chunk: optional callback called for each streamed token/chunk of model output.
-    extra_read_files: optional paths to inject as Reference files (Continue-style context).
+    extra_read_files: optional paths to inject as Reference files.
     context_folders: optional folder paths for @Folder context (list + content).
     """
     del silent
-    # 0 = no cap (Continue-style); > 0 = safety limit
+    # 0 = no cap; > 0 = safety limit
     _max = max_rounds if max_rounds is not None else int(getattr(config, "MAX_TOOL_ROUNDS", 0))
     rounds = _max if _max > 0 else 0  # 0 means no cap
 
-    if getattr(config, "USE_CHAT_TOOLS", False):
-        return _run_agent_api_tools(
-            spec,
-            focus_file=focus_file,
-            mode=mode,
-            extra_read_files=extra_read_files,
-            context_folders=context_folders,
-            max_rounds=rounds,
-            on_action=on_action,
-        )
-
-    prompt = _build_prompt(
+    use_chat_tools = getattr(config, "USE_CHAT_TOOLS", False)
+    initial_content = _build_prompt(
         spec,
         focus_file=focus_file,
         mode=mode,
         extra_read_files=extra_read_files,
         context_folders=context_folders,
     )
+    # For API path, state_to_messages uses system + user (same structure as _run_agent_api_tools: system only, no TOOLS in system)
+    system_msg = getattr(
+        config,
+        "BASE_AGENT_SYSTEM_MESSAGE",
+        "You are a systematic coding agent. Break down problems methodically.",
+    )
+    if use_chat_tools:
+        initial_system = system_msg
+        initial_user = (
+            f"{_workspace_paths_section()}"
+            f"{_code_context_section(focus_file, extra_read_files)}"
+            f"{_folder_context_section(context_folders)}"
+            f"{_reference_files_section(extra_read_files)}"
+            f"User request:\n{(spec or '').strip()}"
+            f"{_focus_file_section(focus_file)}"
+        )
+    else:
+        initial_system = ""
+        initial_user = ""
+    state = ConversationState(
+        initial_content=initial_content,
+        turns=[],
+        initial_system=initial_system,
+        initial_user=initial_user,
+    )
     cache_key = get_session_cache_key()
-    # Use double-newline so we don't cut off mid-reply (e.g. ".\nUser" in prose)
     stop_sequences = ["\n\nUser:", "\n\nSYSTEM:", "\n\nCONTEXT:", "\n\nHISTORY:"]
     max_new = int(getattr(config, "MAX_NEW", 2048))
     READ_ONLY_TOOLS = frozenset({
         "read_file", "list_files", "grep", "glob_file_search", "codebase_search",
         "view_repo_map", "view_diff",
+    })
+    READ_ONLY_TOOLS_API = frozenset({
+        "read_file", "list_files", "grep", "view_subdirectory", "grep_search",
+        "glob_search", "codebase_search", "view_repo_map", "view_diff", "symbols",
     })
 
     per_file_staged: Dict[str, str] = {}
@@ -651,128 +698,132 @@ def run_agent(
     start = time.time()
     nudge_sent = False
     round_num = 0
+    next_user_msg = "User: Proceed. Use the tool results above.\nAssistant:"
 
     while True:
         round_num += 1
         if rounds > 0 and round_num > rounds:
             dbg(f"agent_loop: reached cap rounds={rounds}, stopping")
             break
-        # Step 2: get model response (may contain tool calls)
-        round_chunks: List[str] = []
-        print(f"[agent] round={round_num} starting stream_reply_chunks prompt_len={len(prompt)}", file=sys.stderr)
-        sys.stderr.flush()
-        first_token = True
-        for token in stream_reply_chunks(
-            prompt,
-            max_new=max_new,
-            stop_sequences=stop_sequences,
-            cache_key=cache_key,
-        ):
-            if first_token:
-                print(f"[agent] first token: {repr(token[:80])}{'...' if len(token) > 80 else ''}", file=sys.stderr)
-                sys.stderr.flush()
-                first_token = False
-            round_chunks.append(token)
-            if on_chunk:
-                try:
-                    on_chunk(token)
-                except Exception:
-                    pass
-        reply = "".join(round_chunks).strip()
+
+        # --- Get model reply (backend-specific) ---
+        if use_chat_tools:
+            try:
+                reply, tool_calls_api = get_reply_api(state, max_new=max_new)
+            except Exception as e:
+                dbg(f"agent_loop api round {round_num} error: {e}")
+                output = (final_reply or str(e)).strip()
+                meta = _build_meta(
+                    touched=touched,
+                    per_file_before=per_file_before,
+                    per_file_staged=per_file_staged,
+                    action_feed=action_feed,
+                    duration_ms=int((time.time() - start) * 1000),
+                    output=output,
+                    mode_used="agent_api_tools",
+                    ok=False,
+                    summary=str(e),
+                )
+                return output, meta
+            # Parse API tool_calls to (name, args) for shared execute path
+            func_calls = _parse_api_tool_calls(tool_calls_api)
+        else:
+            print(f"[agent] round={round_num} starting stream_reply_chunks", file=sys.stderr)
+            sys.stderr.flush()
+            first_token = True
+            def _on_chunk(t: str) -> None:
+                nonlocal first_token
+                if first_token:
+                    print(f"[agent] first token: {repr(t[:80])}{'...' if len(t) > 80 else ''}", file=sys.stderr)
+                    sys.stderr.flush()
+                    first_token = False
+                if on_chunk:
+                    try:
+                        on_chunk(t)
+                    except Exception:
+                        pass
+            reply = get_reply_completion(
+                state,
+                next_user_msg,
+                cache_key=cache_key,
+                max_new=max_new,
+                stop_sequences=stop_sequences,
+                on_chunk=_on_chunk,
+            )
+            func_calls = extract_function_style_tool_calls(reply)
+            tool_calls_api = []  # completion path has no API tool_calls
+
+        # Log attempted (parsed) tool calls to debug log and stderr for diagnostics
+        if func_calls:
+            tool_log(
+                f"attempted tool calls ({len(func_calls)}): {[(n, list(k.keys()) if isinstance(k, dict) else []) for n, k in func_calls]}"
+            )
+        else:
+            tool_log("attempted tool calls (0): none parsed from reply")
+
         final_reply = reply
 
-        func_calls = extract_function_style_tool_calls(reply)
         if not func_calls:
-            # Log what the model actually said so we can fix parsing or prompt
-            dbg(f"agent_loop: round={round_num} model reply (no tool calls parsed): {repr(reply[:500])}")
-            # Continue-style: when model responds with no tool calls, that's the final answer; we stop.
-            # Pragmatic addition: if user asked for edits and we have none yet, nudge once.
-            if not touched and not nudge_sent:
+            dbg(f"agent_loop: round={round_num} model reply (no tool calls): {repr(reply[:500])}")
+            if not touched and not nudge_sent and not use_chat_tools:
                 nudge_sent = True
-                prompt = (
-                    f"{prompt}\nAssistant:\n{reply}\n\n"
+                state.turns.append(Turn(
+                    assistant_content=reply,
+                    tool_calls=[],
+                    tool_results=[],
+                    api_tool_calls=None,
+                ))
+                next_user_msg = (
                     "User: You have not made any file edits yet. Use search_replace or edit_existing_file or write_file to apply the requested code changes. Output your tool call(s) now.\nAssistant:"
                 )
                 dbg("agent_loop: no tool calls and no edits yet, sending nudge")
                 continue
             break
 
-        # Step 3: execute each tool; Step 4: collect results to send back to model
-        results: List[str] = []
-        for tool_name, kw in func_calls:
-            if tool_name == "edit_existing_file" and (kw or {}).get("changes") is not None:
-                internal_name = "edit_existing_file"
-            else:
-                internal_name = _API_TOOL_NAME_MAP.get(tool_name, tool_name)
-            action = {
-                "type": "tool_call",
-                "tool": tool_name,
-                "args": dict(kw or {}),
-                "round": round_num,
-            }
-            action_feed.append(action)
-            if on_action:
-                try:
-                    on_action(action)
-                except Exception:
-                    pass
-            tool_args = kw or {}
-            sig = _tool_call_signature(internal_name, tool_args)
-            repetition_check = repetition_detector.check(internal_name, tool_args)
-            if not repetition_check.allow_execution:
-                result = repetition_check.message or (
-                    f"Tool call repetition limit reached for {internal_name}. Please try a different approach."
-                )
-                dbg(f"agent_loop: repetition guard blocked tool={internal_name} sig={sig[:120]}")
-            elif internal_name in _MUTATING_TOOLS and sig in applied_edits:
-                result = "Already applied. Do not call this edit again; do the next task or respond with a brief summary and no further tool calls."
-                dbg(f"agent_loop: duplicate edit blocked tool={internal_name}")
-            else:
-                result = _run_one_tool(
-                    internal_name,
-                    tool_args,
-                    per_file_staged=per_file_staged,
-                    per_file_before=per_file_before,
-                    touched=touched,
-                )
-                if internal_name in _MUTATING_TOOLS and isinstance(result, str):
-                    if internal_name == "search_replace" and result.startswith("Successfully edited "):
-                        applied_edits.add(sig)
-                    elif internal_name == "write_file" and "Wrote" in result and "Error" not in result[:30]:
-                        applied_edits.add(sig)
-                    elif internal_name == "multi_edit" and not result.startswith("[multi_edit] Error"):
-                        applied_edits.add(sig)
-                    elif internal_name == "edit_existing_file" and "Error" not in result[:80]:
-                        applied_edits.add(sig)
-                    elif internal_name == "create_new_file" and "Created" in result:
-                        applied_edits.add(sig)
-            preview = (result[:220] + "...") if isinstance(result, str) and len(result) > 220 else result
-            dbg(
-                f"agent_loop tool_result round={round_num} tool={internal_name} "
-                f"len={len(result) if isinstance(result, str) else 0} preview={preview!r}"
+        # --- Execute tools (shared) ---
+        results, results_for_turn = _execute_tool_calls(
+            func_calls=func_calls,
+            round_num=round_num,
+            per_file_staged=per_file_staged,
+            per_file_before=per_file_before,
+            touched=touched,
+            applied_edits=applied_edits,
+            repetition_detector=repetition_detector,
+            action_feed=action_feed,
+            on_action=on_action,
+        )
+        # Prepend "Already edited" to first result when needed (both backends)
+        if touched and results_for_turn:
+            results_for_turn[0] = (
+                f"[Already edited this session: {', '.join(touched)}. Do not repeat.]\n\n" + results_for_turn[0]
             )
-            results.append(result)
+            results[0] = results_for_turn[0]
 
-        combined = "\n\n".join(results)
         max_chars = int(getattr(config, "MAX_TOOL_RESULT_CHARS", 0) or 0)
+        combined = "\n\n".join(results_for_turn)
         if max_chars > 0 and len(combined) > max_chars:
             combined = combined[:max_chars] + "\n\n...[truncated]"
+            results_for_turn = [combined]
+        state.turns.append(Turn(
+            assistant_content=reply,
+            tool_calls=func_calls,
+            tool_results=results_for_turn,
+            api_tool_calls=tool_calls_api if use_chat_tools else None,
+        ))
 
-        # Step 4/5: send tool results back to model (Continue: "fed back into the model as context")
-        next_user_msg = "User: Continue. Use the tool results above.\nAssistant:"
+        # Next round: compute next_user_msg (completion path) and/or state is updated for API
+        next_user_msg = "User: Proceed. Use the tool results above.\nAssistant:"
         if touched:
             next_user_msg = f"User: Files already edited this session: {', '.join(touched)}. Do not repeat these edits.\n\n" + next_user_msg
-        # If we still have no edits and this round was only read-only, nudge to output edits next
-        if not touched and round_num >= 2 and all(_API_TOOL_NAME_MAP.get(t[0], t[0]) in READ_ONLY_TOOLS for t in func_calls):
+        read_only_tools = READ_ONLY_TOOLS_API if use_chat_tools else READ_ONLY_TOOLS
+        if not touched and round_num >= 2 and all(
+            _API_TOOL_NAME_MAP.get(t[0], t[0]) in read_only_tools for t in func_calls
+        ):
             next_user_msg = (
                 "User: You have only been reading files so far. If the user asked for a code change or fix, "
                 "output search_replace(...) or edit_existing_file(...) or write_file(...) now. Use the tool results above. Do not only read more files.\nAssistant:"
             )
             dbg("agent_loop: read-only round with no edits yet, nudging to edit")
-        prompt = (
-            f"{prompt}\nAssistant:\n{reply}\n\nTool results:\n{combined}\n\n"
-            f"{next_user_msg}"
-        )
         dbg(f"agent_loop: round={round_num} tools={len(func_calls)} touched={len(touched)}")
 
     output = strip_tool_calls_from_output(final_reply).strip()
@@ -803,21 +854,20 @@ def run_agent(
         if touched
         else (output or "No tool calls.")
     )
-    meta: Dict[str, Any] = {
-        "mode_used": "agent",
-        "ok": True,
-        "summary": summary,
-        "touched": touched,
-        "files_changed": touched,
-        "per_file_diffs": per_file_diffs,
-        "per_file_before": per_file_before,
-        "per_file_staged": per_file_staged,
-        "per_file_after": dict(per_file_staged),
-        "staged": bool(per_file_staged),
-        "applied_directly": True,
-        "agent_actions": action_feed,
-        "duration_ms": duration_ms,
-        "output": output[:2000],
-    }
-    # Prefer model's explanation (Continue-style) when present; fall back to summary
+    mode_used = "agent_api_tools" if use_chat_tools else "agent"
+    meta = _build_meta(
+        touched=touched,
+        per_file_before=per_file_before,
+        per_file_staged=per_file_staged,
+        action_feed=action_feed,
+        duration_ms=duration_ms,
+        output=output,
+        mode_used=mode_used,
+        ok=True,
+        summary=summary,
+    )
+    # Override per_file_diffs if we used generate_diff (completion path)
+    if not use_chat_tools and per_file_diffs:
+        meta["per_file_diffs"] = per_file_diffs
+    # Prefer model's explanation when present; fall back to summary
     return (output.strip() or summary), meta

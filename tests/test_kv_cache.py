@@ -34,7 +34,7 @@ def main():
     prompt2 = (
         prompt1
         + "\n[[[list_files]]]\n\nTool results:\n  a.c\n  b.c\n\n"
-        "User: Continue. Use the tool results above.\nAssistant:"
+        "User: Proceed. Use the tool results above.\nAssistant:"
     )
 
     print("Request 1 (cold)...")

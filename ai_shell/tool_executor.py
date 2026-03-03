@@ -39,15 +39,11 @@ from .search_replace import (
 from .tools import grep_search
 from .utils import dbg
 
-try:
-    from file_utils import is_security_concern
-except ImportError:
-    def is_security_concern(*args, **kwargs):
-        return False
+from .file_utils_adapter import is_security_concern
 
 
 def _parse_function_kwargs(text: str, start: int, keys: Tuple[str, ...]) -> Tuple[Optional[Dict[str, str]], int]:
-    """Parse key="value" kwargs from text starting at start. Returns (kwargs_dict, end_pos)."""
+    """Parse key="value" or key='value' kwargs from text starting at start. Returns (kwargs_dict, end_pos)."""
     pos = start
     kwargs: Dict[str, str] = {}
     while pos < len(text):
@@ -65,10 +61,15 @@ def _parse_function_kwargs(text: str, start: int, keys: Tuple[str, ...]) -> Tupl
         pos += key_match.end()
         if pos >= len(text) or key not in {k.lower() for k in keys}:
             continue
+        quote_char = None
         if text[pos] == '"':
-            triple = text[pos : pos + 3] == '"""'
-            quote = '"""' if triple else '"'
-            val, end_pos = _parse_python_string(text, pos, quote[0])
+            quote_char = '"'
+        elif text[pos] == "'":
+            quote_char = "'"
+        if quote_char is not None:
+            triple = text[pos : pos + 3] == quote_char * 3
+            quote = quote_char * 3 if triple else quote_char
+            val, end_pos = _parse_python_string(text, pos, quote_char)
             if val is not None and not triple:
                 val = _unescape_string(val)
             if val is not None:
@@ -115,18 +116,23 @@ def _extract_xml_tool_calls(text: str) -> List[Tuple[str, Dict[str, str]]]:
 
 
 def _extract_write_file_from_code_block(text: str) -> Optional[Tuple[str, str]]:
-    """If model output is a single fenced code block with a filename (e.g. ```c checkpasswd.c), return (path, content)."""
+    """If model output is a fenced code block with a filename (same mechanism as other tools: path + content), return (path, content).
+    Supports: ```lang path\ncontent```, ```\npath\ncontent```, and ```\n\npath\ncontent```."""
     if not text or not isinstance(text, str):
         return None
-    # ```lang filename or ```filename, then newline, then content until ```
-    m = re.search(r"^```\s*\w*\s*([^\s\n]+)\s*\n(.*?)```", text.strip(), re.DOTALL)
+    stripped = text.strip()
+    # Same-line: ```lang path or ```path, then newline, then content until closing ```
+    m = re.search(r"^```\s*\w*\s*([^\s\n]+)\s*\n(.*?)```", stripped, re.DOTALL)
+    if not m:
+        # Filename on its own line after ``` (common model formatting)
+        m = re.search(r"^```\s*(?:\w*\s*)?\n\s*([^\s\n]+)\s*\n(.*?)```", stripped, re.DOTALL)
     if not m:
         return None
     path_candidate = (m.group(1) or "").strip().strip('"\'')
     content = (m.group(2) or "").strip()
     if not path_candidate or not content:
         return None
-    # Must look like a file path (has a dot or is a known ext)
+    # Must look like a file path (has a dot or reasonable length)
     if "." in path_candidate or len(path_candidate) > 2:
         return (path_candidate, content)
     return None
@@ -165,7 +171,7 @@ def extract_function_style_tool_calls(text: str) -> List[Tuple[str, Dict[str, st
             elif name == "multi_edit":
                 keys = ("path", "filepath", "edits")
             elif name in ("write_file", "create_new_file"):
-                keys = ("path", "content")
+                keys = ("path", "filepath", "content", "contents")
             elif name in ("run_terminal_cmd", "run_terminal_command"):
                 keys = ("command",)
             else:
@@ -189,6 +195,12 @@ def extract_function_style_tool_calls(text: str) -> List[Tuple[str, Dict[str, st
                     canonical = "create_new_file"
                 elif name == "run_terminal_command":
                     canonical = "run_terminal_cmd"
+                # Normalize write_file/create_new_file to path + content (same keys as other tools expect)
+                if name in ("write_file", "create_new_file"):
+                    path_val = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip("'\"")
+                    content_val = kwargs.get("content") or kwargs.get("contents") or ""
+                    if path_val:
+                        kwargs = {"path": path_val, "content": content_val}
                 results.append((name, kwargs))
 
     extract_from_chunk(text)
@@ -227,7 +239,7 @@ def _content_has_placeholders(content: str) -> bool:
 
 
 def _resolve_placeholders_in_edit(changes: str, old_content: str) -> Optional[str]:
-    """Resolve first placeholder in changes by filling from old_content (Continue-style partial edit).
+    """Resolve first placeholder in changes by filling from old_content (partial edit).
     Returns resolved full content, or None if context cannot be found in file."""
     if not changes or not old_content:
         return None
@@ -395,7 +407,7 @@ Current file (if any) may be included below as "Current file".
 - After making edits, give a brief explanation of what you changed (one or two sentences).
 - When the whole task is complete (all requested changes applied everywhere needed), respond with a brief summary and no further tool calls. After each tool result, decide the next step from the result; do not repeat the same edit."""
 
-# Chat mode: answer questions, use tools to read/list — do NOT instruct to produce diffs
+# Ask mode: answer questions, use tools to read/list — do NOT instruct to produce diffs
 CHAT_TOOLS_HINT = """You have access to these tools. Use the function-style format when you need them:
 
 - read_file(path="src/main.py") — Read a file
@@ -405,6 +417,33 @@ CHAT_TOOLS_HINT = """You have access to these tools. Use the function-style form
 
 CONTEXT already includes imported files. Use tools if you need more. Answer in plain text. Do NOT produce diffs or code edits unless the user explicitly asks."""
 
+ASK_TOOLS_HINT = CHAT_TOOLS_HINT
+
+# Plan mode: read-only exploration and planning; no file edits
+PLAN_TOOLS_HINT = """You have access to read-only tools for exploring the codebase. Use the function-style format when you need them.
+
+Read-only tools:
+- read_file(filepath="path") — Read file contents
+- list_files(path="dir") — List files in directory
+- grep_search(pattern="...", path=".") — Search across files
+- glob_file_search(glob="*.py", path=".") — Find files by glob
+- codebase_search(query="natural language query") — Search codebase
+- view_repo_map() — Show repo structure
+- view_diff(path="file") — Show diff for a file (if any from this session)
+- symbols(path="file") — List symbols in a file
+
+You cannot edit or create files in Plan mode. Explore and produce an implementation plan as text. When done, the user may execute the plan in Agent mode."""
+
+# Read-only tool names (no file writes)
+READ_ONLY_TOOL_NAMES = frozenset({
+    "read_file", "list_files", "view_subdirectory", "grep", "grep_search",
+    "glob_file_search", "glob_search", "codebase_search", "codebase_tool",
+    "view_repo_map", "view_diff", "symbols",
+})
+WRITE_TOOL_NAMES = frozenset({
+    "search_replace", "edit_existing_file", "single_find_and_replace",
+    "multi_edit", "write_file", "create_new_file",
+})
 
 # Full tools as JSON schema for API tool calls (/v1/chat/completions with tools)
 AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
@@ -593,6 +632,11 @@ AGENT_TOOLS_JSON: List[Dict[str, Any]] = [
         },
     },
 ]
+
+# Read-only subset for Plan and Ask modes (no edit tools)
+_READ_ONLY_JSON_NAMES = {"read_file", "view_subdirectory", "grep_search", "glob_search", "codebase_search", "view_repo_map", "view_diff", "symbols"}
+PLAN_TOOLS_JSON = [t for t in AGENT_TOOLS_JSON if (t.get("function") or {}).get("name") in _READ_ONLY_JSON_NAMES]
+ASK_TOOLS_JSON = list(PLAN_TOOLS_JSON)
 
 
 def execute_tool(name: str, arg: str) -> str:
@@ -926,7 +970,7 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
         return f"[multi_edit] {msg}"
 
     if name == "edit_existing_file":
-        # filepath + changes (full or partial with placeholders; Continue-style)
+        # filepath + changes (full or partial with placeholders)
         path_str = (kwargs.get("filepath") or kwargs.get("path") or "").strip().strip('"\'')
         changes = kwargs.get("changes")
         if not path_str:
@@ -1076,25 +1120,6 @@ def execute_tool_from_kwargs(name: str, kwargs: Dict[str, str]) -> str:
             return f"[run_terminal_cmd] Error: {e}"
 
     return f"[tool] Unknown tool: {name}"
-
-
-def strip_function_style_tool_calls(text: str) -> str:
-    """Remove function-style tool calls from output for display."""
-    for name in FUNCTION_STYLE_TOOLS:
-        pattern = re.compile(rf"\b{re.escape(name)}\s*\([^)]*(?:\([^)]*\)[^)]*)*\)", re.IGNORECASE | re.DOTALL)
-        text = pattern.sub("", text)
-    return text.strip()
-
-
-def extract_tool_calls(text: str) -> List[Tuple[str, str]]:
-    """Extract tool calls from model output. Returns [(tool_name, arg), ...]."""
-    calls = []
-    for m in TOOL_PATTERN.finditer(text):
-        name = (m.group(1) or "").strip()
-        arg = (m.group(2) or "").strip()
-        if name:
-            calls.append((name, arg))
-    return calls
 
 
 def strip_tool_calls_from_output(text: str) -> str:

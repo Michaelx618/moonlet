@@ -28,11 +28,23 @@
         --surface0: #313244;
         --surface1: #45475a;
         --surface2: #585b70;
+        --panel: var(--surface0);
         --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
         --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
         --radius: 6px;
         --radius-lg: 8px;
+        --text-xs: 11px;
+        --text-sm: 12px;
+        --text-base: 13px;
+        --accent-subtle: rgba(137, 180, 250, 0.12);
+        --accent-border: rgba(137, 180, 250, 0.2);
       }
+      .flex-row { display: flex; align-items: center; }
+      .flex-row-between { display: flex; align-items: center; justify-content: space-between; }
+      .flex-col { display: flex; flex-direction: column; }
+      .flex-fill { flex: 1; }
+      .min-h-0 { min-height: 0; }
+      .gap-1 { gap: 6px; }
       * { margin: 0; padding: 0; box-sizing: border-box; }
       body {
         font-family: var(--font-ui);
@@ -72,7 +84,7 @@
         cursor: col-resize;
         z-index: 10;
       }
-      .right-panel-resize:hover { background: rgba(137, 180, 250, 0.1); }
+      .right-panel-resize:hover { background: var(--accent-subtle); }
 
       /* ─── Title Bar ─── */
       .titlebar {
@@ -251,12 +263,13 @@
         flex: 1;
         padding: 4px 6px;
       }
-      .file-list::-webkit-scrollbar { width: 6px; }
-      .file-list::-webkit-scrollbar-track { background: transparent; }
-      .file-list::-webkit-scrollbar-thumb {
+      .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+      .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+      .scrollbar-thin::-webkit-scrollbar-thumb {
         background: var(--surface1);
-        border-radius: 3px;
+        border-radius: var(--radius);
       }
+      .file-list.scrollbar-thin::-webkit-scrollbar { width: 6px; }
       .file-list li {
         display: flex;
         align-items: center;
@@ -273,7 +286,7 @@
         color: var(--text);
       }
       .file-list li.active {
-        background: rgba(137, 180, 250, 0.12);
+        background: var(--accent-subtle);
         color: var(--accent);
         box-shadow: inset 3px 0 0 var(--accent);
       }
@@ -288,7 +301,7 @@
         justify-content: center;
         flex-shrink: 0;
         color: var(--accent-dim);
-        background: rgba(137, 180, 250, 0.08);
+        background: var(--accent-subtle);
         border-radius: 3px;
         letter-spacing: -0.5px;
       }
@@ -333,7 +346,7 @@
         border: none;
         background: transparent;
         color: var(--text);
-        border-radius: 4px;
+        border-radius: var(--radius);
         cursor: pointer;
         font-size: 12px;
         font-family: var(--font-ui);
@@ -441,10 +454,10 @@
         color: var(--text-muted);
       }
       .cm-host .cm-activeLineGutter {
-        background: rgba(137, 180, 250, 0.08);
+        background: var(--accent-subtle);
       }
       .cm-host .cm-activeLine {
-        background: rgba(137, 180, 250, 0.06);
+        background: var(--accent-subtle);
       }
       .cm-host .cm-diff-add {
         background: rgba(166, 227, 161, 0.22);
@@ -515,7 +528,7 @@
       .editor::-webkit-scrollbar-track { background: transparent; }
       .editor::-webkit-scrollbar-thumb {
         background: var(--surface1);
-        border-radius: 4px;
+        border-radius: var(--radius);
       }
       .editor::placeholder { color: var(--text-muted); }
       /* Syntax highlight tokens */
@@ -597,11 +610,6 @@
         outline: none;
         cursor: text;
       }
-      .terminal-output::-webkit-scrollbar { width: 6px; height: 6px; }
-      .terminal-output::-webkit-scrollbar-thumb {
-        background: var(--surface1);
-        border-radius: 3px;
-      }
       .btn-danger {
         color: var(--red);
         border-color: rgba(243, 139, 168, 0.35);
@@ -643,7 +651,7 @@
         font-size: 12px;
         line-height: 1.4;
         color: var(--accent);
-        background: rgba(137, 180, 250, 0.08);
+        background: var(--accent-subtle);
         border-left: 2px solid var(--accent);
         border-radius: 0 var(--radius) var(--radius) 0;
         white-space: pre-wrap;
@@ -668,12 +676,27 @@
         white-space: pre-wrap;
         word-break: break-word;
       }
-      .response-area::-webkit-scrollbar { width: 6px; }
-      .response-area::-webkit-scrollbar-thumb {
-        background: var(--surface1);
-        border-radius: 3px;
-      }
       .response-area.has-content { color: var(--text); }
+      .response-card {
+        padding: 8px 12px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--panel);
+      }
+      .response-explanation {
+        margin-bottom: 10px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .response-files {
+        margin: 4px 0;
+        padding: 2px 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .response-error {
+        color: var(--red);
+      }
+      .response-section { margin-top: 6px; }
       .panel-turn {
         margin: 8px 0 10px 0;
         padding: 8px 10px;
@@ -686,9 +709,9 @@
         box-shadow: inset 0 0 0 1px rgba(249, 226, 175, 0.15);
       }
       .panel-turn-assistant {
-        border-color: rgba(137, 180, 250, 0.45);
-        background: rgba(137, 180, 250, 0.10);
-        box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.12);
+        border-color: var(--accent-border);
+        background: var(--accent-subtle);
+        box-shadow: inset 0 0 0 1px var(--accent-subtle);
       }
       .panel-turn-head {
         display: flex;
@@ -808,59 +831,84 @@
         white-space: pre;
         display: block;
       }
+      /* Prompt: one full-width box; textarea fills it, small buttons in corners inside the box */
       .prompt-bar {
-        display: flex;
-        align-items: flex-end;
-        gap: 8px;
-        padding: 8px 12px;
+        padding: 10px 12px;
         border-top: 1px solid var(--border);
         background: var(--bg-overlay);
         flex-shrink: 0;
       }
-      .prompt-input {
-        flex: 1;
+      .prompt-box {
+        position: relative;
+        width: 100%;
+        min-height: 80px;
         background: var(--surface0);
-        color: var(--text);
         border: 1px solid var(--border);
         border-radius: var(--radius-lg);
-        padding: 8px 12px;
+        overflow: hidden;
+      }
+      .prompt-box:focus-within {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent-border);
+      }
+      .prompt-input {
+        display: block;
+        width: 100%;
+        min-height: 78px;
+        max-height: 200px;
+        box-sizing: border-box;
+        padding: 12px 14px 44px 14px;
+        margin: 0;
+        background: transparent;
+        color: var(--text);
+        border: none;
         font-size: 13px;
         font-family: var(--font-ui);
         resize: none;
         outline: none;
-        max-height: 80px;
-        line-height: 1.4;
-        transition: border-color 120ms;
+        line-height: 1.45;
       }
       .prompt-input::placeholder {
         color: var(--text-muted);
       }
-      .prompt-actions {
+      .prompt-actions-left {
+        position: absolute;
+        left: 8px;
+        bottom: 8px;
         display: flex;
+        align-items: center;
         gap: 6px;
-        flex-shrink: 0;
+      }
+      .prompt-actions-right {
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
       }
       .mode-toggle {
-        background: var(--surface0);
-        color: var(--text);
+        background: transparent;
+        color: var(--text-dim);
         border: 1px solid var(--border);
-        border-radius: var(--radius-lg);
-        padding: 8px 10px;
-        font-size: 12px;
+        border-radius: var(--radius);
+        padding: 4px 8px;
+        font-size: 11px;
         font-family: var(--font-ui);
         outline: none;
         cursor: pointer;
       }
-      .mode-toggle:focus {
+      .mode-toggle:hover, .mode-toggle:focus {
+        color: var(--text);
         border-color: var(--accent);
       }
       .btn-send {
         background: var(--accent);
         color: var(--bg-overlay);
         border: none;
-        border-radius: var(--radius-lg);
-        padding: 8px 16px;
-        font-size: 13px;
+        border-radius: var(--radius);
+        padding: 5px 12px;
+        font-size: 12px;
         font-weight: 600;
         cursor: pointer;
         transition: all 120ms;
@@ -872,12 +920,12 @@
         cursor: not-allowed;
       }
       .btn-cancel {
-        background: none;
+        background: transparent;
         color: var(--text-dim);
         border: 1px solid var(--border);
-        border-radius: var(--radius-lg);
-        padding: 8px 12px;
-        font-size: 12px;
+        border-radius: var(--radius);
+        padding: 4px 8px;
+        font-size: 11px;
         cursor: pointer;
         font-family: var(--font-ui);
         transition: all 120ms;
@@ -949,7 +997,7 @@
         justify-content: center;
         font-size: 20px;
         color: var(--accent);
-        box-shadow: 0 0 24px rgba(137, 180, 250, 0.08);
+        box-shadow: 0 0 24px var(--accent-subtle);
       }
       .welcome h2 {
         font-size: 16px;
@@ -975,7 +1023,7 @@
         font-family: var(--font-mono);
         background: var(--surface0);
         border: 1px solid var(--border);
-        border-radius: 4px;
+        border-radius: var(--radius);
         color: var(--text-dim);
       }
 
@@ -1001,10 +1049,6 @@
       }
 
       /* ─── Focus & interaction polish ─── */
-      .prompt-input:focus {
-        border-color: var(--accent);
-        box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.12);
-      }
       .btn:active {
         transform: scale(0.97);
       }
@@ -1064,21 +1108,21 @@
       <!-- Sidebar -->
       <div class="sidebar">
         <div class="sidebar-header">
-          <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div class="flex-row-between">
             <span class="sidebar-title">Explorer</span>
             <div class="sidebar-actions">
               <button class="btn btn-sm btn-icon" id="refresh" title="Refresh">&#8635;</button>
             </div>
           </div>
-          <div style="display:flex; gap:6px;">
-            <button class="btn btn-primary btn-sm" id="pickRoot" style="flex:1;">Import Files</button>
+          <div class="flex-row gap-1">
+            <button class="btn btn-primary btn-sm flex-fill" id="pickRoot">Import Files</button>
             <button class="btn btn-sm" id="clearRoot" title="Unselect current directory">Unselect</button>
           </div>
           <div class="root-display">
             <input id="root" placeholder="No folder selected" readonly />
           </div>
         </div>
-        <ul class="file-list" id="files"></ul>
+        <ul class="file-list scrollbar-thin" id="files"></ul>
       </div>
 
       <div class="explorer-menu hidden" id="explorerMenu">
@@ -1096,10 +1140,10 @@
             <span id="tabName">Welcome</span>
             <span class="unsaved-dot" id="unsavedDot"></span>
           </div>
-          <div style="flex:1;"></div>
+          <div class="flex-fill"></div>
         </div>
 
-        <div class="editor-wrap" style="flex:1; min-height:0;">
+        <div class="editor-wrap flex-fill min-h-0">
           <div class="editor-container">
             <div class="welcome" id="welcomeScreen">
               <div class="welcome-icon">&#9790;</div>
@@ -1125,9 +1169,9 @@
           <div class="panel-tabs" style="height:30px;">
             <div class="panel-tab active">Terminal</div>
             <button class="btn btn-sm" id="terminalCloseBtn" title="Close terminal">Close</button>
-            <div style="flex:1;"></div>
+            <div class="flex-fill"></div>
           </div>
-          <div class="terminal-output" id="terminalOutput" style="flex:1;"></div>
+          <div class="terminal-output scrollbar-thin flex-fill" id="terminalOutput"></div>
         </div>
       </div>
 
@@ -1138,25 +1182,32 @@
           <div class="panel-tabs" style="height:30px; border-bottom:1px solid var(--border);">
             <div class="panel-tab active">Assistant</div>
             <button class="btn btn-sm" id="newChatBtn" title="Start a new chat">New Chat</button>
+            <button class="btn btn-sm" id="copyResponseBtn" title="Copy response to clipboard">Copy</button>
+            <button class="btn btn-sm" id="exportTranscriptBtn" title="Export conversation as markdown">Export</button>
             <div class="diff-actions" id="diffActions" style="display:none;">
               <button class="btn-reject" id="btnRevert" title="Revert changes (Ctrl+Z also works)">Revert</button>
               <button class="btn-repair" id="btnRepair" title="Repair after verify failure" style="display:none;">Repair</button>
             </div>
-            <div style="flex:1;"></div>
+            <div class="flex-fill"></div>
             <div class="run-timer" id="runTimer"></div>
           </div>
-          <div class="panel-body" style="flex:1; min-height:0; display:flex; flex-direction:column;">
+          <div class="panel-body flex-fill min-h-0 flex-col">
             <div class="user-prompt-echo" id="userPromptEcho"></div>
-            <div class="response-area" id="response" style="flex:1;">Ready. Select a file and ask the agent to edit it.</div>
+            <div class="response-area scrollbar-thin flex-fill" id="response">Ready. Select a file and ask the agent to edit it.</div>
             <div class="prompt-bar">
-              <textarea class="prompt-input" id="prompt" rows="1" placeholder="Ask the agent... or /run <command>"></textarea>
-              <div class="prompt-actions">
-                <select id="mode" class="mode-toggle" title="Assistant mode">
-                  <option value="chat">chat</option>
-                  <option value="agent">agent</option>
-                </select>
-                <button class="btn-send" id="send" disabled>Send</button>
-                <button class="btn-cancel" id="cancel">Stop</button>
+              <div class="prompt-box">
+                <textarea class="prompt-input" id="prompt" rows="3" placeholder="Ask the agent... (Enter or Cmd+Enter to send, Shift+Enter for newline)"></textarea>
+                <div class="prompt-actions-left">
+                  <select id="mode" class="mode-toggle" title="Assistant mode">
+                    <option value="ask">Ask</option>
+                    <option value="plan">Plan</option>
+                    <option value="agent">Agent</option>
+                  </select>
+                  <button class="btn-cancel" id="cancel" title="Stop run">Stop</button>
+                </div>
+                <div class="prompt-actions-right">
+                  <button class="btn-send" id="send" disabled title="Send message">Send</button>
+                </div>
               </div>
             </div>
           </div>

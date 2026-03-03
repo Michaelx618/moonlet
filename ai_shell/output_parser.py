@@ -1,7 +1,7 @@
 """Flexible output parser for freedom mode: extract edits from model output.
 
 Tries in order: unified diff, [[[file: path]]] blocks, markdown code blocks.
-Returns List[Tuple[path, content]] for apply_blocks, or (path, hunks) for diff apply.
+Returns List[Tuple[path, content]] for file blocks, or (path, hunks) for diff apply.
 """
 
 import json as json_mod

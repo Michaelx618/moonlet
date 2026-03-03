@@ -104,26 +104,14 @@ def _extract_keywords(text: str) -> List[str]:
 
 def _list_editable_files(max_files: int = 80) -> List[str]:
     """List editable files in repo (for semantic search candidates).
-    When include filter is set, uses indexed files (user's imported files only)."""
+    When include filter is set, uses indexed files; otherwise uses canonical index walk."""
     include = get_include()
     if include:
         from .index import get_indexed_files
         files = get_indexed_files()
         return [f for f in files if _is_editable_file(f)][:max_files]
-    root = get_root()
-    found: List[str] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        if len(found) >= max_files:
-            break
-        dirnames[:] = [d for d in dirnames if d not in config.IGNORE_DIRS and not d.startswith(".")]
-        for fname in sorted(filenames):
-            try:
-                rel = str(Path(dirpath, fname).relative_to(root))
-            except ValueError:
-                continue
-            if _is_editable_file(rel):
-                found.append(_norm_rel_path(rel))
-    return found
+    from .index import _list_editable_files as index_list
+    return [f for f in index_list(max_files=max_files) if _is_editable_file(f)]
 
 
 def _get_file_summaries(paths: List[str], max_chars: int = 500) -> List[Tuple[str, str]]:

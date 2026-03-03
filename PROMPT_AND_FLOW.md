@@ -21,23 +21,27 @@ All user requests that do edits or chat go through **POST /stream**. The request
 | Mode   | When used | What runs | Tool choice |
 |--------|-----------|-----------|-------------|
 | **agent** | Default for “do something” (edit, implement, fix). | **Agent loop** (`run_agent`). | **Agent**: Model gets a **single system + user prompt** that includes the tool list (and optionally workspace paths, reference files, focus file). The **model** decides which tools to call (read_file, grep, search_replace, write_file, etc.) by outputting tool calls; we parse and execute them and feed results back. No separate “mode” per tool—one agent prompt, model picks tools. |
-| **chat**  | Q&A, no edits. | Same agent loop as agent mode (`run_agent`), but with a **chat** mode flag. | Same tool list; we may add a hint in the prompt that this is “answer in text, don’t edit”. Model can still call read-only tools. |
-| **repair** | After verify failed; “fix the build error”. | **Agent loop** with repair text (original spec + last error). | Same as agent; model chooses tools. |
+| **ask**  | Q&A, no edits. | **Ask route** (`run_ask`). | Read-only tools only; write tools rejected. Own prompt (ASK_TOOLS_HINT). |
+| **plan**  | Explore codebase, produce a plan. | **Plan route** (`run_plan`). | Read-only tools only; Execute button sends plan to agent. |
+| **repair** | After verify failed; "fix the build error". | **Agent loop** with repair text (original spec + last error). | Same as agent; model chooses tools. |
 
 So:
 
-- **We do not choose the tool** per request. The **model** chooses tools from the list we put in the prompt.
-- We always use the **agent loop** (one prompt and tool loop).
+- **Agent** uses the full agent loop. **Ask** and **plan** use separate routes (`ask_plan.py`) with read-only tools and their own prompts.
+- The **model** chooses tools from the list we put in the prompt for each route.
 
 ---
 
 ## Does each case have different prompts?
 
-- **Agent loop (agent / chat / repair)**  
-  One prompt shape: **system message** (e.g. “You are a systematic coding agent…”) + **tool list / schema** + **workspace paths** (optional) + **@Code / @Folder / reference / focus file** sections + **user request**. The only difference between agent and chat is the **mode** value and any chat-specific hint (“answer in text”). Repair adds the **last_error** (and repair target) into the user text. So: **same prompt structure**, different **content** (spec vs question vs spec+error).
+- **Agent (and repair)**  
+  One prompt shape: **system message** (e.g. “You are a systematic coding agent…”) + **tool list / schema** + **workspace paths** (optional) + **@Code / @Folder / reference / focus file** sections + **user request**. Repair prepends the last error.
 
 
-Summary: **Agent loop** uses one prompt style (with tool list + context). See [BORROWED_FROM_CONTINUE.md](BORROWED_FROM_CONTINUE.md) for design origin.
+- **Ask** — Own prompt in `ask_plan._build_ask_prompt`: system + ASK_TOOLS_HINT (read-only). Write tool calls rejected.
+- **Plan** — Own prompt in `ask_plan._build_plan_prompt`: system + PLAN_TOOLS_HINT (read-only). Write tool calls rejected.
+
+Summary: **Agent** uses one prompt style; **ask** and **plan** use separate prompts and loops. See [BORROWED_FROM_CONTINUE.md](BORROWED_FROM_CONTINUE.md) for design origin.
 
 ---
 

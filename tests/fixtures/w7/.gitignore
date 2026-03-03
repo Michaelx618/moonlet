@@ -1,0 +1,10 @@
+
+# Ignore built executables
+validate
+checkpasswd
+
+# Ignore object files
+*.o
+
+# Ignore dependency files
+*.d

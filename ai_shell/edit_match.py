@@ -1,4 +1,4 @@
-"""Continue-style search match strategies for find-and-replace.
+"""Search match strategies for find-and-replace.
 
 Ported from core/edit/searchAndReplace/findSearchMatch.ts.
 Strategies: exact, trimmed, flexible_whitespace, case_insensitive, whitespace_ignored.
@@ -93,7 +93,7 @@ def _whitespace_ignored_match(file_content: str, search_content: str) -> Optiona
     return (orig_start, orig_end)
 
 
-# Order of strategies (same as Continue; flexible_whitespace added for incomplete/model strings)
+# Order of strategies (flexible_whitespace added for incomplete/model strings)
 _MATCH_STRATEGIES: List[Tuple[str, object]] = [
     ("exact", _exact_match),
     ("trimmed", _trimmed_match),
@@ -110,7 +110,7 @@ def find_search_match(
     """Find a single match. Returns (start, end, strategy_name) or None.
 
     Tries strategies in order: exact, trimmed, case_insensitive, whitespace_ignored.
-    Empty search_content matches at position 0 (like Continue).
+    Empty search_content matches at position 0.
     """
     trimmed = search_content.strip()
     if trimmed == "":
@@ -129,7 +129,7 @@ def find_search_matches(
     """Find all non-overlapping matches. Returns [(start, end), ...].
 
     Uses the same strategies as find_search_match; applied iteratively
-    for each occurrence. Empty search returns [(0, 0)] (Continue behavior).
+    for each occurrence. Empty search returns [(0, 0)].
     """
     if search_content.strip() == "":
         return [(0, 0)]

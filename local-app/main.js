@@ -83,9 +83,7 @@ function buildTerminalEnv() {
 }
 
 function buildServerPathEnv(existingPath) {
-  const localLlamaBin = path.join(repoRoot, "tools", "llama.cpp", "bin");
   const pathParts = [
-    localLlamaBin,
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -162,11 +160,10 @@ async function startServer() {
   const cfg = loadConfig();
   const venvPython = path.join(repoRoot, ".venv", "bin", "python3");
   const python = fs.existsSync(venvPython) ? venvPython : "python3";
-  const gguf = cfg.ggufPath || process.env.SC2_GGUF;
   const mlxModel = cfg.mlxModel || process.env.SC2_MLX_MODEL;
   const mlxModelPath = cfg.mlxModelPath || process.env.SC2_MLX_MODEL_PATH;
-  if (!gguf && !mlxModel && !mlxModelPath) {
-    console.warn("Set ggufPath or mlxModel in config (or SC2_GGUF / SC2_MLX_MODEL); cannot start server.");
+  if (!mlxModel && !mlxModelPath) {
+    console.warn("Set mlxModel or mlxModelPath in config (or SC2_MLX_MODEL / SC2_MLX_MODEL_PATH); cannot start server.");
     return null;
   }
   const desiredPort = Number(cfg.port || process.env.SC2_PORT || 8000);
@@ -178,16 +175,8 @@ async function startServer() {
     PYTHONDONTWRITEBYTECODE: "1",
     HF_HUB_DISABLE_PROGRESS_BARS: "1",
     HF_HUB_DISABLE_TELEMETRY: "1",
-    ...(gguf ? { SC2_GGUF: gguf } : {}),
     ...(mlxModel ? { SC2_MLX_MODEL: mlxModel } : {}),
     ...(mlxModelPath ? { SC2_MLX_MODEL_PATH: mlxModelPath } : {}),
-    SC2_CTX_TOK: String(cfg.ctxTok || process.env.SC2_CTX_TOK || 8192),
-    SC2_THREADS: String(cfg.threads || process.env.SC2_THREADS || 4),
-    SC2_GPU_LAYERS: String(
-      cfg.gpuLayers !== undefined
-        ? cfg.gpuLayers
-        : process.env.SC2_GPU_LAYERS || 0
-    ),
     SC2_TEMP: String(cfg.temp || process.env.SC2_TEMP || 0.25),
     SC2_TOP_P: String(cfg.topP || process.env.SC2_TOP_P || 0.9),
     SC2_MAX_NEW: String(cfg.maxNew || process.env.SC2_MAX_NEW || 4096),
@@ -199,24 +188,6 @@ async function startServer() {
     SC2_DEBUG_LOG: cfg.debugLog || process.env.SC2_DEBUG_LOG,
     SC2_DEBUG_KV: cfg.debugKv ? "1" : process.env.SC2_DEBUG_KV,
     SC2_DEBUG_CHAT: cfg.debugChat ? "1" : process.env.SC2_DEBUG_CHAT,
-    SC2_PREFER_CLI: String(
-      cfg.preferCli !== undefined
-        ? cfg.preferCli
-        : process.env.SC2_PREFER_CLI || 0
-    ),
-    SC2_LLAMA_CLI: cfg.llamaCliPath || process.env.SC2_LLAMA_CLI,
-    SC2_USE_LLAMA_SERVER: String(
-      cfg.useLlamaServer !== undefined
-        ? cfg.useLlamaServer
-        : process.env.SC2_USE_LLAMA_SERVER || 1
-    ),
-    SC2_LLAMA_SERVER_BIN:
-      cfg.llamaServerPath || process.env.SC2_LLAMA_SERVER_BIN,
-    SC2_LLAMA_SERVER_HOST:
-      cfg.llamaServerHost || process.env.SC2_LLAMA_SERVER_HOST || "127.0.0.1",
-    SC2_LLAMA_SERVER_PORT: String(
-      cfg.llamaServerPort || process.env.SC2_LLAMA_SERVER_PORT || 8012
-    ),
     SC2_PIPELINE_IMPL: String(
       cfg.pipelineImpl || process.env.SC2_PIPELINE_IMPL || "rail_v3"
     ),
@@ -245,30 +216,30 @@ async function startServer() {
         ? cfg.autoApplyOnSuccess
         : process.env.SC2_AUTO_APPLY_ON_SUCCESS || 1
     ),
-    SC2_USE_CONTINUE_BRIDGE: String(
-      cfg.useContinueBridge !== undefined
-        ? cfg.useContinueBridge
-        : process.env.SC2_USE_CONTINUE_BRIDGE || 0
+    SC2_USE_EXTERNAL_BRIDGE: String(
+      cfg.useExternalBridge !== undefined
+        ? cfg.useExternalBridge
+        : process.env.SC2_USE_EXTERNAL_BRIDGE || process.env.SC2_USE_CONTINUE_BRIDGE || 0
     ),
-    SC2_CONTINUE_CLI_CMD: String(
-      cfg.continueCliCmd || process.env.SC2_CONTINUE_CLI_CMD || ""
+    SC2_BRIDGE_CLI_CMD: String(
+      cfg.bridgeCliCmd || process.env.SC2_BRIDGE_CLI_CMD || process.env.SC2_CONTINUE_CLI_CMD || ""
     ),
-    SC2_CONTINUE_NODE_BIN: String(
-      cfg.continueNodeBin || process.env.SC2_CONTINUE_NODE_BIN || "node"
+    SC2_BRIDGE_NODE_BIN: String(
+      cfg.bridgeNodeBin || process.env.SC2_BRIDGE_NODE_BIN || process.env.SC2_CONTINUE_NODE_BIN || "node"
     ),
-    SC2_CONTINUE_TIMEOUT_S: String(
-      cfg.continueTimeoutS || process.env.SC2_CONTINUE_TIMEOUT_S || 180
+    SC2_BRIDGE_TIMEOUT_S: String(
+      cfg.bridgeTimeoutS || process.env.SC2_BRIDGE_TIMEOUT_S || process.env.SC2_CONTINUE_TIMEOUT_S || 180
     ),
-    SC2_CONTINUE_PRINT_FORMAT: String(
-      cfg.continuePrintFormat || process.env.SC2_CONTINUE_PRINT_FORMAT || ""
+    SC2_BRIDGE_PRINT_FORMAT: String(
+      cfg.bridgePrintFormat || process.env.SC2_BRIDGE_PRINT_FORMAT || process.env.SC2_CONTINUE_PRINT_FORMAT || ""
     ),
-    SC2_CONTINUE_SILENT_PRINT: String(
-      cfg.continueSilentPrint !== undefined
-        ? cfg.continueSilentPrint
-        : process.env.SC2_CONTINUE_SILENT_PRINT || 0
+    SC2_BRIDGE_SILENT_PRINT: String(
+      cfg.bridgeSilentPrint !== undefined
+        ? cfg.bridgeSilentPrint
+        : process.env.SC2_BRIDGE_SILENT_PRINT || process.env.SC2_CONTINUE_SILENT_PRINT || 0
     ),
-    SC2_CONTINUE_GLOBAL_DIR: String(
-      cfg.continueGlobalDir || process.env.SC2_CONTINUE_GLOBAL_DIR || ""
+    SC2_BRIDGE_GLOBAL_DIR: String(
+      cfg.bridgeGlobalDir || process.env.SC2_BRIDGE_GLOBAL_DIR || process.env.SC2_CONTINUE_GLOBAL_DIR || ""
     ),
     ...(cfg.verifyCommand ? { SC2_VERIFY_CMD: String(cfg.verifyCommand) } : {}),
   };
@@ -718,7 +689,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("before-quit", () => {
-  // Clear llama-server KV cache before shutdown
+  // Clear backend cache before shutdown
   if (serverPort) {
     try {
       const http = require("http");
@@ -729,13 +700,6 @@ app.on("before-quit", () => {
   }
   if (serverProc) {
     serverProc.kill();
-    // Ensure llama-server (child of Python) is killed; it can orphan when parent dies
-    try {
-      require("child_process").spawnSync("pkill", ["-f", "llama-server"], {
-        stdio: "ignore",
-        timeout: 2000,
-      });
-    } catch (_) {}
   }
   if (lspMain) {
     try { lspMain.stopAll(); } catch (_) {}

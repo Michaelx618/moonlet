@@ -30577,6 +30577,8 @@ ${contents.value}`;
   var runFileBtn = document.getElementById("runFileBtn");
   var openTerminalBtn = document.getElementById("openTerminalBtn");
   var newChatBtn = document.getElementById("newChatBtn");
+  var copyResponseBtn = document.getElementById("copyResponseBtn");
+  var exportTranscriptBtn = document.getElementById("exportTranscriptBtn");
   var terminalOutputEl = document.getElementById("terminalOutput");
   var terminalCloseBtn = document.getElementById("terminalCloseBtn");
   var explorerMenuEl = document.getElementById("explorerMenu");
@@ -31588,6 +31590,17 @@ ${contents.value}`;
   function esc(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
+  function stripToolCallsForDisplay(text) {
+    if (!text || typeof text !== "string") return text;
+    const toolNames = "read_file|list_files|view_subdirectory|grep|grep_search|glob_file_search|glob_search|codebase_search|codebase_tool|view_repo_map|view_diff|search_replace|edit_existing_file|single_find_and_replace|multi_edit|write_file|create_new_file|run_terminal_cmd|run_terminal_command";
+    let out = text;
+    out = out.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, content2) => {
+      if (new RegExp(`\\b(${toolNames})\\s*\\(`, "i").test(content2)) return "\n\n";
+      return m;
+    });
+    out = out.replace(new RegExp(`\\b(${toolNames})\\s*\\([^)]*\\)`, "gi"), "Running: $1 \u2026");
+    return out.trim();
+  }
   function truncatePanelUserText(text) {
     const s = String(text || "").trim();
     if (s.length <= PANEL_USER_TEXT_MAX_CHARS) return s;
@@ -32481,13 +32494,13 @@ ${contents.value}`;
     function flushResponse() {
       if (metaSummaryLocked) return;
       responseThrottleTimer = null;
-      const rendered = rawResponseBuf;
+      const rendered = stripToolCallsForDisplay(rawResponseBuf);
       if (activeTranscriptIndex >= 0 && panelTranscript[activeTranscriptIndex]) {
         panelTranscript[activeTranscriptIndex].assistant = rendered || "...";
         renderPanelTranscript();
         return;
       }
-      responseEl.textContent = rawResponseBuf;
+      responseEl.textContent = rendered;
       responseEl.classList.add("has-content");
     }
     try {
@@ -32606,13 +32619,13 @@ ${contents.value}`;
               const explanation2 = (d.explanation || d.output || rawResponseBuf || "").trim();
               let html2 = "";
               if (explanation2) {
-                html2 += `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation2)}</div>`;
+                html2 += `<div class="response-explanation">${esc(explanation2)}</div>`;
               }
               html2 += `<strong>Changed ${fc.length} file${fc.length !== 1 ? "s" : ""}</strong><br>`;
               for (const f of fc) {
                 const fdiff = (d.per_file_diffs || {})[f] || "";
                 const fsum = fdiff ? summarizeDiff(fdiff, f) : esc(f);
-                html2 += `<div style="margin:4px 0;padding:2px 0;border-bottom:1px solid var(--border);">${fsum}</div>`;
+                html2 += `<div class="response-files">${fsum}</div>`;
               }
               responseEl.innerHTML = html2;
               responseEl.classList.add("has-content");
@@ -32704,7 +32717,7 @@ ${contents.value}`;
               document.getElementById("diffActions").style.display = "flex";
               const explanation2 = (d.explanation || d.output || rawResponseBuf || "").trim();
               const summary = summarizeDiff(d.diff, d.focus_file || "");
-              responseEl.innerHTML = explanation2 ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation2)}</div>${summary}` : summary;
+              responseEl.innerHTML = explanation2 ? `<div class="response-explanation">${esc(explanation2)}</div>${summary}` : summary;
               responseEl.classList.add("has-content");
               rawResponseBuf = "";
               renderedMetaSummary = true;
@@ -32716,11 +32729,11 @@ ${contents.value}`;
               const reason = esc(failureReason || "Agent reported a failure.");
               const tag = esc(failureKind.toUpperCase());
               const attemptInfo = d.attempt_index && d.attempt_total ? ` &middot; attempt ${Number(d.attempt_index)}/${Number(d.attempt_total)}` : "";
-              let body = `<div><strong style="color:var(--red);">${tag}</strong>${attemptInfo}</div><div style="margin-top:4px;">${reason}</div>`;
+              let body = `<div><strong class="response-error">${tag}</strong>${attemptInfo}</div><div class="response-section">${reason}</div>`;
               if (d.diff && d.diff.trim()) {
-                body += `<div style="margin-top:6px;">${summarizeDiff(d.diff, d.focus_file || "")}</div>`;
+                body += `<div class="response-section">${summarizeDiff(d.diff, d.focus_file || "")}</div>`;
               }
-              responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${body}</div>`;
+              responseEl.innerHTML = `<div class="response-card">${body}</div>`;
               responseEl.classList.add("has-content");
               rawResponseBuf = "";
               renderedMetaSummary = true;
@@ -32777,7 +32790,7 @@ ${contents.value}`;
               const stagedFiles = d.per_file_staged ? Object.keys(d.per_file_staged) : d.staged_file ? [d.staged_file] : [];
               const appliedDirectly = d.applied_directly === true;
               const msg = appliedDirectly ? stagedFiles.length > 1 ? `Changes applied to ${stagedFiles.length} files. Use Ctrl+Z to undo or click Revert.` : `Changes applied. Use Ctrl+Z to undo or click Revert.` : stagedFiles.length > 1 ? `Staged changes for ${stagedFiles.length} files. Review and click Accept or Reject.` : `Staged changes for ${esc(String(d.staged_file || stagedFiles[0] || ""))}. Review and click Accept or Reject.`;
-              responseEl.innerHTML = explanation2 ? `<div style="margin-bottom:10px;white-space:pre-wrap;">${esc(explanation2)}</div><div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>` : `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${msg}</div>`;
+              responseEl.innerHTML = explanation2 ? `<div class="response-explanation">${esc(explanation2)}</div><div class="response-card">${msg}</div>` : `<div class="response-card">${msg}</div>`;
               responseEl.classList.add("has-content");
               rawResponseBuf = "";
               renderedMetaSummary = true;
@@ -32878,7 +32891,7 @@ ${contents.value}`;
               window._pendingDiff = null;
             }
             if (!finalHasDiff && pendingNoopRun) {
-              responseEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--panel);">${pendingNoopBody}</div>`;
+              responseEl.innerHTML = `<div class="response-card">${pendingNoopBody}</div>`;
               responseEl.classList.add("has-content");
               rawResponseBuf = "";
               clearDiffHighlights();
@@ -32933,10 +32946,10 @@ ${contents.value}`;
   }
   promptEl.addEventListener("input", () => {
     promptEl.style.height = "auto";
-    promptEl.style.height = Math.min(promptEl.scrollHeight, 80) + "px";
+    promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + "px";
   });
   promptEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && (!e.shiftKey || e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       sendPrompt();
     }
@@ -33331,6 +33344,42 @@ ${contents.value}`;
   pickRootBtn.onclick = () => handlePick(true);
   if (newChatBtn) {
     newChatBtn.onclick = () => startNewChat();
+  }
+  if (copyResponseBtn) {
+    copyResponseBtn.onclick = async () => {
+      const text = (responseEl.innerText || responseEl.textContent || "").trim();
+      if (!text) {
+        setStatus("Nothing to copy", "");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        setStatus("Copied to clipboard", "");
+      } catch (_) {
+        setStatus("Copy failed", "error");
+      }
+    };
+  }
+  if (exportTranscriptBtn) {
+    exportTranscriptBtn.onclick = () => {
+      const lines = [];
+      const current = (responseEl.innerText || responseEl.textContent || "").trim();
+      for (const t2 of panelTranscript) {
+        if (t2.user) lines.push("## You\n\n" + (t2.user || "").trim() + "\n");
+        if (t2.assistant) lines.push("## Assistant\n\n" + (t2.assistant || "").trim() + "\n");
+      }
+      if (current && !lines.some((l) => l.includes(current.slice(0, 50)))) {
+        lines.push("## Assistant\n\n" + current + "\n");
+      }
+      const markdown2 = lines.length ? lines.join("\n") : current || "No conversation to export.";
+      const blob = new Blob([markdown2], { type: "text/markdown;charset=utf-8" });
+      const a2 = document.createElement("a");
+      a2.href = URL.createObjectURL(blob);
+      a2.download = "moonlet-transcript.md";
+      a2.click();
+      URL.revokeObjectURL(a2.href);
+      setStatus("Exported transcript", "");
+    };
   }
   if (clearRootBtn) {
     clearRootBtn.onclick = () => unselectDirectory();

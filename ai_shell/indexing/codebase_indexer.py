@@ -28,42 +28,9 @@ def _get_file_stats(paths: List[str], root: Path) -> dict:
 
 
 def _walk_directory(root: Path, include: Optional[List[str]], max_files: int) -> List[str]:
-    """List relative file paths under root, respecting include filter (same semantics as index._list_editable_files)."""
-    from .. import config
-    from ..files import is_allowed_file, _norm_rel_path
-
-    files: List[str] = []
-    seen = set()
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in getattr(config, "IGNORE_DIRS", set()) and not d.startswith(".")]
-        for fname in sorted(filenames):
-            if fname.startswith("."):
-                continue
-            try:
-                full = Path(dirpath, fname).resolve()
-                rel = str(full.relative_to(root.resolve())).replace("\\", "/")
-            except ValueError:
-                continue
-            if not is_allowed_file(rel):
-                continue
-            if include:
-                matched = rel in include
-                if not matched:
-                    for p in include:
-                        prefix = p.rstrip("/")
-                        if prefix and (rel == prefix or rel.startswith(prefix + "/")):
-                            matched = True
-                            break
-                if not matched:
-                    continue
-            norm = _norm_rel_path(rel)
-            if norm in seen:
-                continue
-            seen.add(norm)
-            files.append(norm)
-            if len(files) >= max_files:
-                return sorted(files)
-    return sorted(files)
+    """List relative file paths under root, respecting include filter. Uses index.walk_editable_files."""
+    from ..index import walk_editable_files
+    return walk_editable_files(root, include, max_files, require_include=False)
 
 
 def _get_branch(_directory: str) -> str:
@@ -161,7 +128,7 @@ def refresh_codebase_index(
                 mark_complete([(path, cache_key)], IndexResultType.UPDATE_LAST_UPDATED)
             continue
 
-        # Batch (same as Continue: slice each list by files_per_batch)
+        # Batch: slice each list by files_per_batch
         batch_size = files_per_batch
         pos = 0
         while pos < len(results.compute) or pos < len(results.del_) or pos < len(results.add_tag) or pos < len(results.remove_tag):

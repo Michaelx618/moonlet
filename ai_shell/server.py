@@ -16,6 +16,7 @@ from . import state
 from .relevance import find_relevant_files
 from .verify import run_verify
 from .agent_loop import run_agent
+from .ask_plan import run_ask, run_plan
 from .files import (
     delete_file,
     get_include,
@@ -35,37 +36,7 @@ from .utils import dbg
 
 import difflib
 
-try:
-    from file_utils import (
-        generate_diff,
-        is_security_concern,
-        validate_file_path,
-    )
-except ImportError:
-    def generate_diff(
-        old_content: str,
-        new_content: str,
-        filepath: str,
-        context_lines: int = 3,
-    ) -> str:
-        old_lines = (old_content or "").splitlines(keepends=True)
-        new_lines = (new_content or "").splitlines(keepends=True)
-        diff = difflib.unified_diff(
-            old_lines,
-            new_lines,
-            fromfile=str(filepath),
-            tofile=str(filepath),
-            lineterm="",
-            n=context_lines,
-        )
-        return "".join(diff)
-
-    def is_security_concern(*args, **kwargs):
-        return False
-
-    def validate_file_path(*args, **kwargs):
-        raise NotImplementedError("file_utils not available")
-
+from .file_utils_adapter import generate_diff, is_security_concern, validate_file_path
 
 _PATCH_PROPOSALS: Dict[str, Dict] = {}
 _PATCH_PROPOSAL_ORDER: list[str] = []
@@ -196,13 +167,17 @@ class APIServer(BaseHTTPRequestHandler):
 
         if parsed.path == "/stream":
             mode = (data.get("mode") or "agent").strip().lower()
+            # Treat "chat" as "ask" for backward compatibility
+            if mode == "chat":
+                mode = "ask"
             text = data.get("text") or ""
+            plan_context = (data.get("plan_context") or "").strip()
             focus_file = data.get("focus_file")
             file_path = data.get("file_path")
             last_error = data.get("last_error") or ""
             previous_patches = data.get("previous_patches") or []
             iteration = int(data.get("iteration") or 0)
-            if not text.strip() and mode != "repair":
+            if not text.strip() and mode != "repair" and not plan_context:
                 self._json(400, {"error": "text is required"})
                 return
             if mode == "repair" and not text.strip():
@@ -226,40 +201,86 @@ class APIServer(BaseHTTPRequestHandler):
                     )
                     focus_file = str(target.relative_to(get_root()))
 
-                # Agent mode: when no file open, discover target from request text
-                if mode == "agent" and not (focus_file or "").strip():
-                    discovered = find_relevant_files(text, open_file=None)
-                    if discovered:
-                        focus_file = discovered[0]
-                        dbg(f"agent: discovered focus_file from request: {focus_file}")
+                # When no file open, discover target from request text (agent always; ask/plan optionally)
+                if not (focus_file or "").strip():
+                    if mode == "agent" or mode == "plan" or mode == "ask":
+                        discovered = find_relevant_files(text or (plan_context or "")[:500], open_file=None)
+                        if discovered:
+                            focus_file = discovered[0]
+                            dbg(f"stream: discovered focus_file from request: {focus_file}")
 
                 if getattr(config, "DISABLE_FOCUS_FILE", False):
                     focus_file = None
 
-                if mode in ("agent", "chat", "repair"):
-                    run_text = text if mode != "repair" else f"{text}\n\nRepair target:\n{last_error}"
-                    extra_read = [
-                        str(p).strip() for p in (data.get("extra_read_files") or [])
-                        if str(p).strip()
-                    ]
-                    context_folders = [
-                        str(p).strip() for p in (data.get("context_folders") or data.get("extra_folders") or [])
-                        if str(p).strip()
-                    ] or None
-                    def on_action(action: Dict) -> None:
-                        self._sse_send(json.dumps(action), event="action")
-                        if action.get("type") == "tool_call":
-                            from .utils import tool_call_log
-                            tool_call_log(action.get("tool", ""), action.get("args") or {})
-                            # Ensure debugger sees every tool call: append to debug log (tool_call_log already does stderr + log)
-                            try:
-                                _line = f"[stream action] {action.get('tool', '')} {action.get('args') or {}}"
-                                with open(config.DEBUG_LOG_PATH, "a") as _f:
-                                    _f.write(f"[tool_call] {time.strftime('%Y-%m-%d %H:%M:%S')} {_line}\n")
-                            except Exception:
-                                pass
+                extra_read = [
+                    str(p).strip() for p in (data.get("extra_read_files") or [])
+                    if str(p).strip()
+                ]
+                context_folders = [
+                    str(p).strip() for p in (data.get("context_folders") or data.get("extra_folders") or [])
+                    if str(p).strip()
+                ] or None
 
-                    # Do not stream token-by-token; only send final summary (if any) after run_agent
+                def on_action(action: Dict) -> None:
+                    self._sse_send(json.dumps(action), event="action")
+                    if action.get("type") == "tool_call":
+                        from .utils import tool_call_log
+                        tool_call_log(action.get("tool", ""), action.get("args") or {})
+                        try:
+                            _line = f"[stream action] {action.get('tool', '')} {action.get('args') or {}}"
+                            with open(config.DEBUG_LOG_PATH, "a") as _f:
+                                _f.write(f"[tool_call] {time.strftime('%Y-%m-%d %H:%M:%S')} {_line}\n")
+                        except Exception:
+                            pass
+
+                def on_chunk(token: str) -> None:
+                    if token:
+                        self._sse_send(token, event="chunk")
+
+                # Build run_text and dispatch by mode
+                if mode == "repair":
+                    run_text = f"{text}\n\nRepair target:\n{last_error}"
+                elif mode == "agent" and plan_context:
+                    # Execute plan (from Plan mode Execute button): pass plan as user message to agent
+                    run_text = "Implement the following plan.\n\n" + plan_context
+                else:
+                    history_limit = max(0, int(getattr(config, "CHAT_HISTORY_TURNS", 5)))
+                    pairs = state.get_recent_chat(limit=history_limit) if history_limit else []
+                    if pairs:
+                        parts = []
+                        for u, a in pairs:
+                            if u or a:
+                                parts.append(f"User: {u or ''}\n\nAssistant: {a or ''}")
+                        run_text = "\n\n".join(parts) + "\n\nUser: " + text
+                    else:
+                        run_text = text
+
+                if mode == "ask":
+                    print("[stream] calling run_ask ...", file=sys.stderr)
+                    sys.stderr.flush()
+                    output, meta = run_ask(
+                        run_text,
+                        focus_file=focus_file,
+                        silent=True,
+                        on_action=on_action,
+                        on_chunk=on_chunk,
+                        extra_read_files=extra_read or None,
+                        context_folders=context_folders,
+                    )
+                elif mode == "plan":
+                    print("[stream] calling run_plan ...", file=sys.stderr)
+                    sys.stderr.flush()
+                    output, meta = run_plan(
+                        run_text,
+                        focus_file=focus_file,
+                        silent=True,
+                        on_action=on_action,
+                        on_chunk=on_chunk,
+                        extra_read_files=extra_read or None,
+                        context_folders=context_folders,
+                    )
+                else:
+                    # agent or repair
                     print("[stream] calling run_agent ...", file=sys.stderr)
                     sys.stderr.flush()
                     output, meta = run_agent(
@@ -268,27 +289,25 @@ class APIServer(BaseHTTPRequestHandler):
                         mode=mode,
                         silent=True,
                         on_action=on_action,
-                        on_chunk=None,
+                        on_chunk=on_chunk,
                         extra_read_files=extra_read or None,
                         context_folders=context_folders,
                     )
-                    meta["buffer_mode"] = "direct"
-                    meta["output"] = output
-                    meta["explanation"] = output
-                    self._attach_path_debug(meta, focus_file)
-                    print(f"[stream] run_agent done output_len={len(output)}", file=sys.stderr)
+
+                meta["buffer_mode"] = "direct"
+                meta["output"] = output
+                meta["explanation"] = output
+                self._attach_path_debug(meta, focus_file)
+                print(f"[stream] done output_len={len(output)}", file=sys.stderr)
+                sys.stderr.flush()
+                if not output:
+                    print("[stream] No response from the model (may still be loading). Try again in a moment.", file=sys.stderr)
                     sys.stderr.flush()
-                    if not output:
-                        print("[stream] No response from the model (may still be loading). Try again in a moment.", file=sys.stderr)
-                        sys.stderr.flush()
-                    # Stream only the final summary to the client (one chunk), not token-by-token
-                    if output and output.strip():
-                        self._sse_send(output.strip(), event="chunk")
-                    if mode != "repair":
-                        state.append_chat_turn(text, output)
-                    elif meta.get("touched"):
-                        state.append_chat_turn(text, output)
-                        state.append_change_note(f"Repair staged for: {', '.join(meta['touched'])}")
+                if mode != "repair":
+                    state.append_chat_turn(text, output)
+                elif meta.get("touched"):
+                    state.append_chat_turn(text, output)
+                    state.append_change_note(f"Repair staged for: {', '.join(meta['touched'])}")
 
                 if focus_file:
                     meta["focus_file"] = focus_file

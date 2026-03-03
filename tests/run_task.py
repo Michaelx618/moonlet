@@ -6,7 +6,7 @@ Usage:
   cd /Users/michael/moonlet
   python3 tests/run_task.py tests/fixtures/w7
   # Or with env:
-  SC2_GGUF=... SC2_USE_CHAT_TOOLS=1 python3 tests/run_task.py /path/to/task_dir
+  SC2_MLX_MODEL=... python3 tests/run_task.py /path/to/task_dir
 
 Task directory should contain:
   - spec.txt (or spec.md): the instruction for the model

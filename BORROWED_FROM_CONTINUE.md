@@ -79,7 +79,9 @@ Everything below is implemented in this repo and derived from or aligned with Co
 - **Edit match**: `ai_shell/edit_match.py` — `find_search_matches` (exact, trimmed, case-insensitive, whitespace-ignored).
 - **Search/replace**: `ai_shell/search_replace.py` — `validate_single_edit`, `execute_find_and_replace` (replace_all), `execute_multi_find_and_replace`, `apply_single_multi_edit`, `parse_multi_edit_calls`.
 - **Config**: `ai_shell/config.py` — `BASE_AGENT_SYSTEM_MESSAGE`, limits for context.
-- **Server**: `ai_shell/server.py` — `/stream` and `/v2/execute` pass `focus_file`, `extra_read_files`, and `context_folders` (or `extra_folders`) into `run_agent`.
+- **Server**: `ai_shell/server.py` — `/stream` and `/v2/execute` pass `focus_file`, `extra_read_files`, and `context_folders` (or `extra_folders`). Server branches on mode: **ask** → `run_ask`, **plan** → `run_plan`, **agent**/repair → `run_agent`. Optional `plan_context` (Execute plan): when present with mode agent, user message is "Implement the following plan." + plan_context.
+- **Ask and Plan modes**: `ai_shell/ask_plan.py` — `run_ask` and `run_plan` with separate prompts and read-only tool loops (ask = Q&A, no edits; plan = explore and produce a plan). Plan mode in the UI shows an **Execute** button; clicking it sends an agent request with the plan as context and, when done, switches the UI to agent mode.
+- **Config/Electron**: In `local-app/main.js`, bridge-related config uses neutral names: `useExternalBridge`, `bridgeCliCmd`, `bridgeNodeBin`, `bridgeTimeoutS`, `bridgePrintFormat`, `bridgeSilentPrint`, `bridgeGlobalDir` (env: `SC2_USE_EXTERNAL_BRIDGE`, `SC2_BRIDGE_CLI_CMD`, etc.). The bridge is for the other IDE; see this file for attribution.
 
 ---
 
@@ -113,7 +115,7 @@ To get closer to Continue's behavior: use a backend with **native tool calling**
 ## What Continue has that we don't (features)
 
 - **search_web**, **fetch_url_content**, **create_rule_block**, **read_currently_open_file** (we inject current file in prompt instead).
-- **Plan mode** (read-only only); we have agent + chat with same tool schema.
+- ~~Plan mode~~ We now have **ask** and **plan** as separate routes (read-only tools); plan mode includes an Execute button that feeds the plan to agent mode.
 - **@Git Diff**, **@Terminal**, **@Docs**, **@Web**, **@Url**, **@Clipboard** context providers.
 - MCP server integration; we only have built-in tools.
 

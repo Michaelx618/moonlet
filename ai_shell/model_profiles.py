@@ -36,13 +36,11 @@ PROFILES: Dict[str, ModelProfile] = {
 }
 
 
-def resolve_model_profile(profile_name: str, gguf_path: str = "") -> ModelProfile:
+def resolve_model_profile(profile_name: str, _model_path: str = "") -> ModelProfile:
+    """Resolve profile by name. For 'auto', returns chatml_completion (MLX models are typically chat-tuned)."""
+    _ = _model_path
     key = (profile_name or "").strip().lower()
     if key in PROFILES:
         return PROFILES[key]
-
-    gguf = (gguf_path or "").lower()
-    # Heuristic defaults for auto mode.
-    if any(x in gguf for x in ("deepseek", "coder", "instruct", "llama-3")):
-        return PROFILES["chatml_completion"]
-    return PROFILES["legacy_raw"]
+    # Auto: default to chatml for MLX
+    return PROFILES["chatml_completion"]

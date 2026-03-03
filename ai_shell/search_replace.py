@@ -1,7 +1,7 @@
 """Parse and execute search_replace(old_string, new_string, path) from model output.
 
 Simple algorithm: literal find old_string in file, replace with new_string (all occurrences).
-Continue parity: replace_all, multi_edit, validate_single_edit.
+Parity: replace_all, multi_edit, validate_single_edit.
 """
 
 import re
@@ -17,17 +17,13 @@ from .files import (
     resolve_path,
     write_file_text,
 )
+from . import config
+from .file_utils_adapter import is_security_concern
 from .utils import dbg, dbg_dump
-
-try:
-    from file_utils import is_security_concern
-except ImportError:
-    def is_security_concern(*args, **kwargs):
-        return False
 
 
 class SearchReplaceError(Exception):
-    """Continue-style validation error for find-and-replace."""
+    """Validation error for find-and-replace."""
     pass
 
 
@@ -37,7 +33,7 @@ def validate_single_edit(
     replace_all: Any = None,
     index: Optional[int] = None,
 ) -> Tuple[str, str, bool]:
-    """Validate a single edit (Continue findAndReplaceUtils). Returns (old_string, new_string, replace_all)."""
+    """Validate a single edit. Returns (old_string, new_string, replace_all)."""
     ctx = f"edit at index {index}: " if index is not None else ""
     if old_string is None or not isinstance(old_string, str):
         raise SearchReplaceError(f"{ctx}old_string is required")
@@ -208,60 +204,6 @@ def parse_search_replace_calls(
                     "new_string": new_s,
                     "path": path_s,
                     "replace_all": replace_all,
-                }
-            )
-    return results
-
-
-def parse_write_file_calls(raw: str) -> List[Dict[str, str]]:
-    """Extract write_file(path=..., content=...) from model output.
-
-    Returns [{"path": str, "content": str}, ...].
-    Supports "..." and \"\"\"...\"\"\" for multi-line content.
-    """
-    if not raw or not isinstance(raw, str):
-        return []
-    text = raw.strip()
-    results: List[Dict[str, str]] = []
-    pattern = re.compile(r"\bwrite_file\s*\(", re.IGNORECASE)
-    for m in pattern.finditer(text):
-        start = m.end()
-        pos = start
-        kwargs: Dict[str, str] = {}
-        while pos < len(text):
-            while pos < len(text) and text[pos] in " \t\n\r,":
-                pos += 1
-            if pos >= len(text):
-                break
-            if text[pos] == ")":
-                pos += 1
-                break
-            key_match = re.match(r"(path|content)\s*=\s*", text[pos:], re.IGNORECASE)
-            if not key_match:
-                pos += 1
-                continue
-            key = key_match.group(1).lower()
-            pos += key_match.end()
-            if pos >= len(text):
-                break
-            if text[pos] == '"':
-                triple = text[pos : pos + 3] == '"""'
-                quote = '"""' if triple else '"'
-                val, end_pos = _parse_python_string(text, pos, quote[0])
-                if triple and val is not None:
-                    pass
-                elif val is not None:
-                    val = _unescape_string(val)
-                if val is not None:
-                    kwargs[key] = val
-                pos = end_pos
-            else:
-                break
-        if kwargs.get("path") is not None and kwargs.get("content") is not None:
-            results.append(
-                {
-                    "path": kwargs["path"].strip().strip('"'),
-                    "content": kwargs["content"],
                 }
             )
     return results
@@ -472,7 +414,7 @@ def execute_multi_find_and_replace(
     file_content: str,
     edits: List[Dict[str, Any]],
 ) -> str:
-    """Apply a list of edits in sequence (Continue performReplace.executeMultiFindAndReplace)."""
+    """Apply a list of edits in sequence (executeMultiFindAndReplace)."""
     result = file_content
     for i, edit in enumerate(edits):
         old_s = edit.get("old_string") or ""
@@ -548,23 +490,23 @@ def apply_search_replace(
     """
     import json as _json
     import time as _time
-    # #region agent log
-    def _dlog(loc: str, msg: str, data: dict, hid: str) -> None:
-        try:
-            with open("/Users/michael/moonlet/.cursor/debug-c7e239.log", "a") as _f:
-                _f.write(_json.dumps({"sessionId": "c7e239", "hypothesisId": hid, "location": loc, "message": msg, "data": data, "timestamp": int(_time.time() * 1000)}) + "\n")
-        except Exception:
-            pass
-    # #endregion
+    if config.DEBUG_AGENT_LOG:
+        _log_path = config.DEBUG_LOG_PATH
+        def _dlog(loc: str, msg: str, data: dict, hid: str) -> None:
+            try:
+                with open(_log_path, "a") as _f:
+                    _f.write(_json.dumps({"location": loc, "message": msg, "data": data, "timestamp": int(_time.time() * 1000)}) + "\n")
+            except Exception:
+                pass
+    else:
+        _dlog = lambda _loc, _msg, _data, _hid: None
     root = root or get_root()
     root = Path(root).resolve()
     old_str = edit.get("old_string") or ""
     new_str = edit.get("new_string", "")
     path_str = edit.get("path") or ""
     replace_all = edit.get("replace_all") is True
-    # #region agent log
     _dlog("search_replace.apply_search_replace:entry", "entry", {"path_str": path_str, "root": str(root), "stage_only": stage_only}, "H1")
-    # #endregion
 
     if not old_str:
         return False, "search_replace: old_string is empty", None
@@ -578,14 +520,10 @@ def apply_search_replace(
     try:
         rel_path, abs_path = _resolve_edit_path(path_str, root)
     except ValueError as e:
-        # #region agent log
         _dlog("search_replace.apply_search_replace:resolve_fail", "resolve_fail", {"path_str": path_str, "error": str(e)}, "H1")
-        # #endregion
         return False, f"search_replace: {e}", None
 
-    # #region agent log
     _dlog("search_replace.apply_search_replace:resolved", "resolved", {"rel_path": rel_path, "abs_path": str(abs_path), "exists": abs_path.exists() and abs_path.is_file()}, "H1")
-    # #endregion
 
     if allowed_edit_files:
         allowed_set = {_norm_rel_path(p) for p in allowed_edit_files}
@@ -601,9 +539,7 @@ def apply_search_replace(
 
     allow_new = not (abs_path.exists() and abs_path.is_file())
     edit_allowed = is_edit_allowed(rel_path, allow_new=allow_new)
-    # #region agent log
     _dlog("search_replace.apply_search_replace:edit_allowed", "edit_allowed", {"rel_path": rel_path, "allow_new": allow_new, "edit_allowed": edit_allowed, "include_paths": get_include() or None}, "H2")
-    # #endregion
     if not edit_allowed:
         return False, (
             f"search_replace: edit not allowed for {rel_path} "
@@ -619,19 +555,15 @@ def apply_search_replace(
     content = abs_path.read_text()
     old_in_content = old_str in content
     new_in_content = new_str in content
-    # #region agent log
     _dlog("search_replace.apply_search_replace:before_replace", "before_replace", {"rel_path": rel_path, "old_in_content": old_in_content, "new_in_content": new_in_content, "content_len": len(content)}, "H3")
-    # #endregion
     try:
         new_content = execute_search_replace(
             content, old_str, new_str, replace_all=replace_all, edit_index=0
         )
     except SearchReplaceError as e:
         err_msg = str(e)
-        # #region agent log
         _dlog("search_replace.apply_search_replace:string_not_found", "string_not_found", {"rel_path": rel_path, "err_msg": err_msg[:200]}, "H3")
-        # #endregion
-        # Continue-style: short failure message only (no file snippet)
+        # Short failure message only (no file snippet)
         fail_msg = (
             f"Failed to edit {rel_path}. To continue working with the file, read it again to see the most up-to-date contents."
         )
@@ -640,9 +572,7 @@ def apply_search_replace(
     diff = generate_diff(content, new_content, str(abs_path))
 
     if stage_only:
-        # #region agent log
         _dlog("search_replace.apply_search_replace:return_ok_stage", "return_ok", {"rel_path": rel_path, "stage_only": True}, "H4")
-        # #endregion
         return True, f"Successfully edited {rel_path}", {
             "path": rel_path,
             "old_content": content,
@@ -650,9 +580,7 @@ def apply_search_replace(
             "diff": diff,
         }
     abs_path.write_text(new_content)
-    # #region agent log
     _dlog("search_replace.apply_search_replace:return_ok_write", "return_ok", {"rel_path": rel_path, "stage_only": False}, "H4")
-    # #endregion
     return True, f"Successfully edited {rel_path}", {
         "path": rel_path,
         "old_content": content,
@@ -718,7 +646,7 @@ def apply_search_replace_edits(
             continue
         content = abs_path.read_text()
         try:
-            # Continue: apply edits in sequence (execute_multi_find_and_replace)
+            # Apply edits in sequence (execute_multi_find_and_replace)
             edits_payload = [
                 {
                     "old_string": e.get("old_string") or "",

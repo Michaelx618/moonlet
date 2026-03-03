@@ -1,4 +1,4 @@
-"""Tests for Continue-style edit match strategies and search_replace validation."""
+"""Tests for edit match strategies and search_replace validation."""
 
 import unittest
 

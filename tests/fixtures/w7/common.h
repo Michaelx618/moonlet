@@ -1,0 +1,2 @@
+#define MAXLINE 256
+#define MAX_PASSWORD 10
