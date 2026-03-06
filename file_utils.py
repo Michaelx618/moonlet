@@ -1,7 +1,6 @@
 """File editing utilities."""
 import difflib
 from pathlib import Path
-from typing import List, Tuple, Optional
 
 
 def generate_diff(
@@ -26,97 +25,6 @@ def generate_diff(
         n=context_lines,
     )
     return "".join(diff)
-
-
-def find_search_matches(content: str, search_string: str) -> List[Tuple[int, int]]:
-    """Find all occurrences of search_string in content.
-    
-    Returns list of (start_index, end_index) tuples.
-    Ported from core/edit/searchAndReplace/findSearchMatch.ts
-    """
-    matches = []
-    start = 0
-    while True:
-        idx = content.find(search_string, start)
-        if idx == -1:
-            break
-        matches.append((idx, idx + len(search_string)))
-        start = idx + 1
-    return matches
-
-
-def execute_find_and_replace(
-    file_content: str,
-    old_string: str,
-    new_string: str,
-    replace_all: bool = False,
-    edit_index: int = 0,
-) -> str:
-    """Execute find and replace operation with validation.
-    
-    Ported from core/edit/searchAndReplace/performReplace.ts
-    """
-    matches = find_search_matches(file_content, old_string)
-    
-    if not matches:
-        raise ValueError(
-            f"Edit at index {edit_index}: string not found in file: {old_string!r}"
-        )
-    
-    if replace_all:
-        # Apply replacements in reverse order to maintain correct positions
-        result = file_content
-        for start_idx, end_idx in reversed(matches):
-            result = result[:start_idx] + new_string + result[end_idx:]
-        return result
-    else:
-        # For single replacement, check for multiple matches first
-        if len(matches) > 1:
-            raise ValueError(
-                f"Edit at index {edit_index}: String {old_string!r} appears "
-                f"{len(matches)} times in the file. Either provide a more specific "
-                "string with surrounding context to make it unique, or use "
-                "replace_all=True to replace all occurrences."
-            )
-        
-        # Apply single replacement
-        start_idx, end_idx = matches[0]
-        return (
-            file_content[:start_idx] + new_string + file_content[end_idx:]
-        )
-
-
-def execute_multi_find_and_replace(
-    file_content: str,
-    edits: List[dict],
-) -> str:
-    """Execute multiple find and replace operations sequentially.
-    
-    Ported from core/edit/searchAndReplace/performReplace.ts
-    
-    Args:
-        file_content: Original file content
-        edits: List of dicts with 'old_string', 'new_string', and optional 'replace_all'
-    
-    Returns:
-        Modified file content
-    """
-    result = file_content
-    
-    for edit_index, edit in enumerate(edits):
-        old_string = edit.get("old_string", "")
-        new_string = edit.get("new_string", "")
-        replace_all = edit.get("replace_all", False)
-        
-        result = execute_find_and_replace(
-            result,
-            old_string,
-            new_string,
-            replace_all,
-            edit_index,
-        )
-    
-    return result
 
 
 def validate_file_path(

@@ -32,7 +32,7 @@ Everything below is implemented in this repo and derived from or aligned with Co
 **Edit logic (ported from Continue core/edit/searchAndReplace)**
 - **Match strategies**: exact, trimmed, case-insensitive, whitespace-ignored (`ai_shell/edit_match.py`).
 - **validate_single_edit**, **execute_find_and_replace** (with replace_all), **execute_multi_find_and_replace** in `ai_shell/search_replace.py`.
-- **Scripts**: Continue's `scripts/` folder is copied into this repo as `scripts/continue/` (install-dependencies.sh, build-packages.js, util/index.js, etc.). Run from repo root or from `vendor/continue` context as needed; see `.cursorignore` (scripts/ is ignored for IDE).
+- **Scripts**: Continue's `scripts/` folder was previously copied as `scripts/continue/`; removed along with vendor/continue and CLI bridge.
 
 **Tool schemas**
 - `TOOLS_SCHEMA`: text description for completion mode (function-style calls). In `ai_shell/tool_executor.py`.
@@ -81,7 +81,7 @@ Everything below is implemented in this repo and derived from or aligned with Co
 - **Config**: `ai_shell/config.py` — `BASE_AGENT_SYSTEM_MESSAGE`, limits for context.
 - **Server**: `ai_shell/server.py` — `/stream` and `/v2/execute` pass `focus_file`, `extra_read_files`, and `context_folders` (or `extra_folders`). Server branches on mode: **ask** → `run_ask`, **plan** → `run_plan`, **agent**/repair → `run_agent`. Optional `plan_context` (Execute plan): when present with mode agent, user message is "Implement the following plan." + plan_context.
 - **Ask and Plan modes**: `ai_shell/ask_plan.py` — `run_ask` and `run_plan` with separate prompts and read-only tool loops (ask = Q&A, no edits; plan = explore and produce a plan). Plan mode in the UI shows an **Execute** button; clicking it sends an agent request with the plan as context and, when done, switches the UI to agent mode.
-- **Config/Electron**: In `local-app/main.js`, bridge-related config uses neutral names: `useExternalBridge`, `bridgeCliCmd`, `bridgeNodeBin`, `bridgeTimeoutS`, `bridgePrintFormat`, `bridgeSilentPrint`, `bridgeGlobalDir` (env: `SC2_USE_EXTERNAL_BRIDGE`, `SC2_BRIDGE_CLI_CMD`, etc.). The bridge is for the other IDE; see this file for attribution.
+- **Config/Electron**: Bridge/CLI integration (vendor/continue, Continue CLI) has been removed.
 
 ---
 

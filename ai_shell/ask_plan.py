@@ -13,7 +13,6 @@ from .agent_loop import (
     get_reply_completion,
     state_to_prompt,
     _workspace_paths_section,
-    _reference_files_section,
     _focus_file_section,
     _code_context_section,
     _folder_context_section,
@@ -50,7 +49,6 @@ def _build_ask_prompt(
         f"{_workspace_paths_section()}"
         f"{_code_context_section(focus_file, extra_read_files)}"
         f"{_folder_context_section(context_folders)}"
-        f"{_reference_files_section(extra_read_files)}"
         f"User request:\n{instruction}"
         f"{_focus_file_section(focus_file)}"
     )
@@ -75,7 +73,6 @@ def _build_plan_prompt(
         f"{_workspace_paths_section()}"
         f"{_code_context_section(focus_file, extra_read_files)}"
         f"{_folder_context_section(context_folders)}"
-        f"{_reference_files_section(extra_read_files)}"
         f"User request:\n{instruction}"
         f"{_focus_file_section(focus_file)}"
     )

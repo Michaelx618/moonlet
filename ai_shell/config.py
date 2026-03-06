@@ -138,8 +138,6 @@ DISABLE_INDEX = os.getenv("SC2_DISABLE_INDEX", "true").lower() in ("1", "true", 
 # Index gate: when true, keep index empty until user imports/selects files.
 INDEX_REQUIRES_IMPORT = os.getenv("SC2_INDEX_REQUIRES_IMPORT", "true").lower() in ("1", "true", "yes")
 # Content-addressed indexing: SQLite catalog, incremental refresh, code snippets, chunks, FTS, embeddings.
-# When True, rebuild_index() also runs the indexer refresh. Off by default for now; set SC2_CONTINUE_INDEX=1 to enable.
-CONTINUE_INDEX_ENABLED = False  # os.getenv("SC2_CONTINUE_INDEX", "false").lower() in ("1", "true", "yes")
 # Which index artifacts to build (all default true except embeddings, which requires SEMANTIC_SEARCH_ENABLED).
 INDEX_ENABLE_CODE_SNIPPETS = os.getenv("SC2_INDEX_CODE_SNIPPETS", "true").lower() in ("1", "true", "yes")
 INDEX_ENABLE_FTS = os.getenv("SC2_INDEX_FTS", "true").lower() in ("1", "true", "yes")

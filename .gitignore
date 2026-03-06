@@ -13,6 +13,8 @@ __pycache__/
 # Local logs/artifacts
 *.log
 moonlet_smoke.json
+tests/integration_*.log
+tests/tmp*/
 
 # macOS
 .DS_Store

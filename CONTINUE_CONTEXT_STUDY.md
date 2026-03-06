@@ -1,6 +1,6 @@
 # Continue context handling (study from their source)
 
-Short summary of how Continue handles multiple files and context. **Source used:** `/Users/michael/continue-main` (you can grep it; workspace may be moonlet so use terminal e.g. `rg "getContextItems" /Users/michael/continue-main -g "*.ts"`). Also: `vendor/continue` in this repo (often cursorignored).
+Short summary of how Continue handles multiple files and context. **Source used:** `/Users/michael/continue-main` (you can grep it; workspace may be moonlet so use terminal e.g. `rg "getContextItems" /Users/michael/continue-main -g "*.ts"`).
 
 ## Context providers (multiple files)
 

@@ -55,6 +55,52 @@ from .file_utils_adapter import generate_diff, is_security_concern
 # Junk paths to exclude from context
 _REFERENCE_SKIP = (".dsym/", "contents/info.plist", "/spec.txt", "/task.json", "node_modules/", "__pycache__/")
 
+_REPO = Path(__file__).resolve().parent.parent
+_PARSE_FAILURE_LOG = _REPO / "tests" / "integration_parse_debug.log"
+
+
+def _log_parse_failure(round_num: int, reply: str) -> None:
+    """Log full model reply when no tool calls were parsed. Useful for debugging tests."""
+    try:
+        log_path = getattr(config, "DEBUG_LOG_PATH", None) or str(_PARSE_FAILURE_LOG)
+        if not log_path:
+            log_path = str(_PARSE_FAILURE_LOG)
+        with open(log_path, "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[parse_failure] round={round_num} reply_len={len(reply)}\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("--- full model reply ---\n")
+            f.write(reply or "(empty)\n")
+            f.write("--- end ---\n")
+    except Exception:
+        pass
+
+
+def _log_parse_result(round_num: int, reply: str, parsed: list) -> None:
+    """Log parse success: reply snippet and what we parsed. For debugging."""
+    try:
+        log_path = getattr(config, "DEBUG_LOG_PATH", None) or str(_PARSE_FAILURE_LOG)
+        if not log_path:
+            log_path = str(_PARSE_FAILURE_LOG)
+        with open(log_path, "a") as f:
+            f.write(f"\n[parse_ok] round={round_num} parsed={[(n, list(k.keys()) if isinstance(k, dict) else []) for n, k in parsed]}\n")
+            f.write(f"reply_preview: {repr((reply or '')[:500])}\n")
+    except Exception:
+        pass
+
+
+def _log_tool_result(tool: str, path: str = "", result: str = "", added_to_touched: bool = False, exc: str = "") -> None:
+    """Log tool execution result for diagnostics (create_new_file, write_file, etc)."""
+    try:
+        log_path = str(_PARSE_FAILURE_LOG)
+        with open(log_path, "a") as f:
+            f.write(f"\n[tool_result] {tool} path={path!r} added_to_touched={added_to_touched}\n")
+            f.write(f"  result: {(result or '')[:400]}\n")
+            if exc:
+                f.write(f"  exc: {exc}\n")
+    except Exception:
+        pass
+
 
 # --- Conversation state (single representation for both completion and API backends) ---
 
@@ -445,7 +491,10 @@ def _run_one_tool(
 
     if name == "create_new_file":
         result = execute_tool_from_kwargs(name, kwargs)
-        if isinstance(result, str) and "Created" in result and "Error" not in result[:30]:
+        path_str = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip('"\'')
+        success = isinstance(result, str) and "Created" in result and "Error" not in result[:30]
+        _log_tool_result("create_new_file", path=path_str, result=result, added_to_touched=success)
+        if success:
             path_str = (kwargs.get("path") or kwargs.get("filepath") or "").strip().strip("'\"")
             if path_str:
                 try:
@@ -456,8 +505,8 @@ def _run_one_tool(
                     per_file_before[rel_path] = ""
                     per_file_staged[rel_path] = str(content)
                     tool_log(f"create_new_file -> {rel_path}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_tool_result("create_new_file", path=path_str, result=result, added_to_touched=False, exc=str(e))
         return result
 
     return execute_tool_from_kwargs(name, kwargs)
@@ -758,8 +807,10 @@ def run_agent(
             tool_log(
                 f"attempted tool calls ({len(func_calls)}): {[(n, list(k.keys()) if isinstance(k, dict) else []) for n, k in func_calls]}"
             )
+            _log_parse_result(round_num, reply, parsed=func_calls)
         else:
             tool_log("attempted tool calls (0): none parsed from reply")
+            _log_parse_failure(round_num, reply)
 
         final_reply = reply
 

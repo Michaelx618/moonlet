@@ -117,7 +117,7 @@ def _extract_xml_tool_calls(text: str) -> List[Tuple[str, Dict[str, str]]]:
 
 def _extract_write_file_from_code_block(text: str) -> Optional[Tuple[str, str]]:
     """If model output is a fenced code block with a filename (same mechanism as other tools: path + content), return (path, content).
-    Supports: ```lang path\ncontent```, ```\npath\ncontent```, and ```\n\npath\ncontent```."""
+    Supports: ```lang path\ncontent```, ```\npath\ncontent```, ```\n\npath\ncontent```, and truncated blocks (no closing ```)."""
     if not text or not isinstance(text, str):
         return None
     stripped = text.strip()
@@ -127,6 +127,31 @@ def _extract_write_file_from_code_block(text: str) -> Optional[Tuple[str, str]]:
         # Filename on its own line after ``` (common model formatting)
         m = re.search(r"^```\s*(?:\w*\s*)?\n\s*([^\s\n]+)\s*\n(.*?)```", stripped, re.DOTALL)
     if not m:
+        # Truncated block (no closing ```): ```\npath\ncontent or ```lang\npath\ncontent
+        if stripped.startswith("```") and "\n" in stripped:
+            lines = stripped.split("\n")
+            # Line 0 = ```, line 1 = optional lang or path, line 2+ = content
+            if len(lines) >= 3:
+                second = (lines[1] or "").strip()
+                # Path must look like a filename (has dot, or is README.md), not a markdown header
+                def _is_path(s: str) -> bool:
+                    if not s or s.startswith("#"):
+                        return False
+                    return "." in s or s.lower() in ("readme", "readme.md")
+                # If second line is path
+                if _is_path(second):
+                    path_candidate = second.strip('"\'')
+                    content = "\n".join(lines[2:]).strip()
+                    if path_candidate and content:
+                        return (path_candidate, content)
+                # Else second is lang (markdown, md); third is path
+                elif len(lines) >= 4 and second.lower() in ("markdown", "md", ""):
+                    third = (lines[2] or "").strip()
+                    if _is_path(third):
+                        path_candidate = third.strip('"\'')
+                        content = "\n".join(lines[3:]).strip()
+                        if path_candidate and content:
+                            return (path_candidate, content)
         return None
     path_candidate = (m.group(1) or "").strip().strip('"\'')
     content = (m.group(2) or "").strip()
@@ -407,32 +432,22 @@ Current file (if any) may be included below as "Current file".
 - After making edits, give a brief explanation of what you changed (one or two sentences).
 - When the whole task is complete (all requested changes applied everywhere needed), respond with a brief summary and no further tool calls. After each tool result, decide the next step from the result; do not repeat the same edit."""
 
-# Ask mode: answer questions, use tools to read/list — do NOT instruct to produce diffs
-CHAT_TOOLS_HINT = """You have access to these tools. Use the function-style format when you need them:
-
-- read_file(path="src/main.py") — Read a file
-- list_files(path="api/") — List files in directory
-- grep(pattern="pattern", path=".") — Search across files
-- run_terminal_cmd(command="pytest") — Run shell command
-
-CONTEXT already includes imported files. Use tools if you need more. Answer in plain text. Do NOT produce diffs or code edits unless the user explicitly asks."""
-
+# Ask mode: read-only tools, answer in text (concise, consistent with agent prompt trimming)
+CHAT_TOOLS_HINT = (
+    "Read-only tools (function-style): read_file(filepath=\"...\"), list_files(path=\"...\"), "
+    "grep(pattern=\"...\", path=\"...\"), glob_file_search(glob=\"*.py\", path=\"...\"), "
+    "codebase_search(query=\"...\"), view_repo_map(), view_diff(path=\"...\"). "
+    "Use tools as needed. Answer in plain text. No diffs or code edits unless the user asks."
+)
 ASK_TOOLS_HINT = CHAT_TOOLS_HINT
 
-# Plan mode: read-only exploration and planning; no file edits
-PLAN_TOOLS_HINT = """You have access to read-only tools for exploring the codebase. Use the function-style format when you need them.
-
-Read-only tools:
-- read_file(filepath="path") — Read file contents
-- list_files(path="dir") — List files in directory
-- grep_search(pattern="...", path=".") — Search across files
-- glob_file_search(glob="*.py", path=".") — Find files by glob
-- codebase_search(query="natural language query") — Search codebase
-- view_repo_map() — Show repo structure
-- view_diff(path="file") — Show diff for a file (if any from this session)
-- symbols(path="file") — List symbols in a file
-
-You cannot edit or create files in Plan mode. Explore and produce an implementation plan as text. When done, the user may execute the plan in Agent mode."""
+# Plan mode: read-only exploration, produce plan as text (concise)
+PLAN_TOOLS_HINT = (
+    "Read-only tools (function-style): read_file(filepath=\"...\"), list_files(path=\"...\"), "
+    "grep_search(pattern=\"...\", path=\"...\"), glob_file_search(glob=\"*.py\", path=\"...\"), "
+    "codebase_search(query=\"...\"), view_repo_map(), view_diff(path=\"...\"), symbols(path=\"...\"). "
+    "Explore with tools. Produce an implementation plan as text. No file edits; user can run plan in Agent mode."
+)
 
 # Read-only tool names (no file writes)
 READ_ONLY_TOOL_NAMES = frozenset({

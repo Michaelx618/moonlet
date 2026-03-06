@@ -104,16 +104,6 @@ def rebuild_index() -> List[str]:
         else:
             include_info = f" include={len(include)} path(s)"
         dbg(f"index: rebuilt, {len(_indexed_files)} files (cap=200) root={root}{include_info}")
-        # Content-addressed indexing: update SQLite catalog + code snippets + FTS when enabled
-        if getattr(config, "CONTINUE_INDEX_ENABLED", False):
-            try:
-                from .indexing import refresh_codebase_index
-                include_list = list(include) if include else None
-                for _ in refresh_codebase_index(str(root), include_paths=include_list):
-                    pass
-                dbg("index: indexing refresh done")
-            except Exception as ce:
-                dbg(f"index: indexing refresh failed: {ce}")
         return _indexed_files
     except Exception as e:
         _indexed_files = []

@@ -188,14 +188,6 @@ async function startServer() {
     SC2_DEBUG_LOG: cfg.debugLog || process.env.SC2_DEBUG_LOG,
     SC2_DEBUG_KV: cfg.debugKv ? "1" : process.env.SC2_DEBUG_KV,
     SC2_DEBUG_CHAT: cfg.debugChat ? "1" : process.env.SC2_DEBUG_CHAT,
-    SC2_PIPELINE_IMPL: String(
-      cfg.pipelineImpl || process.env.SC2_PIPELINE_IMPL || "rail_v3"
-    ),
-    SC2_USE_CORE_V2: String(
-      cfg.useCoreV2 !== undefined
-        ? cfg.useCoreV2
-        : process.env.SC2_USE_CORE_V2 || 1
-    ),
     SC2_MODEL_PROFILE: String(
       cfg.modelProfile || process.env.SC2_MODEL_PROFILE || "auto"
     ),
@@ -204,7 +196,6 @@ async function startServer() {
         ? cfg.useChatmlWrap
         : process.env.SC2_USE_CHATML_WRAP || 1
     ),
-    ...(cfg.usePipeline === false ? { SC2_USE_STATE_MACHINE_PIPELINE: "false" } : {}),
     SC2_USE_CHAT_TOOLS: cfg.useChatTools ? "1" : "0",
     SC2_APPROVAL_MODE: String(
       cfg.approvalMode !== undefined
@@ -215,31 +206,6 @@ async function startServer() {
       cfg.autoApplyOnSuccess !== undefined
         ? cfg.autoApplyOnSuccess
         : process.env.SC2_AUTO_APPLY_ON_SUCCESS || 1
-    ),
-    SC2_USE_EXTERNAL_BRIDGE: String(
-      cfg.useExternalBridge !== undefined
-        ? cfg.useExternalBridge
-        : process.env.SC2_USE_EXTERNAL_BRIDGE || process.env.SC2_USE_CONTINUE_BRIDGE || 0
-    ),
-    SC2_BRIDGE_CLI_CMD: String(
-      cfg.bridgeCliCmd || process.env.SC2_BRIDGE_CLI_CMD || process.env.SC2_CONTINUE_CLI_CMD || ""
-    ),
-    SC2_BRIDGE_NODE_BIN: String(
-      cfg.bridgeNodeBin || process.env.SC2_BRIDGE_NODE_BIN || process.env.SC2_CONTINUE_NODE_BIN || "node"
-    ),
-    SC2_BRIDGE_TIMEOUT_S: String(
-      cfg.bridgeTimeoutS || process.env.SC2_BRIDGE_TIMEOUT_S || process.env.SC2_CONTINUE_TIMEOUT_S || 180
-    ),
-    SC2_BRIDGE_PRINT_FORMAT: String(
-      cfg.bridgePrintFormat || process.env.SC2_BRIDGE_PRINT_FORMAT || process.env.SC2_CONTINUE_PRINT_FORMAT || ""
-    ),
-    SC2_BRIDGE_SILENT_PRINT: String(
-      cfg.bridgeSilentPrint !== undefined
-        ? cfg.bridgeSilentPrint
-        : process.env.SC2_BRIDGE_SILENT_PRINT || process.env.SC2_CONTINUE_SILENT_PRINT || 0
-    ),
-    SC2_BRIDGE_GLOBAL_DIR: String(
-      cfg.bridgeGlobalDir || process.env.SC2_BRIDGE_GLOBAL_DIR || process.env.SC2_CONTINUE_GLOBAL_DIR || ""
     ),
     ...(cfg.verifyCommand ? { SC2_VERIFY_CMD: String(cfg.verifyCommand) } : {}),
   };
