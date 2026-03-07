@@ -2,7 +2,7 @@
   "tasks": [
     {
       "name": "noop-smoke",
-      "spec": "Read the focus file and apply a tiny safe improvement using search_replace.",
+      "spec": "Make a small improvement to this file.",
       "focus_file": "tests/fixtures/w7/checkpasswd.c",
       "extra_read_files": []
     }

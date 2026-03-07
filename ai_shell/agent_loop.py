@@ -292,6 +292,8 @@ def _code_context_section(
     extra_read_files: Optional[List[str]],
 ) -> str:
     """@Code context: symbols (functions, classes) with snippets for focus_file and extra_read_files."""
+    if getattr(config, "DISABLE_CODE_CONTEXT", False):
+        return ""
     files_to_scan: List[str] = []
     if focus_file:
         files_to_scan.append(_norm_rel_path(focus_file))
@@ -571,8 +573,10 @@ def _execute_tool_calls(
     repetition_detector: ToolRepetitionDetector,
     action_feed: List[Dict[str, Any]],
     on_action: Optional[Callable[[Dict[str, Any]], None]],
+    already_read_paths: Optional[set[str]] = None,
 ) -> Tuple[List[str], List[str]]:
     """Execute all tool calls; return (results, results_for_turn). Caller may truncate and prepend 'Already edited'."""
+    already_read = already_read_paths if already_read_paths is not None else set()
     results: List[str] = []
     for tool_name, kw in func_calls:
         internal_name = _API_TOOL_NAME_MAP.get(tool_name, tool_name)
@@ -599,6 +603,30 @@ def _execute_tool_calls(
         elif internal_name in _MUTATING_TOOLS and sig in applied_edits:
             result = "Already applied. Do not call this edit again; do the next task or respond with a brief summary and no further tool calls."
             dbg(f"agent_loop: duplicate edit blocked tool={internal_name}")
+        elif internal_name == "read_file":
+            path = (tool_args.get("filepath") or tool_args.get("path") or "").strip().strip("'\"")
+            if path:
+                norm = _norm_rel_path(path)
+                if norm in already_read:
+                    result = f"[read_file] {norm} already read above — content unchanged"
+                    dbg(f"agent_loop: read_file {norm} already read, returning short message")
+                else:
+                    already_read.add(norm)
+                    result = _run_one_tool(
+                        internal_name,
+                        tool_args,
+                        per_file_staged=per_file_staged,
+                        per_file_before=per_file_before,
+                        touched=touched,
+                    )
+            else:
+                result = _run_one_tool(
+                    internal_name,
+                    tool_args,
+                    per_file_staged=per_file_staged,
+                    per_file_before=per_file_before,
+                    touched=touched,
+                )
         else:
             result = _run_one_tool(
                 internal_name,
@@ -741,6 +769,7 @@ def run_agent(
     per_file_before: Dict[str, str] = {}
     touched: List[str] = []
     applied_edits: set[str] = set()
+    already_read_paths: set[str] = set()
     repetition_detector = ToolRepetitionDetector(getattr(config, "TOOL_REPETITION_LIMIT", 3))
     action_feed: List[Dict[str, Any]] = []
     final_reply = ""
@@ -842,6 +871,7 @@ def run_agent(
             repetition_detector=repetition_detector,
             action_feed=action_feed,
             on_action=on_action,
+            already_read_paths=already_read_paths,
         )
         # Prepend "Already edited" to first result when needed (both backends)
         if touched and results_for_turn:

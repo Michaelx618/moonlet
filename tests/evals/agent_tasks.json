@@ -1,0 +1,40 @@
+{
+  "tasks": [
+    {
+      "name": "agent-w7-smoke",
+      "mode": "agent",
+      "spec": "Make a small improvement to this file—add a comment or fix something minor.",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt", "Makefile"],
+      "focus_file": "checkpasswd.c",
+      "extra_read_files": []
+    },
+    {
+      "name": "agent-w7-checkpasswd-full",
+      "mode": "agent",
+      "spec": "Implement checkpasswd per the spec. It needs to call validate via pipe/fork.",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt", "Makefile"],
+      "focus_file": "checkpasswd.c",
+      "extra_read_files": ["validate.c", "spec.txt", "common.h"]
+    },
+    {
+      "name": "agent-w7-multi-file",
+      "mode": "agent",
+      "spec": "Trim newlines from user_id and password before passing to validate. Use trim_newline from helper.c.",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt", "Makefile"],
+      "focus_file": "checkpasswd.c",
+      "extra_read_files": ["helper.c", "common.h"]
+    },
+    {
+      "name": "agent-w7-helper-docstring",
+      "mode": "agent",
+      "spec": "Add a brief comment above trim_newline explaining what it does.",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt", "Makefile"],
+      "focus_file": "helper.c",
+      "extra_read_files": []
+    }
+  ]
+}

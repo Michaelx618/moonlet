@@ -1,0 +1,43 @@
+{
+  "tasks": [
+    {
+      "name": "plan-w7-checkpasswd",
+      "mode": "plan",
+      "spec": "How would I implement checkpasswd? Give me a plan.",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt", "Makefile"],
+      "focus_file": "checkpasswd.c",
+      "extra_read_files": ["validate.c", "spec.txt", "common.h"],
+      "context_folders": ["."]
+    },
+    {
+      "name": "ask-w7-explore-structure",
+      "mode": "ask",
+      "spec": "What's in this project and how does it fit together?",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt", "Makefile"],
+      "focus_file": null,
+      "extra_read_files": [],
+      "context_folders": ["."]
+    },
+    {
+      "name": "plan-w7-validate-interface",
+      "mode": "plan",
+      "spec": "How does validate work? What does it expect on stdin and how should checkpasswd call it?",
+      "root": "tests/fixtures/w7",
+      "include": ["checkpasswd.c", "validate.c", "common.h", "helper.c", "spec.txt"],
+      "focus_file": "validate.c",
+      "extra_read_files": ["checkpasswd.c", "common.h"]
+    },
+    {
+      "name": "plan-moonlet-agent-flow",
+      "mode": "plan",
+      "spec": "How does a request get from the server to the agent? What tools can it use?",
+      "root": ".",
+      "include": ["ai_shell/server.py", "ai_shell/agent_loop.py", "ai_shell/tool_executor.py"],
+      "focus_file": "ai_shell/server.py",
+      "extra_read_files": ["ai_shell/agent_loop.py"],
+      "context_folders": ["ai_shell"]
+    }
+  ]
+}

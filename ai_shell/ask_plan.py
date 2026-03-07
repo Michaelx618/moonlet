@@ -17,6 +17,7 @@ from .agent_loop import (
     _code_context_section,
     _folder_context_section,
 )
+from .files import _norm_rel_path
 from .tool_executor import (
     ASK_TOOLS_HINT,
     PLAN_TOOLS_HINT,
@@ -94,6 +95,7 @@ def _run_read_only_loop(
     start = time.time()
     next_user_msg = "User: Proceed. Use the tool results above.\nAssistant:"
     round_num = 0
+    already_read_paths: set[str] = set()
 
     while True:
         round_num += 1
@@ -138,6 +140,25 @@ def _run_read_only_loop(
                     pass
             if name_lower in WRITE_TOOL_NAMES:
                 results_for_turn.append(reject_message)
+            elif name_lower == "read_file":
+                path = (kwargs.get("filepath") or kwargs.get("path") or "").strip().strip("'\"")
+                if path:
+                    norm = _norm_rel_path(path)
+                    if norm in already_read_paths:
+                        results_for_turn.append(f"[read_file] {norm} already read above — content unchanged")
+                    else:
+                        already_read_paths.add(norm)
+                        try:
+                            result = execute_tool_from_kwargs(name_lower, kwargs or {})
+                            results_for_turn.append(result or "")
+                        except Exception as e:
+                            results_for_turn.append(f"[{name_lower}] Error: {e}")
+                else:
+                    try:
+                        result = execute_tool_from_kwargs(name_lower, kwargs or {})
+                        results_for_turn.append(result or "")
+                    except Exception as e:
+                        results_for_turn.append(f"[{name_lower}] Error: {e}")
             else:
                 try:
                     result = execute_tool_from_kwargs(name_lower, kwargs or {})
@@ -202,6 +223,7 @@ def run_plan(
     on_chunk: Optional[Callable[[str], None]] = None,
     extra_read_files: Optional[List[str]] = None,
     context_folders: Optional[List[str]] = None,
+    max_rounds: int = 10,
 ) -> Tuple[str, Dict[str, Any]]:
     """Plan route: read-only tools, explore and produce a plan. Returns (output, meta)."""
     del silent
@@ -212,4 +234,5 @@ def run_plan(
         reject_message="Plan mode: file edits are disabled. Use Agent mode to apply changes.",
         on_action=on_action,
         on_chunk=on_chunk,
+        max_rounds=max_rounds,
     )

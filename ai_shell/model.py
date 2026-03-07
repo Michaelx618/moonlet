@@ -1,13 +1,24 @@
+import atexit
 import hashlib
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import config
+
+# Lock file for MLX singleton: only one process may hold the model at a time.
+_MLX_LOCK_PATH = Path(os.path.expanduser("~")) / ".moonlet" / "mlx-singleton.lock"
+_MLX_LOCK_FILE: Optional[object] = None  # Keep open so lock held until process exit
+
+# Process patterns that indicate a process using the MLX model (eval, server, agent).
+_MLX_PROCESS_PATTERN = "run_single_task|eval_harness|run_eval_suite|ai_shell\\.server"
 from .model_roles import resolve_role_config
 from .model_providers import MLXProviderAdapter
 from .utils import dbg
@@ -165,6 +176,62 @@ else:
 MODEL_LOCK = threading.Lock()
 
 
+def _kill_other_mlx_processes() -> None:
+    """Kill any other processes that use the MLX model. Prevents 2 model instances in memory."""
+    our_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", _MLX_PROCESS_PATTERN],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0 and not result.stdout:
+            return  # No matches
+        pids = [int(x) for x in (result.stdout or "").strip().split() if x.strip()]
+        pids = [p for p in pids if p != our_pid]
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print(f"[MLX singleton] Killed other model process pid={pid}", file=sys.stderr)
+                sys.stderr.flush()
+            except (ProcessLookupError, PermissionError):
+                pass
+        if pids:
+            time.sleep(2)  # Let processes die before we load
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+
+def _acquire_mlx_singleton_lock() -> None:
+    """Acquire exclusive lock; kill other model processes; hold lock until process exit."""
+    global _MLX_LOCK_FILE
+    try:
+        import fcntl
+    except ImportError:
+        # Windows: no fcntl; just kill others, no lock
+        _kill_other_mlx_processes()
+        return
+    _MLX_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_MLX_LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # Block until we get it
+        _kill_other_mlx_processes()
+        _MLX_LOCK_FILE = fd  # Keep open; lock released on process exit
+
+        def _release(lock_fd: int = fd) -> None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except Exception:
+                pass
+
+        atexit.register(_release)
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def ensure_model_loaded() -> None:
     """Load MLX model once (no-op if already loaded or not using MLX)."""
     global model, tokenizer, _PROVIDER, _loading
@@ -178,6 +245,8 @@ def ensure_model_loaded() -> None:
         else:
             _loading = True
             try:
+                if getattr(config, "MLX_SINGLETON", True):
+                    _acquire_mlx_singleton_lock()  # Kill other model processes; hold lock
                 _tok, _m = load_model()
                 tokenizer = _tok
                 model = _m

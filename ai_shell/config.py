@@ -84,6 +84,8 @@ MLX_MODEL = os.getenv("SC2_MLX_MODEL", "").strip() or None
 MLX_MODEL_PATH = os.getenv("SC2_MLX_MODEL_PATH", "").strip() or None
 # KV cache size for MLX (max prompt tokens to cache; improves throughput). 0 = use mlx_lm default.
 MLX_MAX_KV_SIZE = int(os.getenv("SC2_MLX_MAX_KV_SIZE", "16384"))
+# MLX singleton: only one model process at a time. Kills other model processes before load. SC2_MLX_SINGLETON=0 to disable.
+MLX_SINGLETON = os.getenv("SC2_MLX_SINGLETON", "true").lower() not in ("0", "false", "no")
 # Hard cap on agent prompt length when using MLX (reduce hallucination from oversized context).
 MLX_AGENT_PROMPT_MAX_CHARS = int(os.getenv("SC2_MLX_AGENT_PROMPT_MAX_CHARS", "32000"))
 # When False, MLX uses same ChatML wrap as GGUF (no tokenizer chat template). Can reduce edit hallucination.
@@ -188,6 +190,8 @@ MAX_FOCUS_CONTENT_CHARS = int(os.getenv("SC2_MAX_FOCUS_CONTENT_CHARS", "12000"))
 MAX_REF_CONTENT_CHARS = int(os.getenv("SC2_MAX_REF_CONTENT_CHARS", "12000"))
 MAX_READ_FILES_IN_PROMPT = int(os.getenv("SC2_MAX_READ_FILES_IN_PROMPT", "15"))
 # @Code / @Folder context
+# When True, skip @Code block (symbol snippets) in prompt; model uses read_file instead.
+DISABLE_CODE_CONTEXT = os.getenv("SC2_DISABLE_CODE_CONTEXT", "true").lower() in ("1", "true", "yes")
 MAX_CODE_SNIPPET_LINES = int(os.getenv("SC2_MAX_CODE_SNIPPET_LINES", "40"))
 MAX_FOLDER_CONTEXT_FILES = int(os.getenv("SC2_MAX_FOLDER_CONTEXT_FILES", "25"))
 # Default agent system message
